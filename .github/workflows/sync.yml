@@ -16,6 +16,8 @@ jobs:
         owner: FDio
         base: master
         head: master
+        merge_method: rebase
+        pr_title: Sync master
 
     - uses: TG908/fork-sync@v1.1
       with:
@@ -23,3 +25,5 @@ jobs:
         owner: FDio
         base: stable/1908
         head: stable/1908
+        merge_method: rebase
+        pr_title: Sync 1908
