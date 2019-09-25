@@ -1,0 +1,25 @@
+name: Sync Upstream
+
+on:
+  schedule:
+  - cron: '*/30 * * * *'
+
+jobs:
+  sync:
+
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: TG908/fork-sync@v1.1
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        owner: FDio
+        base: master
+        head: master
+
+    - uses: TG908/fork-sync@v1.1
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        owner: FDio
+        base: stable/1908
+        head: stable/1908
