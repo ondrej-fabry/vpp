@@ -1,7 +1,12 @@
 name: Sync Upstream
 
 on:
-  schedule:
+  pull_request:
+    branches: master
+  push:
+    branches: master
+    
+#  schedule:
 #    - cron: '0 0 * * *'
 
 jobs:
@@ -9,14 +14,12 @@ jobs:
     name: Sync master branch
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v1
-    
-    
-#     - uses: TG908/fork-sync@v1.1
-#      with:
-#        github_token: ${{ secrets.GITHUB_TOKEN }}
-#        owner: FDio
-#        base: master
-#        head: master
-#        merge_method: rebase
-#        pr_title: Sync master
+      - uses: actions/checkout@v2
+      - uses: TG908/fork-sync@v1.1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          owner: FDio
+          base: master
+          head: master
+          merge_method: hardreset
+          pr_title: Sync master
