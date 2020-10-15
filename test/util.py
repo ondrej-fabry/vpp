@@ -1,6 +1,8 @@
 """ test framework utilities """
 
 import abc
+import ipaddress
+import logging
 import socket
 from socket import AF_INET6
 import six
@@ -18,6 +20,10 @@ from scapy.utils6 import in6_mactoifaceid
 
 from io import BytesIO
 from vpp_papi import mac_pton
+
+# Set up an empty logger for the testcase that can be overridden as necessary
+null_logger = logging.getLogger('VppTestCase.util')
+null_logger.addHandler(logging.NullHandler())
 
 
 def ppp(headline, packet):
@@ -50,15 +56,26 @@ def ip4_range(ip4, s, e):
     return ("%s.%d" % (tmp, i) for i in range(s, e))
 
 
-def ip4n_range(ip4n, s, e):
-    ip4 = socket.inet_ntop(socket.AF_INET, ip4n)
-    return (socket.inet_pton(socket.AF_INET, ip)
-            for ip in ip4_range(ip4, s, e))
+def mcast_ip_to_mac(ip):
+    ip = ipaddress.ip_address(ip)
+    if not ip.is_multicast:
+        raise ValueError("Must be multicast address.")
+    ip_as_int = int(ip)
+    if ip.version == 4:
+        mcast_mac = "01:00:5e:%02x:%02x:%02x" % ((ip_as_int >> 16) & 0x7f,
+                                                 (ip_as_int >> 8) & 0xff,
+                                                 ip_as_int & 0xff)
+    else:
+        mcast_mac = "33:33:%02x:%02x:%02x:%02x" % ((ip_as_int >> 24) & 0xff,
+                                                   (ip_as_int >> 16) & 0xff,
+                                                   (ip_as_int >> 8) & 0xff,
+                                                   ip_as_int & 0xff)
+    return mcast_mac
 
 
 # wrapper around scapy library function.
 def mk_ll_addr(mac):
-    euid = in6_mactoifaceid(mac)
+    euid = in6_mactoifaceid(str(mac))
     addr = "fe80::" + euid
     return addr
 
@@ -260,20 +277,7 @@ class L4_CONN_SIDE:
     L4_CONN_SIDE_ONE = 1
 
 
-class LoggerWrapper(object):
-    def __init__(self, logger=None):
-        self._logger = logger
-
-    def debug(self, *args, **kwargs):
-        if self._logger:
-            self._logger.debug(*args, **kwargs)
-
-    def error(self, *args, **kwargs):
-        if self._logger:
-            self._logger.error(*args, **kwargs)
-
-
-def fragment_rfc791(packet, fragsize, _logger=None):
+def fragment_rfc791(packet, fragsize, logger=null_logger):
     """
     Fragment an IPv4 packet per RFC 791
     :param packet: packet to fragment
@@ -281,7 +285,6 @@ def fragment_rfc791(packet, fragsize, _logger=None):
     :note: IP options are not supported
     :returns: list of fragments
     """
-    logger = LoggerWrapper(_logger)
     logger.debug(ppp("Fragmenting packet:", packet))
     packet = packet.__class__(scapy.compat.raw(packet))  # recalc. all values
     if len(packet[IP].options) > 0:
@@ -298,7 +301,7 @@ def fragment_rfc791(packet, fragsize, _logger=None):
     pkts = []
     ihl = packet[IP].ihl
     otl = len(packet[IP])
-    nfb = (fragsize - pre_ip_len - ihl * 4) / 8
+    nfb = int((fragsize - pre_ip_len - ihl * 4) / 8)
     fo = packet[IP].frag
 
     p = packet.__class__(hex_headers + hex_payload[:nfb * 8])
@@ -313,13 +316,13 @@ def fragment_rfc791(packet, fragsize, _logger=None):
     p[IP].frag = fo + nfb
     del p[IP].chksum
 
-    more_fragments = fragment_rfc791(p, fragsize, _logger)
+    more_fragments = fragment_rfc791(p, fragsize, logger)
     pkts.extend(more_fragments)
 
     return pkts
 
 
-def fragment_rfc8200(packet, identification, fragsize, _logger=None):
+def fragment_rfc8200(packet, identification, fragsize, logger=null_logger):
     """
     Fragment an IPv6 packet per RFC 8200
     :param packet: packet to fragment
@@ -327,7 +330,6 @@ def fragment_rfc8200(packet, identification, fragsize, _logger=None):
     :note: IP options are not supported
     :returns: list of fragments
     """
-    logger = LoggerWrapper(_logger)
     packet = packet.__class__(scapy.compat.raw(packet))  # recalc. all values
     if len(packet) <= fragsize:
         return [packet]
@@ -406,7 +408,7 @@ def fragment_rfc8200(packet, identification, fragsize, _logger=None):
     del p[IPv6].nh
     p = p / fragment_ext_hdr
     del p[IPv6ExtHdrFragment].nh
-    first_payload_len_nfb = (fragsize - len(p)) / 8
+    first_payload_len_nfb = int((fragsize - len(p)) / 8)
     p = p / Raw(hex_payload[:first_payload_len_nfb * 8])
     del p[IPv6].plen
     p[IPv6ExtHdrFragment].nh = orig_nh
@@ -424,11 +426,11 @@ def fragment_rfc8200(packet, identification, fragsize, _logger=None):
         del p[IPv6].nh
         p = p / fragment_ext_hdr
         del p[IPv6ExtHdrFragment].nh
-        l_nfb = (fragsize - len(p)) / 8
+        l_nfb = int((fragsize - len(p)) / 8)
         p = p / Raw(hex_payload[offset:offset + l_nfb * 8])
         p[IPv6ExtHdrFragment].nh = orig_nh
         p[IPv6ExtHdrFragment].id = identification
-        p[IPv6ExtHdrFragment].offset = offset / 8
+        p[IPv6ExtHdrFragment].offset = int(offset / 8)
         p[IPv6ExtHdrFragment].m = 1
         p = p.__class__(scapy.compat.raw(p))
         logger.debug(ppp("Fragment %s:" % len(pkts), p))

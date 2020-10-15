@@ -63,15 +63,35 @@ ip_adjacency_t *
 adj_alloc (fib_protocol_t proto)
 {
     ip_adjacency_t *adj;
+    u8 need_barrier_sync = 0;
+    vlib_main_t *vm;
+    vm = vlib_get_main();
+
+    ASSERT (vm->thread_index == 0);
+
+    pool_get_aligned_will_expand (adj_pool, need_barrier_sync,
+                                  CLIB_CACHE_LINE_BYTES);
+    /* If the adj_pool will expand, stop the parade. */
+    if (need_barrier_sync)
+        vlib_worker_thread_barrier_sync (vm);
 
     pool_get_aligned(adj_pool, adj, CLIB_CACHE_LINE_BYTES);
 
     adj_poison(adj);
 
-    /* Make sure certain fields are always initialized. */
     /* Validate adjacency counters. */
+    if (need_barrier_sync == 0)
+    {
+        /* If the adj counter pool will expand, stop the parade */
+        need_barrier_sync = vlib_validate_combined_counter_will_expand
+            (&adjacency_counters, adj_get_index (adj));
+        if (need_barrier_sync)
+            vlib_worker_thread_barrier_sync (vm);
+    }
     vlib_validate_combined_counter(&adjacency_counters,
                                    adj_get_index(adj));
+
+    /* Make sure certain fields are always initialized. */
     vlib_zero_combined_counter(&adjacency_counters,
                                adj_get_index(adj));
     fib_node_init(&adj->ia_node,
@@ -79,6 +99,7 @@ adj_alloc (fib_protocol_t proto)
 
     adj->ia_nh_proto = proto;
     adj->ia_flags = 0;
+    adj->ia_cfg_index = 0;
     adj->rewrite_header.sw_if_index = ~0;
     adj->rewrite_header.flags = 0;
     adj->lookup_next_index = 0;
@@ -87,6 +108,9 @@ adj_alloc (fib_protocol_t proto)
     /* lest it become a midchain in the future */
     clib_memset(&adj->sub_type.midchain.next_dpo, 0,
            sizeof(adj->sub_type.midchain.next_dpo));
+
+    if (need_barrier_sync)
+        vlib_worker_thread_barrier_release (vm);
 
     return (adj);
 }
@@ -182,7 +206,7 @@ format_ip_adjacency (u8 * s, va_list * args)
         s = format (s, "\n   flags:%U", format_adj_flags, adj->ia_flags);
         s = format (s, "\n   counts:[%Ld:%Ld]", counts.packets, counts.bytes);
 	s = format (s, "\n   locks:%d", adj->ia_node.fn_locks);
-	s = format(s, "\n delegates:\n  ");
+	s = format(s, "\n delegates:");
         s = adj_delegate_format(s, adj);
 
 	s = format(s, "\n children:");
@@ -249,7 +273,7 @@ adj_last_lock_gone (ip_adjacency_t *adj)
     switch (adj->lookup_next_index)
     {
     case IP_LOOKUP_NEXT_MIDCHAIN:
-        dpo_reset(&adj->sub_type.midchain.next_dpo);
+        adj_midchain_teardown(adj);
         /* FALL THROUGH */
     case IP_LOOKUP_NEXT_ARP:
     case IP_LOOKUP_NEXT_REWRITE:
@@ -267,8 +291,10 @@ adj_last_lock_gone (ip_adjacency_t *adj)
 	adj_glean_remove(adj->ia_nh_proto,
 			 adj->rewrite_header.sw_if_index);
 	break;
-    case IP_LOOKUP_NEXT_MCAST:
     case IP_LOOKUP_NEXT_MCAST_MIDCHAIN:
+        adj_midchain_teardown(adj);
+        /* FALL THROUGH */
+    case IP_LOOKUP_NEXT_MCAST:
 	adj_mcast_remove(adj->ia_nh_proto,
 			 adj->rewrite_header.sw_if_index);
 	break;
@@ -397,18 +423,27 @@ adj_feature_update_walk_cb (adj_index_t ai,
         ((ctx->arc == mpls_main.output_feature_arc_index) &&
          (VNET_LINK_MPLS == adj->ia_link)))
     {
+        vnet_feature_main_t *fm = &feature_main;
+        vnet_feature_config_main_t *cm;
+
+        cm = &fm->feature_config_mains[ctx->arc];
+
         if (ctx->enable)
             adj->rewrite_header.flags |= VNET_REWRITE_HAS_FEATURES;
         else
             adj->rewrite_header.flags &= ~VNET_REWRITE_HAS_FEATURES;
+
+        adj->ia_cfg_index = vec_elt (cm->config_index_by_sw_if_index,
+                                     adj->rewrite_header.sw_if_index);
     }
     return (ADJ_WALK_RC_CONTINUE);
 }
 
-void
+static void
 adj_feature_update (u32 sw_if_index,
                     u8 arc_index,
-                    u8 is_enable)
+                    u8 is_enable,
+                    void *data)
 {
     /*
      * Walk all the adjacencies on the interface to update the cached
@@ -590,6 +625,8 @@ adj_module_init (vlib_main_t * vm)
     adj_midchain_module_init();
     adj_mcast_module_init();
 
+    vnet_feature_register(adj_feature_update, NULL);
+
     return (NULL);
 }
 
@@ -608,9 +645,7 @@ adj_show (vlib_main_t * vm,
     {
 	if (unformat (input, "%d", &ai))
 	    ;
-	else if (unformat (input, "sum"))
-	    summary = 1;
-	else if (unformat (input, "summary"))
+	else if (unformat (input, "summary") || unformat (input, "sum"))
 	    summary = 1;
 	else if (unformat (input, "%U",
 			   unformat_vnet_sw_interface, vnet_get_main(),

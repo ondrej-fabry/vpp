@@ -34,9 +34,6 @@ Looking at the :ref:`vppVagrantfile`, we can see that the default OS is Ubuntu 1
         config.vm.box = "centos/7"
         config.vm.box_version = "1708.01"
         config.ssh.insert_key = false
-      elsif distro == 'opensuse'
-        config.vm.box = "opensuse/openSUSE-42.3-x86_64"
-        config.vm.box_version = "1.0.4.20170726"
       else
         config.vm.box = "puppetlabs/ubuntu-16.04-64-nocm"
 
@@ -62,7 +59,7 @@ Looking further in the :ref:`vppVagrantfile`, you can see more Ruby variables be
       config.vm.network "private_network", type: "dhcp"
     end
 
-    # use http proxy if avaiable
+    # use http proxy if available
     if ENV['http_proxy'] && Vagrant.has_plugin?("vagrant-proxyconf")
      config.proxy.http     = ENV['http_proxy']
      config.proxy.https    = ENV['https_proxy']

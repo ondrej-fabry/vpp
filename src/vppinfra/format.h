@@ -117,7 +117,6 @@ _(format_timeval);
 _(format_time_float);
 _(format_signal);
 _(format_ucontext_pc);
-_(format_page_map);
 #endif
 
 #undef _
@@ -298,6 +297,12 @@ unformat_function_t unformat_memory_size;
 /* Unparse memory size e.g. 100, 100k, 100m, 100g. */
 u8 *format_memory_size (u8 * s, va_list * va);
 
+/* Parse memory page size e.g. 4K, 2M */
+unformat_function_t unformat_log2_page_size;
+
+/* Unparse memory page size e.g. 4K, 2M */
+u8 *format_log2_page_size (u8 * s, va_list * va);
+
 /* Format c identifier: e.g. a_name -> "a name". */
 u8 *format_c_identifier (u8 * s, va_list * va);
 
@@ -316,6 +321,8 @@ uword unformat_init_unix_env (unformat_input_t * input, char *var);
 /* Unformat unix group id (gid) specified as integer or string */
 unformat_function_t unformat_unix_gid;
 #endif /* CLIB_UNIX */
+
+uword unformat_data_size (unformat_input_t * input, va_list * args);
 
 /* Test code. */
 int test_format_main (unformat_input_t * input);

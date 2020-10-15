@@ -26,34 +26,10 @@
 #include <vlibmemory/api.h>
 
 /* define message IDs */
-#include <avf/avf_msg_enum.h>
-
-/* define message structures */
-#define vl_typedefs
-#include <avf/avf_all_api_h.h>
-#undef vl_typedefs
-
-/* define generated endian-swappers */
-#define vl_endianfun
-#include <avf/avf_all_api_h.h>
-#undef vl_endianfun
-
-/* instantiate all the print functions we know about */
-#define vl_print(handle, ...) vlib_cli_output (handle, __VA_ARGS__)
-#define vl_printfun
-#include <avf/avf_all_api_h.h>
-#undef vl_printfun
-
-/* get the API version number */
-#define vl_api_version(n,v) static u32 api_version=(v);
-#include <avf/avf_all_api_h.h>
-#undef vl_api_version
+#include <avf/avf.api_enum.h>
+#include <avf/avf.api_types.h>
 
 #include <vlibapi/api_helper_macros.h>
-
-#define foreach_avf_plugin_api_msg	\
-_(AVF_CREATE, avf_create)		\
-_(AVF_DELETE, avf_delete)
 
 static void
 vl_api_avf_create_t_handler (vl_api_avf_create_t * mp)
@@ -90,7 +66,6 @@ vl_api_avf_delete_t_handler (vl_api_avf_delete_t * mp)
   vnet_main_t *vnm = vnet_get_main ();
   avf_main_t *am = &avf_main;
   vl_api_avf_delete_reply_t *rmp;
-  avf_device_t *ad;
   vnet_hw_interface_t *hw;
   int rv = 0;
 
@@ -103,57 +78,25 @@ vl_api_avf_delete_t_handler (vl_api_avf_delete_t * mp)
       goto reply;
     }
 
-  ad = pool_elt_at_index (am->devices, hw->dev_instance);
-
-  avf_delete_if (vm, ad);
+  vlib_process_signal_event (vm, avf_process_node.index,
+			     AVF_PROCESS_EVENT_DELETE_IF, hw->dev_instance);
 
 reply:
   REPLY_MACRO (VL_API_AVF_DELETE_REPLY + am->msg_id_base);
 }
 
-#define vl_msg_name_crc_list
-#include <avf/avf_all_api_h.h>
-#undef vl_msg_name_crc_list
-
-static void
-setup_message_id_table (avf_main_t * avm, api_main_t * am)
-{
-#define _(id,n,crc) \
-  vl_msg_api_add_msg_name_crc (am, #n "_" #crc, id + avm->msg_id_base);
-  foreach_vl_msg_name_crc_avf;
-#undef _
-}
-
 /* set tup the API message handling tables */
+#include <avf/avf.api.c>
 static clib_error_t *
 avf_plugin_api_hookup (vlib_main_t * vm)
 {
   avf_main_t *avm = &avf_main;
-  api_main_t *am = &api_main;
-  u8 *name;
+  api_main_t *am = vlibapi_get_main ();
 
-  /* construct the API name */
-  name = format (0, "avf_%08x%c", api_version, 0);
+  am->is_mp_safe[VL_API_AVF_DELETE] = 1;
 
   /* ask for a correctly-sized block of API message decode slots */
-  avm->msg_id_base = vl_msg_api_get_msg_ids
-    ((char *) name, VL_MSG_FIRST_AVAILABLE);
-
-#define _(N,n)							\
-    vl_msg_api_set_handlers((VL_API_##N + avm->msg_id_base),	\
-			   #n,					\
-			   vl_api_##n##_t_handler,		\
-			   vl_noop_handler,			\
-			   vl_api_##n##_t_endian,		\
-			   vl_api_##n##_t_print,		\
-			   sizeof(vl_api_##n##_t), 1);
-  foreach_avf_plugin_api_msg;
-#undef _
-
-  /* set up the (msg_name, crc, message-id) table */
-  setup_message_id_table (avm, am);
-
-  vec_free (name);
+  avm->msg_id_base = setup_message_id_table ();
   return 0;
 }
 

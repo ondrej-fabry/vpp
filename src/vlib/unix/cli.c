@@ -61,6 +61,7 @@
 #include <limits.h>
 #include <netinet/tcp.h>
 #include <math.h>
+#include <vppinfra/macros.h>
 
 /** ANSI escape code. */
 #define ESC "\x1b"
@@ -91,7 +92,7 @@
 
 /** Maximum depth into a byte stream from which to compile a Telnet
  * protocol message. This is a safety measure. */
-#define UNIX_CLI_MAX_DEPTH_TELNET 24
+#define UNIX_CLI_MAX_DEPTH_TELNET 32
 
 /** Maximum terminal width we will accept */
 #define UNIX_CLI_MAX_TERMINAL_WIDTH 512
@@ -241,6 +242,8 @@ typedef struct
    */
   u8 cursor_direction;
 
+  /** Macro tables for this session */
+  clib_macro_main_t macro_main;
 } unix_cli_file_t;
 
 /** Resets the pager buffer and other data.
@@ -491,10 +494,32 @@ typedef struct
 
   /** List of new sessions */
   unix_cli_new_session_t *new_sessions;
+
+  /** system default macro table */
+  clib_macro_main_t macro_main;
+
 } unix_cli_main_t;
 
 /** CLI global state */
 static unix_cli_main_t unix_cli_main;
+
+/** Return the macro main / tables we should use for this session
+ */
+static clib_macro_main_t *
+get_macro_main (void)
+{
+  unix_cli_main_t *cm = &unix_cli_main;
+  vlib_main_t *vm = vlib_get_main ();
+  vlib_process_t *cp = vlib_get_current_process (vm);
+  unix_cli_file_t *cf;
+
+  if (pool_is_free_index (cm->cli_file_pool, cp->output_function_arg))
+    return (&cm->macro_main);
+
+  cf = pool_elt_at_index (cm->cli_file_pool, cp->output_function_arg);
+
+  return (&cf->macro_main);
+}
 
 /**
  * @brief Search for a byte sequence in the action list.
@@ -2495,6 +2520,7 @@ unix_cli_line_edit (unix_cli_main_t * cm, unix_main_t * um,
 	  if (cf->line_mode)
 	    {
 	      vec_delete (cf->input_vector, i, 0);
+	      vec_free (cf->current_command);
 	      cf->current_command = cf->input_vector;
 	      return 0;
 	    }
@@ -2557,7 +2583,29 @@ more:
 		   format_timeval, 0 /* current bat-time */ ,
 		   0 /* current bat-format */ ,
 		   cli_file_index, cf->current_command);
+      if ((vec_len (cf->current_command) > 0) &&
+	  (cf->current_command[vec_len (cf->current_command) - 1] != '\n'))
+	lv = format (lv, "\n");
       int rv __attribute__ ((unused)) = write (um->log_fd, lv, vec_len (lv));
+    }
+
+  /* Run the command through the macro processor */
+  if (vec_len (cf->current_command))
+    {
+      u8 *expanded;
+      vec_validate (cf->current_command, vec_len (cf->current_command));
+      cf->current_command[vec_len (cf->current_command) - 1] = 0;
+      /* The macro expander expects proper C-strings, not vectors */
+      expanded = (u8 *) clib_macro_eval (&cf->macro_main,
+					 (i8 *) cf->current_command,
+					 1 /* complain */ ,
+					 0 /* level */ ,
+					 8 /* max_level */ );
+      /* Macro processor NULL terminates the return */
+      _vec_len (expanded) -= 1;
+      vec_reset_length (cf->current_command);
+      vec_append (cf->current_command, expanded);
+      vec_free (expanded);
     }
 
   /* Build an unformat structure around our command */
@@ -2664,6 +2712,7 @@ unix_cli_kill (unix_cli_main_t * cm, uword cli_file_index)
   clib_file_del (fm, uf);
 
   unix_cli_file_free (cf);
+  clib_macro_free (&cf->macro_main);
   pool_put (cm->cli_file_pool, cf);
 }
 
@@ -2864,7 +2913,7 @@ unix_cli_file_add (unix_cli_main_t * cm, char *name, int fd)
       static vlib_node_registration_t r = {
 	.function = unix_cli_process,
 	.type = VLIB_NODE_TYPE_PROCESS,
-	.process_log2_n_stack_bytes = 17,
+	.process_log2_n_stack_bytes = 18,
       };
 
       r.name = name;
@@ -2881,6 +2930,7 @@ unix_cli_file_add (unix_cli_main_t * cm, char *name, int fd)
 
   pool_get (cm->cli_file_pool, cf);
   clib_memset (cf, 0, sizeof (*cf));
+  clib_macro_init (&cf->macro_main);
 
   template.read_function = unix_cli_read_ready;
   template.write_function = unix_cli_write_ready;
@@ -2893,6 +2943,8 @@ unix_cli_file_add (unix_cli_main_t * cm, char *name, int fd)
   cf->clib_file_index = clib_file_add (fm, &template);
   cf->output_vector = 0;
   cf->input_vector = 0;
+  vec_validate (cf->current_command, 0);
+  _vec_len (cf->current_command) = 0;
 
   vlib_start_process (vm, n->runtime_index);
 
@@ -3089,9 +3141,11 @@ unix_cli_config (vlib_main_t * vm, unformat_input_t * input)
 	    clib_panic ("sigaction");
 
 	  /* Retrieve the current terminal size */
-	  ioctl (STDIN_FILENO, TIOCGWINSZ, &ws);
-	  cf->width = ws.ws_col;
-	  cf->height = ws.ws_row;
+	  if (ioctl (STDIN_FILENO, TIOCGWINSZ, &ws) == 0)
+	    {
+	      cf->width = ws.ws_col;
+	      cf->height = ws.ws_row;
+	    }
 
 	  if (cf->width == 0 || cf->height == 0)
 	    {
@@ -3232,6 +3286,23 @@ vlib_unix_cli_set_prompt (char *prompt)
   cm->cli_prompt = format (0, fmt, prompt);
 }
 
+static unix_cli_file_t *
+unix_cli_file_if_exists (unix_cli_main_t * cm)
+{
+  if (!cm->cli_file_pool)
+    return 0;
+  return pool_elt_at_index (cm->cli_file_pool, cm->current_input_file_index);
+}
+
+static unix_cli_file_t *
+unix_cli_file_if_interactive (unix_cli_main_t * cm)
+{
+  unix_cli_file_t *cf;
+  if ((cf = unix_cli_file_if_exists (cm)) && !cf->is_interactive)
+    return 0;
+  return cf;
+}
+
 /** CLI command to quit the terminal session.
  * @note If this is a stdin session then this will
  *       shutdown VPP also.
@@ -3241,8 +3312,10 @@ unix_cli_quit (vlib_main_t * vm,
 	       unformat_input_t * input, vlib_cli_command_t * cmd)
 {
   unix_cli_main_t *cm = &unix_cli_main;
-  unix_cli_file_t *cf = pool_elt_at_index (cm->cli_file_pool,
-					   cm->current_input_file_index);
+  unix_cli_file_t *cf;
+
+  if (!(cf = unix_cli_file_if_exists (cm)))
+    return clib_error_return (0, "invalid session");
 
   /* Cosmetic: suppress the final prompt from appearing before we die */
   cf->is_interactive = 0;
@@ -3328,7 +3401,7 @@ unix_cli_exec (vlib_main_t * vm,
   unformat_free (&sub_input);
 
 done:
-  if (fd > 0)
+  if (fd >= 0)
     close (fd);
   vec_free (file_name);
 
@@ -3494,9 +3567,7 @@ unix_cli_show_history (vlib_main_t * vm,
   unix_cli_file_t *cf;
   int i, j;
 
-  cf = pool_elt_at_index (cm->cli_file_pool, cm->current_input_file_index);
-
-  if (!cf->is_interactive)
+  if (!(cf = unix_cli_file_if_interactive (cm)))
     return clib_error_return (0, "invalid for non-interactive sessions");
 
   if (cf->has_history && cf->history_limit)
@@ -3534,7 +3605,9 @@ unix_cli_show_terminal (vlib_main_t * vm,
   unix_cli_file_t *cf;
   vlib_node_t *n;
 
-  cf = pool_elt_at_index (cm->cli_file_pool, cm->current_input_file_index);
+  if (!(cf = unix_cli_file_if_exists (cm)))
+    return clib_error_return (0, "invalid session");
+
   n = vlib_get_node (vm, cf->process_node_index);
 
   vlib_cli_output (vm, "Terminal name:   %v\n", n->name);
@@ -3686,9 +3759,7 @@ unix_cli_set_terminal_pager (vlib_main_t * vm,
   unformat_input_t _line_input, *line_input = &_line_input;
   clib_error_t *error = 0;
 
-  cf = pool_elt_at_index (cm->cli_file_pool, cm->current_input_file_index);
-
-  if (!cf->is_interactive)
+  if (!(cf = unix_cli_file_if_interactive (cm)))
     return clib_error_return (0, "invalid for non-interactive sessions");
 
   if (!unformat_user (input, unformat_line_input, line_input))
@@ -3745,9 +3816,7 @@ unix_cli_set_terminal_history (vlib_main_t * vm,
   u32 limit;
   clib_error_t *error = 0;
 
-  cf = pool_elt_at_index (cm->cli_file_pool, cm->current_input_file_index);
-
-  if (!cf->is_interactive)
+  if (!(cf = unix_cli_file_if_interactive (cm)))
     return clib_error_return (0, "invalid for non-interactive sessions");
 
   if (!unformat_user (input, unformat_line_input, line_input))
@@ -3815,9 +3884,7 @@ unix_cli_set_terminal_ansi (vlib_main_t * vm,
   unix_cli_main_t *cm = &unix_cli_main;
   unix_cli_file_t *cf;
 
-  cf = pool_elt_at_index (cm->cli_file_pool, cm->current_input_file_index);
-
-  if (!cf->is_interactive)
+  if (!(cf = unix_cli_file_if_interactive (cm)))
     return clib_error_return (0, "invalid for non-interactive sessions");
 
   if (unformat (input, "on"))
@@ -3847,6 +3914,161 @@ VLIB_CLI_COMMAND (cli_unix_cli_set_terminal_ansi, static) = {
 };
 /* *INDENT-ON* */
 
+
+#define MAX_CLI_WAIT 86400
+/** CLI command to wait <sec> seconds. Useful for exec script. */
+static clib_error_t *
+unix_wait_cmd (vlib_main_t * vm,
+	       unformat_input_t * input, vlib_cli_command_t * cmd)
+{
+  unformat_input_t _line_input, *line_input = &_line_input;
+  f64 sec = 1.0;
+
+  if (!unformat_user (input, unformat_line_input, line_input))
+    return 0;
+
+  while (unformat_check_input (line_input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (line_input, "%f", &sec))
+	;
+      else
+	return clib_error_return (0, "unknown parameter: `%U`",
+				  format_unformat_error, input);
+    }
+
+  if (sec <= 0 || sec > MAX_CLI_WAIT || floor (sec * 1000) / 1000 != sec)
+    return clib_error_return (0,
+			      "<sec> must be a positive value and less than 86400 (one day) with no more than msec precision.");
+
+  vlib_process_wait_for_event_or_clock (vm, sec);
+  vlib_cli_output (vm, "waited %.3f sec.", sec);
+
+  unformat_free (line_input);
+  return 0;
+}
+/* *INDENT-OFF* */
+VLIB_CLI_COMMAND (cli_unix_wait_cmd, static) = {
+  .path = "wait",
+  .short_help = "wait <sec>",
+  .function = unix_wait_cmd,
+};
+/* *INDENT-ON* */
+
+static clib_error_t *
+echo_cmd (vlib_main_t * vm,
+	  unformat_input_t * input, vlib_cli_command_t * cmd)
+{
+  unformat_input_t _line_input, *line_input = &_line_input;
+
+  /* Get a line of input. */
+  if (!unformat_user (input, unformat_line_input, line_input))
+    {
+      vlib_cli_output (vm, "");
+      return 0;
+    }
+
+  vlib_cli_output (vm, "%v", line_input->buffer);
+
+  unformat_free (line_input);
+  return 0;
+}
+
+/* *INDENT-OFF* */
+VLIB_CLI_COMMAND (cli_unix_echo_cmd, static) = {
+  .path = "echo",
+  .short_help = "echo <rest-of-line>",
+  .function = echo_cmd,
+};
+/* *INDENT-ON* */
+
+static clib_error_t *
+define_cmd_fn (vlib_main_t * vm,
+	       unformat_input_t * input, vlib_cli_command_t * cmd)
+{
+  u8 *macro_name;
+  unformat_input_t _line_input, *line_input = &_line_input;
+  clib_macro_main_t *mm = get_macro_main ();
+  clib_error_t *error;
+
+  if (!unformat (input, "%s", &macro_name))
+    return clib_error_return (0, "missing variable name...");
+
+  /* Remove white space */
+  (void) unformat (input, "");
+
+  /* Get a line of input. */
+  if (!unformat_user (input, unformat_line_input, line_input))
+    {
+      error = clib_error_return (0, "missing value for '%s'...", macro_name);
+      vec_free (macro_name);
+      return error;
+    }
+  /* the macro expander expects c-strings, not vectors... */
+  vec_add1 (line_input->buffer, 0);
+  clib_macro_set_value (mm, (char *) macro_name, (char *) line_input->buffer);
+  vec_free (macro_name);
+  unformat_free (line_input);
+  return 0;
+}
+
+/* *INDENT-OFF* */
+VLIB_CLI_COMMAND (define_cmd, static) = {
+  .path = "define",
+  .short_help = "define <variable-name> <value>",
+  .function = define_cmd_fn,
+};
+
+/* *INDENT-ON* */
+
+static clib_error_t *
+undefine_cmd_fn (vlib_main_t * vm,
+		 unformat_input_t * input, vlib_cli_command_t * cmd)
+{
+  u8 *macro_name;
+  clib_macro_main_t *mm = get_macro_main ();
+
+  if (!unformat (input, "%s", &macro_name))
+    return clib_error_return (0, "missing variable name...");
+
+  if (clib_macro_unset (mm, (char *) macro_name))
+    vlib_cli_output (vm, "%s wasn't set...", macro_name);
+
+  vec_free (macro_name);
+  return 0;
+}
+
+/* *INDENT-OFF* */
+VLIB_CLI_COMMAND (undefine_cmd, static) = {
+  .path = "undefine",
+  .short_help = "undefine <variable-name>",
+  .function = undefine_cmd_fn,
+};
+/* *INDENT-ON* */
+
+static clib_error_t *
+show_macro_cmd_fn (vlib_main_t * vm,
+		   unformat_input_t * input, vlib_cli_command_t * cmd)
+{
+  clib_macro_main_t *mm = get_macro_main ();
+  int evaluate = 1;
+
+  if (unformat (input, "noevaluate %=", &evaluate, 0))
+    ;
+  else if (unformat (input, "noeval %=", &evaluate, 0))
+    ;
+
+  vlib_cli_output (vm, "%U", format_clib_macro_main, mm, evaluate);
+  return 0;
+}
+
+/* *INDENT-OFF* */
+VLIB_CLI_COMMAND (show_macro, static) = {
+  .path = "show macro",
+  .short_help = "show macro [noevaluate]",
+  .function = show_macro_cmd_fn,
+};
+/* *INDENT-ON* */
+
 static clib_error_t *
 unix_cli_init (vlib_main_t * vm)
 {
@@ -3855,6 +4077,7 @@ unix_cli_init (vlib_main_t * vm)
   /* Breadcrumb to indicate the new session process
    * has not been started */
   cm->new_session_process_node_index = ~0;
+  clib_macro_init (&cm->macro_main);
 
   return 0;
 }

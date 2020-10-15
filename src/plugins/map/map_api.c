@@ -22,6 +22,9 @@
 #include <map/map.api_enum.h>
 #include <map/map.api_types.h>
 #include <vnet/ip/ip.h>
+#include <vnet/ip/reass/ip4_sv_reass.h>
+#include <vnet/ip/reass/ip6_sv_reass.h>
+#include <vnet/ip/reass/ip6_full_reass.h>
 #include <vnet/fib/fib_table.h>
 #include <vlibmemory/api.h>
 
@@ -37,7 +40,7 @@ vl_api_map_add_domain_t_handler (vl_api_map_add_domain_t * mp)
   u32 index;
   u8 flags = 0;
 
-  u8 *tag = format (0, "%s", mp->tag);
+  mp->tag[ARRAY_LEN (mp->tag) - 1] = '\0';
   rv =
     map_create_domain ((ip4_address_t *) & mp->ip4_prefix.address,
 		       mp->ip4_prefix.len,
@@ -45,13 +48,14 @@ vl_api_map_add_domain_t_handler (vl_api_map_add_domain_t * mp)
 		       mp->ip6_prefix.len,
 		       (ip6_address_t *) & mp->ip6_src.address,
 		       mp->ip6_src.len, mp->ea_bits_len, mp->psid_offset,
-		       mp->psid_length, &index, ntohs (mp->mtu), flags, tag);
-  vec_free (tag);
+		       mp->psid_length, &index, mp->mtu, flags, mp->tag);
+
   /* *INDENT-OFF* */
-  REPLY_MACRO2(VL_API_MAP_ADD_DOMAIN_REPLY,
+  REPLY_MACRO2_END(VL_API_MAP_ADD_DOMAIN_REPLY,
   ({
-    rmp->index = ntohl(index);
+    rmp->index = index;
   }));
+
   /* *INDENT-ON* */
 }
 
@@ -82,14 +86,48 @@ vl_api_map_add_del_rule_t_handler (vl_api_map_add_del_rule_t * mp)
 }
 
 static void
+send_domain_details (u32 map_domain_index, vl_api_registration_t * rp,
+		     u32 context)
+{
+  map_main_t *mm = &map_main;
+  vl_api_map_domain_details_t *rmp;
+  map_domain_t *d = pool_elt_at_index (mm->domains, map_domain_index);
+
+  /* Make sure every field is initiated (or don't skip the clib_memset()) */
+  map_domain_extra_t *de =
+    vec_elt_at_index (mm->domain_extras, map_domain_index);
+  int tag_len = clib_min (ARRAY_LEN (rmp->tag), vec_len (de->tag) + 1);
+
+  /* *INDENT-OFF* */
+  REPLY_MACRO_DETAILS4(VL_API_MAP_DOMAIN_DETAILS, rp, context,
+  ({
+    rmp->domain_index = htonl (map_domain_index);
+    clib_memcpy (&rmp->ip6_prefix.address, &d->ip6_prefix,
+		 sizeof (rmp->ip6_prefix.address));
+    clib_memcpy (&rmp->ip4_prefix.address, &d->ip4_prefix,
+		 sizeof (rmp->ip4_prefix.address));
+    clib_memcpy (&rmp->ip6_src.address, &d->ip6_src,
+		 sizeof (rmp->ip6_src.address));
+    rmp->ip6_prefix.len = d->ip6_prefix_len;
+    rmp->ip4_prefix.len = d->ip4_prefix_len;
+    rmp->ip6_src.len = d->ip6_src_len;
+    rmp->ea_bits_len = d->ea_bits_len;
+    rmp->psid_offset = d->psid_offset;
+    rmp->psid_length = d->psid_length;
+    rmp->flags = d->flags;
+    rmp->mtu = htons (d->mtu);
+    memcpy (rmp->tag, de->tag, tag_len - 1);
+    rmp->tag[tag_len - 1] = '\0';
+  }));
+  /* *INDENT-ON* */
+}
+
+static void
 vl_api_map_domain_dump_t_handler (vl_api_map_domain_dump_t * mp)
 {
-  vl_api_map_domain_details_t *rmp;
   map_main_t *mm = &map_main;
-  map_domain_t *d;
-  map_domain_extra_t *de;
+  int i;
   vl_api_registration_t *reg;
-  u32 map_domain_index;
 
   if (pool_elts (mm->domains) == 0)
     return;
@@ -99,33 +137,28 @@ vl_api_map_domain_dump_t_handler (vl_api_map_domain_dump_t * mp)
     return;
 
   /* *INDENT-OFF* */
-  pool_foreach(d, mm->domains,
+  pool_foreach_index(i, mm->domains,
   ({
-    map_domain_index = d - mm->domains;
-    de = vec_elt_at_index(mm->domain_extras, map_domain_index);
-    int tag_len = clib_min(ARRAY_LEN(rmp->tag), vec_len(de->tag) + 1);
+    send_domain_details(i, reg, mp->context);
+  }));
+  /* *INDENT-ON* */
+}
 
-    /* Make sure every field is initiated (or don't skip the clib_memset()) */
-    rmp = vl_msg_api_alloc (sizeof (*rmp) + tag_len);
+static void
+vl_api_map_domains_get_t_handler (vl_api_map_domains_get_t * mp)
+{
+  map_main_t *mm = &map_main;
+  vl_api_map_domains_get_reply_t *rmp;
 
-    rmp->_vl_msg_id = htons(VL_API_MAP_DOMAIN_DETAILS + mm->msg_id_base);
-    rmp->context = mp->context;
-    rmp->domain_index = htonl(map_domain_index);
-    clib_memcpy(&rmp->ip6_prefix.address, &d->ip6_prefix, sizeof(rmp->ip6_prefix.address));
-    clib_memcpy(&rmp->ip4_prefix.address, &d->ip4_prefix, sizeof(rmp->ip4_prefix.address));
-    clib_memcpy(&rmp->ip6_src.address, &d->ip6_src, sizeof(rmp->ip6_src.address));
-    rmp->ip6_prefix.len = d->ip6_prefix_len;
-    rmp->ip4_prefix.len = d->ip4_prefix_len;
-    rmp->ip6_src.len = d->ip6_src_len;
-    rmp->ea_bits_len = d->ea_bits_len;
-    rmp->psid_offset = d->psid_offset;
-    rmp->psid_length = d->psid_length;
-    rmp->flags = d->flags;
-    rmp->mtu = htons(d->mtu);
-    memcpy(rmp->tag, de->tag, tag_len-1);
-    rmp->tag[tag_len-1] = '\0';
+  i32 rv = 0;
 
-    vl_api_send_msg (reg, (u8 *) rmp);
+  if (pool_elts (mm->domains) == 0)
+    return;
+
+  /* *INDENT-OFF* */
+  REPLY_AND_DETAILS_MACRO (VL_API_MAP_DOMAINS_GET_REPLY, mm->domains,
+  ({
+    send_domain_details (cursor, rp, mp->context);
   }));
   /* *INDENT-ON* */
 }
@@ -328,140 +361,6 @@ static void
   REPLY_MACRO (VL_API_MAP_PARAM_ADD_DEL_PRE_RESOLVE_REPLY);
 }
 
-
-int
-map_param_set_reassembly (bool is_ipv6,
-			  u16 lifetime_ms,
-			  u16 pool_size,
-			  u32 buffers,
-			  f64 ht_ratio, u32 * reass, u32 * packets)
-{
-  u32 ps_reass = 0, ps_packets = 0;
-  u32 ht_reass = 0, ht_packets = 0;
-
-  if (is_ipv6)
-    {
-      if (pool_size != (u16) ~ 0)
-	{
-	  if (pool_size > MAP_IP6_REASS_CONF_POOL_SIZE_MAX)
-	    return MAP_ERR_BAD_POOL_SIZE;
-	  if (map_ip6_reass_conf_pool_size
-	      (pool_size, &ps_reass, &ps_packets))
-	    return MAP_ERR_BAD_POOL_SIZE;
-	}
-
-      if (ht_ratio != (MAP_IP6_REASS_CONF_HT_RATIO_MAX + 1))
-	{
-	  if (ht_ratio > MAP_IP6_REASS_CONF_HT_RATIO_MAX)
-	    return MAP_ERR_BAD_HT_RATIO;
-	  if (map_ip6_reass_conf_ht_ratio (ht_ratio, &ht_reass, &ht_packets))
-	    return MAP_ERR_BAD_HT_RATIO;
-	}
-
-      if (lifetime_ms != (u16) ~ 0)
-	{
-	  if (lifetime_ms > MAP_IP6_REASS_CONF_LIFETIME_MAX)
-	    return MAP_ERR_BAD_LIFETIME;
-	  if (map_ip6_reass_conf_lifetime (lifetime_ms))
-	    return MAP_ERR_BAD_LIFETIME;
-	}
-
-      if (buffers != ~0)
-	{
-	  if (buffers > MAP_IP6_REASS_CONF_BUFFERS_MAX)
-	    return MAP_ERR_BAD_BUFFERS;
-	  if (map_ip6_reass_conf_buffers (buffers))
-	    return MAP_ERR_BAD_BUFFERS;
-	}
-
-      if (map_main.ip6_reass_conf_buffers >
-	  map_main.ip6_reass_conf_pool_size *
-	  MAP_IP6_REASS_MAX_FRAGMENTS_PER_REASSEMBLY)
-	{
-	  return MAP_ERR_BAD_BUFFERS_TOO_LARGE;
-	}
-    }
-  else
-    {
-      if (pool_size != (u16) ~ 0)
-	{
-	  if (pool_size > MAP_IP4_REASS_CONF_POOL_SIZE_MAX)
-	    return MAP_ERR_BAD_POOL_SIZE;
-	  if (map_ip4_reass_conf_pool_size
-	      (pool_size, &ps_reass, &ps_packets))
-	    return MAP_ERR_BAD_POOL_SIZE;
-	}
-
-      if (ht_ratio != (MAP_IP4_REASS_CONF_HT_RATIO_MAX + 1))
-	{
-	  if (ht_ratio > MAP_IP4_REASS_CONF_HT_RATIO_MAX)
-	    return MAP_ERR_BAD_HT_RATIO;
-	  if (map_ip4_reass_conf_ht_ratio (ht_ratio, &ht_reass, &ht_packets))
-	    return MAP_ERR_BAD_HT_RATIO;
-	}
-
-      if (lifetime_ms != (u16) ~ 0)
-	{
-	  if (lifetime_ms > MAP_IP4_REASS_CONF_LIFETIME_MAX)
-	    return MAP_ERR_BAD_LIFETIME;
-	  if (map_ip4_reass_conf_lifetime (lifetime_ms))
-	    return MAP_ERR_BAD_LIFETIME;
-	}
-
-      if (buffers != ~0)
-	{
-	  if (buffers > MAP_IP4_REASS_CONF_BUFFERS_MAX)
-	    return MAP_ERR_BAD_BUFFERS;
-	  if (map_ip4_reass_conf_buffers (buffers))
-	    return MAP_ERR_BAD_BUFFERS;
-	}
-
-      if (map_main.ip4_reass_conf_buffers >
-	  map_main.ip4_reass_conf_pool_size *
-	  MAP_IP4_REASS_MAX_FRAGMENTS_PER_REASSEMBLY)
-	{
-	  return MAP_ERR_BAD_BUFFERS_TOO_LARGE;
-	}
-    }
-
-  if (reass)
-    *reass = ps_reass + ht_reass;
-
-  if (packets)
-    *packets = ps_packets + ht_packets;
-
-  return 0;
-}
-
-
-static void
-  vl_api_map_param_set_reassembly_t_handler
-  (vl_api_map_param_set_reassembly_t * mp)
-{
-  map_main_t *mm = &map_main;
-  vl_api_map_param_set_reassembly_reply_t *rmp;
-  u32 reass = 0, packets = 0;
-  int rv;
-  f64 ht_ratio;
-
-  ht_ratio = (f64) clib_net_to_host_f64 (mp->ht_ratio);
-  if (ht_ratio == ~0)
-    ht_ratio = MAP_IP6_REASS_CONF_HT_RATIO_MAX + 1;
-
-  rv = map_param_set_reassembly (mp->is_ip6,
-				 clib_net_to_host_u16 (mp->lifetime_ms),
-				 clib_net_to_host_u16 (mp->pool_size),
-				 clib_net_to_host_u32 (mp->buffers),
-				 ht_ratio, &reass, &packets);
-
-  /*
-   * FIXME: Should the lost reass and packet counts be returned in the API?
-   */
-
-  REPLY_MACRO (VL_API_MAP_PARAM_SET_REASSEMBLY_REPLY);
-}
-
-
 int
 map_param_set_security_check (bool enable, bool fragments)
 {
@@ -566,18 +465,6 @@ vl_api_map_param_get_t_handler (vl_api_map_param_get_t * mp)
   clib_memset (&rmp->ip4_nh_address, 0, sizeof (rmp->ip4_nh_address));
   clib_memset (&rmp->ip6_nh_address, 0, sizeof (rmp->ip6_nh_address));
 
-  rmp->ip4_lifetime_ms =
-    clib_net_to_host_u16 (mm->ip4_reass_conf_lifetime_ms);
-  rmp->ip4_pool_size = clib_net_to_host_u16 (mm->ip4_reass_conf_pool_size);
-  rmp->ip4_buffers = clib_net_to_host_u32 (mm->ip4_reass_conf_buffers);
-  rmp->ip4_ht_ratio = clib_net_to_host_f64 (mm->ip4_reass_conf_ht_ratio);
-
-  rmp->ip6_lifetime_ms =
-    clib_net_to_host_u16 (mm->ip6_reass_conf_lifetime_ms);
-  rmp->ip6_pool_size = clib_net_to_host_u16 (mm->ip6_reass_conf_pool_size);
-  rmp->ip6_buffers = clib_net_to_host_u32 (mm->ip6_reass_conf_buffers);
-  rmp->ip6_ht_ratio = clib_net_to_host_f64 (mm->ip6_reass_conf_ht_ratio);
-
   rmp->sec_check_enable = mm->sec_check;
   rmp->sec_check_fragments = mm->sec_check_frag;
 
@@ -614,6 +501,8 @@ map_if_enable_disable (bool is_enable, u32 sw_if_index, bool is_translation)
 
   if (is_translation == false)
     {
+      ip4_sv_reass_enable_disable_with_refcnt (sw_if_index, is_enable);
+      ip6_full_reass_enable_disable_with_refcnt (sw_if_index, is_enable);
       vnet_feature_enable_disable ("ip4-unicast", "ip4-map", sw_if_index,
 				   is_enable ? 1 : 0, 0, 0);
       vnet_feature_enable_disable ("ip6-unicast", "ip6-map", sw_if_index,
@@ -624,6 +513,8 @@ map_if_enable_disable (bool is_enable, u32 sw_if_index, bool is_translation)
     }
   else
     {
+      ip4_sv_reass_enable_disable_with_refcnt (sw_if_index, is_enable);
+      ip6_sv_reass_enable_disable_with_refcnt (sw_if_index, is_enable);
       vnet_feature_enable_disable ("ip4-unicast", "ip4-map-t", sw_if_index,
 				   is_enable ? 1 : 0, 0, 0);
       vnet_feature_enable_disable ("ip6-unicast", "ip6-map-t", sw_if_index,
@@ -665,6 +556,9 @@ map_plugin_api_hookup (vlib_main_t * vm)
   map_main_t *mm = &map_main;
 
   mm->msg_id_base = setup_message_id_table ();
+
+  api_main_t *am = vlibapi_get_main ();
+  am->is_autoendian[mm->msg_id_base + VL_API_MAP_ADD_DOMAIN] = 1;
   return 0;
 }
 

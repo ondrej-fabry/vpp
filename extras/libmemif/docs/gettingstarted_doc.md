@@ -18,7 +18,7 @@ control_fd_update (int fd, uint8_t events)
 err = memif_init (control_fd_update, APP_NAME, NULL, NULL);
 ```
    
-> If event occurres on any file descriptor returned by this callback, call memif\_control\_fd\_handler function. Since version 2.0, last two optional arguments are used to specify custom memory allocation.
+> If event occurs on any file descriptor returned by this callback, call memif\_control\_fd\_handler function. Since version 2.0, last two optional arguments are used to specify custom memory allocation.
 ```C
 memif_err = memif_control_fd_handler (evt.data.fd, events);
 ``` 
@@ -38,7 +38,7 @@ memif_err = memif_control_fd_handler (evt.data.fd, events);
 > Memif initialization function will initialize internal structures and create timer file descriptor, which will be used for sending periodic connection requests. Timer is disarmed if no memif interface is created.
  
 2. Creating interface
-   - Declare memif connction handle.
+   - Declare memif connection handle.
 ```C
 memif_conn_handle_t c;
 ```
@@ -114,7 +114,7 @@ typedef struct
 ```
 
 5. Packet receive
-    - Api call memif\_rx\_burst will set all required fields in memif buffers provided by user application and dequeue received buffers.
+    - Api call memif\_rx\_burst will set all required fields in memif buffers provided by user application, dequeue received buffers and consume interrupt event on receive queue. The event is not consumed, if memif_rx_burst fails.
 ```C
 err = memif_rx_burst (c->conn, qid, c->bufs, MAX_MEMIF_BUFS, &rx);
 ```
@@ -180,7 +180,7 @@ ICMP Responder multi-thread.
 
 VPP config:
 ```
-# create memif id 0 master
+# create interface memif id 0 master
 # set int state memif0 up
 # set int ip address memif0 192.168.1.1/24
 # ping 192.168.1.2
@@ -200,7 +200,7 @@ cpu {
 ```
 VPP config:
 ```
-# create memif id 0 master
+# create interface memif id 0 master
 # set int state memif0 up
 # set int ip address memif0 192.168.1.1/24
 # ping 192.168.1.2

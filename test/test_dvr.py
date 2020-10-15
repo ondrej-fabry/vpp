@@ -1,15 +1,17 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 import unittest
 
 from framework import VppTestCase, VppTestRunner
 from vpp_ip_route import VppIpRoute, VppRoutePath, FibPathType
 from vpp_l2 import L2_PORT_TYPE
 from vpp_sub_interface import L2_VTR_OP, VppDot1QSubint
+from vpp_acl import AclRule, VppAcl, VppAclInterface
 
 from scapy.packet import Raw
 from scapy.layers.l2 import Ether, Dot1Q
 from scapy.layers.inet import IP, UDP
 from socket import AF_INET, inet_pton
+from ipaddress import IPv4Network
 
 NUM_PKTS = 67
 
@@ -75,13 +77,13 @@ class TestDVR(VppTestCase):
                       IP(src=any_src_addr,
                          dst=ip_non_tag_bridged) /
                       UDP(sport=1234, dport=1234) /
-                      Raw('\xa5' * 100))
+                      Raw(b'\xa5' * 100))
         pkt_tag = (Ether(src=self.pg0.remote_mac,
                          dst=self.loop0.local_mac) /
                    IP(src=any_src_addr,
                       dst=ip_tag_bridged) /
                    UDP(sport=1234, dport=1234) /
-                   Raw('\xa5' * 100))
+                   Raw(b'\xa5' * 100))
 
         #
         # Two sub-interfaces so we can test VLAN tag push/pop
@@ -158,7 +160,7 @@ class TestDVR(VppTestCase):
                           IP(src=any_src_addr,
                              dst=ip_tag_bridged) /
                           UDP(sport=1234, dport=1234) /
-                          Raw('\xa5' * 100))
+                          Raw(b'\xa5' * 100))
 
         rx = self.send_and_expect(self.pg2,
                                   pkt_tag_to_tag * NUM_PKTS,
@@ -175,7 +177,7 @@ class TestDVR(VppTestCase):
                               IP(src=any_src_addr,
                                  dst=ip_non_tag_bridged) /
                               UDP(sport=1234, dport=1234) /
-                              Raw('\xa5' * 100))
+                              Raw(b'\xa5' * 100))
 
         rx = self.send_and_expect(self.pg2,
                                   pkt_tag_to_non_tag * NUM_PKTS,
@@ -186,26 +188,18 @@ class TestDVR(VppTestCase):
         #
         # Add an output L3 ACL that will block the traffic
         #
-        rule_1 = ({'is_permit': 0,
-                   'is_ipv6': 0,
-                   'proto': 17,
-                   'srcport_or_icmptype_first': 1234,
-                   'srcport_or_icmptype_last': 1234,
-                   'src_ip_prefix_len': 32,
-                   'src_ip_addr': inet_pton(AF_INET, any_src_addr),
-                   'dstport_or_icmpcode_first': 1234,
-                   'dstport_or_icmpcode_last': 1234,
-                   'dst_ip_prefix_len': 32,
-                   'dst_ip_addr': inet_pton(AF_INET, ip_non_tag_bridged)})
-        acl = self.vapi.acl_add_replace(acl_index=4294967295,
-                                        r=[rule_1])
+        rule_1 = AclRule(is_permit=0, proto=17, ports=1234,
+                         src_prefix=IPv4Network((any_src_addr, 32)),
+                         dst_prefix=IPv4Network((ip_non_tag_bridged, 32)))
+        acl = VppAcl(self, rules=[rule_1])
+        acl.add_vpp_config()
 
         #
         # Apply the ACL on the output interface
         #
-        self.vapi.acl_interface_set_acl_list(self.pg1.sw_if_index,
-                                             0,
-                                             [acl.acl_index])
+        acl_if1 = VppAclInterface(self, sw_if_index=self.pg1.sw_if_index,
+                                  n_input=0, acls=[acl])
+        acl_if1.add_vpp_config()
 
         #
         # Send packet's that should match the ACL and be dropped
@@ -216,9 +210,8 @@ class TestDVR(VppTestCase):
         #
         # cleanup
         #
-        self.vapi.acl_interface_set_acl_list(self.pg1.sw_if_index,
-                                             0, [])
-        self.vapi.acl_del(acl.acl_index)
+        acl_if1.remove_vpp_config()
+        acl.remove_vpp_config()
 
         self.vapi.sw_interface_set_l2_bridge(
             rx_sw_if_index=self.pg0.sw_if_index, bd_id=1, enable=0)
@@ -270,33 +263,33 @@ class TestDVR(VppTestCase):
                       IP(src="2.2.2.2",
                          dst="1.1.1.1") /
                       UDP(sport=1234, dport=1234) /
-                      Raw('\xa5' * 100))
+                      Raw(b'\xa5' * 100))
         pkt_to_tag = (Ether(src=self.pg0.remote_mac,
                             dst=self.pg2.remote_mac) /
                       IP(src="2.2.2.2",
                          dst="1.1.1.2") /
                       UDP(sport=1234, dport=1234) /
-                      Raw('\xa5' * 100))
+                      Raw(b'\xa5' * 100))
         pkt_from_tag = (Ether(src=self.pg3.remote_mac,
                               dst=self.pg2.remote_mac) /
                         Dot1Q(vlan=93) /
                         IP(src="2.2.2.2",
                            dst="1.1.1.1") /
                         UDP(sport=1234, dport=1234) /
-                        Raw('\xa5' * 100))
+                        Raw(b'\xa5' * 100))
         pkt_from_to_tag = (Ether(src=self.pg3.remote_mac,
                                  dst=self.pg2.remote_mac) /
                            Dot1Q(vlan=93) /
                            IP(src="2.2.2.2",
                               dst="1.1.1.2") /
                            UDP(sport=1234, dport=1234) /
-                           Raw('\xa5' * 100))
+                           Raw(b'\xa5' * 100))
         pkt_bcast = (Ether(src=self.pg0.remote_mac,
                            dst="ff:ff:ff:ff:ff:ff") /
                      IP(src="2.2.2.2",
                         dst="255.255.255.255") /
                      UDP(sport=1234, dport=1234) /
-                     Raw('\xa5' * 100))
+                     Raw(b'\xa5' * 100))
 
         #
         # A couple of sub-interfaces for tags

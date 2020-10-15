@@ -74,7 +74,7 @@ search across 2**log2_size backing pages on a per-bucket basis.
 
 To maintain *space* efficiency, we should configure the bucket array
 so that backing pages are effectively utilized. Lookup performance
-tends to change *very litte* if the bucket array is too small or too
+tends to change *very little* if the bucket array is too small or too
 large.
 
 Bihash depends on selecting an effective hash function. If one were to
@@ -201,9 +201,9 @@ The simplest possible (key, value) search goes like so:
    search_kv.key = key_to_add_or_delete;
 
    if (clib_bihash_search_8_8 (h, &search_kv, &return_kv) < 0)
-     key_not_found()
-   else
      key_not_found();
+   else
+     key_found();
 ```
 
 Note that it's perfectly fine to collect the lookup result

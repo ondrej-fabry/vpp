@@ -21,7 +21,6 @@
 */
 
 #include <vlib/vlib.h>
-#include <vnet/pg/pg.h>
 #include <vnet/vxlan-gpe/vxlan_gpe.h>
 
 /**
@@ -788,20 +787,29 @@ ip_vxlan_gpe_bypass_inline (vlib_main_t * vm,
   u32 *from, *to_next, n_left_from, n_left_to_next, next_index;
   vlib_node_runtime_t *error_node =
     vlib_node_get_runtime (vm, ip4_input_node.index);
-  ip4_address_t addr4;		/* last IPv4 address matching a local VTEP address */
-  ip6_address_t addr6;		/* last IPv6 address matching a local VTEP address */
+  vtep4_key_t last_vtep4;	/* last IPv4 address / fib index
+				   matching a local VTEP address */
+  vtep6_key_t last_vtep6;	/* last IPv6 address / fib index
+				   matching a local VTEP address */
+  vlib_buffer_t *bufs[VLIB_FRAME_SIZE], **b = bufs;
+#ifdef CLIB_HAVE_VEC512
+  vtep4_cache_t vtep4_u512;
+  clib_memset (&vtep4_u512, 0, sizeof (vtep4_u512));
+#endif
 
   from = vlib_frame_vector_args (frame);
   n_left_from = frame->n_vectors;
   next_index = node->cached_next_index;
 
+  vlib_get_buffers (vm, from, bufs, n_left_from);
+
   if (node->flags & VLIB_NODE_FLAG_TRACE)
     ip4_forward_next_trace (vm, node, frame, VLIB_TX);
 
   if (is_ip4)
-    addr4.data_u32 = ~0;
+    vtep4_key_init (&last_vtep4);
   else
-    ip6_address_set_zero (&addr6);
+    vtep6_key_init (&last_vtep6);
 
   while (n_left_from > 0)
     {
@@ -821,16 +829,11 @@ ip_vxlan_gpe_bypass_inline (vlib_main_t * vm,
 
 	  /* Prefetch next iteration. */
 	  {
-	    vlib_buffer_t *p2, *p3;
+	    vlib_prefetch_buffer_header (b[2], LOAD);
+	    vlib_prefetch_buffer_header (b[3], LOAD);
 
-	    p2 = vlib_get_buffer (vm, from[2]);
-	    p3 = vlib_get_buffer (vm, from[3]);
-
-	    vlib_prefetch_buffer_header (p2, LOAD);
-	    vlib_prefetch_buffer_header (p3, LOAD);
-
-	    CLIB_PREFETCH (p2->data, 2 * CLIB_CACHE_LINE_BYTES, LOAD);
-	    CLIB_PREFETCH (p3->data, 2 * CLIB_CACHE_LINE_BYTES, LOAD);
+	    CLIB_PREFETCH (b[2]->data, 2 * CLIB_CACHE_LINE_BYTES, LOAD);
+	    CLIB_PREFETCH (b[3]->data, 2 * CLIB_CACHE_LINE_BYTES, LOAD);
 	  }
 
 	  bi0 = to_next[0] = from[0];
@@ -840,8 +843,9 @@ ip_vxlan_gpe_bypass_inline (vlib_main_t * vm,
 	  to_next += 2;
 	  n_left_to_next -= 2;
 
-	  b0 = vlib_get_buffer (vm, bi0);
-	  b1 = vlib_get_buffer (vm, bi1);
+	  b0 = b[0];
+	  b1 = b[1];
+	  b += 2;
 	  if (is_ip4)
 	    {
 	      ip40 = vlib_buffer_get_current (b0);
@@ -883,21 +887,18 @@ ip_vxlan_gpe_bypass_inline (vlib_main_t * vm,
 	  /* Validate DIP against VTEPs */
 	  if (is_ip4)
 	    {
-	      if (addr4.as_u32 != ip40->dst_address.as_u32)
-		{
-		  if (!hash_get (ngm->vtep4, ip40->dst_address.as_u32))
-		    goto exit0;	/* no local VTEP for VXLAN packet */
-		  addr4 = ip40->dst_address;
-		}
+#ifdef CLIB_HAVE_VEC512
+	      if (!vtep4_check_vector
+		  (&ngm->vtep_table, b0, ip40, &last_vtep4, &vtep4_u512))
+#else
+	      if (!vtep4_check (&ngm->vtep_table, b0, ip40, &last_vtep4))
+#endif
+		goto exit0;	/* no local VTEP for VXLAN packet */
 	    }
 	  else
 	    {
-	      if (!ip6_address_is_equal (&addr6, &ip60->dst_address))
-		{
-		  if (!hash_get_mem (ngm->vtep6, &ip60->dst_address))
-		    goto exit0;	/* no local VTEP for VXLAN packet */
-		  addr6 = ip60->dst_address;
-		}
+	      if (!vtep6_check (&ngm->vtep_table, b0, ip60, &last_vtep6))
+		goto exit0;	/* no local VTEP for VXLAN packet */
 	    }
 
 	  flags0 = b0->flags;
@@ -969,21 +970,18 @@ ip_vxlan_gpe_bypass_inline (vlib_main_t * vm,
 	  /* Validate DIP against VTEPs */
 	  if (is_ip4)
 	    {
-	      if (addr4.as_u32 != ip41->dst_address.as_u32)
-		{
-		  if (!hash_get (ngm->vtep4, ip41->dst_address.as_u32))
-		    goto exit1;	/* no local VTEP for VXLAN packet */
-		  addr4 = ip41->dst_address;
-		}
+#ifdef CLIB_HAVE_VEC512
+	      if (!vtep4_check_vector
+		  (&ngm->vtep_table, b1, ip41, &last_vtep4, &vtep4_u512))
+#else
+	      if (!vtep4_check (&ngm->vtep_table, b1, ip41, &last_vtep4))
+#endif
+		goto exit1;	/* no local VTEP for VXLAN packet */
 	    }
 	  else
 	    {
-	      if (!ip6_address_is_equal (&addr6, &ip61->dst_address))
-		{
-		  if (!hash_get_mem (ngm->vtep6, &ip61->dst_address))
-		    goto exit1;	/* no local VTEP for VXLAN packet */
-		  addr6 = ip61->dst_address;
-		}
+	      if (!vtep6_check (&ngm->vtep_table, b1, ip61, &last_vtep6))
+		goto exit1;	/* no local VTEP for VXLAN packet */
 	    }
 
 	  flags1 = b1->flags;
@@ -1061,7 +1059,8 @@ ip_vxlan_gpe_bypass_inline (vlib_main_t * vm,
 	  to_next += 1;
 	  n_left_to_next -= 1;
 
-	  b0 = vlib_get_buffer (vm, bi0);
+	  b0 = b[0];
+	  b++;
 	  if (is_ip4)
 	    ip40 = vlib_buffer_get_current (b0);
 	  else
@@ -1087,23 +1086,21 @@ ip_vxlan_gpe_bypass_inline (vlib_main_t * vm,
 	    goto exit;		/* not VXLAN packet */
 
 	  /* Validate DIP against VTEPs */
+
 	  if (is_ip4)
 	    {
-	      if (addr4.as_u32 != ip40->dst_address.as_u32)
-		{
-		  if (!hash_get (ngm->vtep4, ip40->dst_address.as_u32))
-		    goto exit;	/* no local VTEP for VXLAN packet */
-		  addr4 = ip40->dst_address;
-		}
+#ifdef CLIB_HAVE_VEC512
+	      if (!vtep4_check_vector
+		  (&ngm->vtep_table, b0, ip40, &last_vtep4, &vtep4_u512))
+#else
+	      if (!vtep4_check (&ngm->vtep_table, b0, ip40, &last_vtep4))
+#endif
+		goto exit;	/* no local VTEP for VXLAN packet */
 	    }
 	  else
 	    {
-	      if (!ip6_address_is_equal (&addr6, &ip60->dst_address))
-		{
-		  if (!hash_get_mem (ngm->vtep6, &ip60->dst_address))
-		    goto exit;	/* no local VTEP for VXLAN packet */
-		  addr6 = ip60->dst_address;
-		}
+	      if (!vtep6_check (&ngm->vtep_table, b0, ip60, &last_vtep6))
+		goto exit;	/* no local VTEP for VXLAN packet */
 	    }
 
 	  flags0 = b0->flags;

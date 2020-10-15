@@ -413,6 +413,12 @@ gtpu_encap_inline (vlib_main_t * vm,
 	  stats_n_packets += 4;
 	  stats_n_bytes += len0 + len1 + len2 + len3;
 
+          /* save inner packet flow_hash for load-balance node */
+          vnet_buffer (b0)->ip.flow_hash = flow_hash0;
+          vnet_buffer (b1)->ip.flow_hash = flow_hash1;
+          vnet_buffer (b2)->ip.flow_hash = flow_hash2;
+          vnet_buffer (b3)->ip.flow_hash = flow_hash3;
+
 	  /* Batch stats increment on the same gtpu tunnel so counter is not
 	     incremented per packet. Note stats are still incremented for deleted
 	     and admin-down tunnel where packets are dropped. It is not worthwhile
@@ -459,7 +465,7 @@ gtpu_encap_inline (vlib_main_t * vm,
               gtpu_encap_trace_t *tr =
                 vlib_add_trace (vm, node, b0, sizeof (*tr));
               tr->tunnel_index = t0 - gtm->tunnels;
-              tr->teid = t0->teid;
+              tr->tteid = t0->tteid;
            }
 
           if (PREDICT_FALSE(b1->flags & VLIB_BUFFER_IS_TRACED))
@@ -467,7 +473,7 @@ gtpu_encap_inline (vlib_main_t * vm,
               gtpu_encap_trace_t *tr =
                 vlib_add_trace (vm, node, b1, sizeof (*tr));
               tr->tunnel_index = t1 - gtm->tunnels;
-              tr->teid = t1->teid;
+              tr->tteid = t1->tteid;
             }
 
 	  if (PREDICT_FALSE(b2->flags & VLIB_BUFFER_IS_TRACED))
@@ -475,7 +481,7 @@ gtpu_encap_inline (vlib_main_t * vm,
               gtpu_encap_trace_t *tr =
                 vlib_add_trace (vm, node, b2, sizeof (*tr));
               tr->tunnel_index = t2 - gtm->tunnels;
-              tr->teid = t2->teid;
+              tr->tteid = t2->tteid;
            }
 
           if (PREDICT_FALSE(b3->flags & VLIB_BUFFER_IS_TRACED))
@@ -483,7 +489,7 @@ gtpu_encap_inline (vlib_main_t * vm,
               gtpu_encap_trace_t *tr =
                 vlib_add_trace (vm, node, b3, sizeof (*tr));
               tr->tunnel_index = t3 - gtm->tunnels;
-              tr->teid = t3->teid;
+              tr->tteid = t3->tteid;
             }
 
 	  vlib_validate_buffer_enqueue_x4 (vm, node, next_index,
@@ -611,6 +617,9 @@ gtpu_encap_inline (vlib_main_t * vm,
 	  stats_n_packets += 1;
 	  stats_n_bytes += len0;
 
+          /* save inner packet flow_hash for load-balance node */
+          vnet_buffer (b0)->ip.flow_hash = flow_hash0;
+
 	  /* Batch stats increment on the same gtpu tunnel so counter is not
 	     incremented per packet. Note stats are still incremented for deleted
 	     and admin-down tunnel where packets are dropped. It is not worthwhile
@@ -634,7 +643,7 @@ gtpu_encap_inline (vlib_main_t * vm,
               gtpu_encap_trace_t *tr =
                 vlib_add_trace (vm, node, b0, sizeof (*tr));
               tr->tunnel_index = t0 - gtm->tunnels;
-              tr->teid = t0->teid;
+              tr->tteid = t0->tteid;
             }
 	  vlib_validate_buffer_enqueue_x1 (vm, node, next_index,
 					   to_next, n_left_to_next,

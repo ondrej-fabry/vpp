@@ -10,7 +10,7 @@ Run VPP and icmpr-epoll example (default example when running in container).
 
 VPP-side config:
 ```
-DBGvpp# create memif id 0 master
+DBGvpp# create interface memif id 0 master
 DBGvpp# set int state memif0/0 up
 DBGvpp# set int ip address memif0/0 192.168.1.1/24
 ```
@@ -18,7 +18,7 @@ icmpr-epoll:
 ```
 conn 0 0
 ```
-Memif in slave mode will try to connect every 2 seconds. If connection establishment is successfull, a message will show.
+Memif in slave mode will try to connect every 2 seconds. If connection establishment is successful, a message will show.
 ```
 INFO: memif connected!
 ```

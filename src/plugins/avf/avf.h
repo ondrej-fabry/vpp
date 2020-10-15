@@ -22,8 +22,17 @@
 
 #include <vlib/log.h>
 
+#define AVF_QUEUE_SZ_MAX                4096
+#define AVF_QUEUE_SZ_MIN                64
+
 #define AVF_AQ_ENQ_SUSPEND_TIME		50e-6
-#define AVF_AQ_ENQ_MAX_WAIT_TIME	50e-3
+#define AVF_AQ_ENQ_MAX_WAIT_TIME	250e-3
+
+#define AVF_RESET_SUSPEND_TIME		20e-3
+#define AVF_RESET_MAX_WAIT_TIME		1
+
+#define AVF_SEND_TO_PF_SUSPEND_TIME	10e-3
+#define AVF_SEND_TO_PF_MAX_WAIT_TIME	1
 
 #define AVF_RXD_STATUS(x)		(1ULL << x)
 #define AVF_RXD_STATUS_DD		AVF_RXD_STATUS(0)
@@ -63,7 +72,9 @@
   _(3, VA_DMA, "vaddr-dma") \
   _(4, LINK_UP, "link-up") \
   _(5, SHARED_TXQ_LOCK, "shared-txq-lock") \
-  _(6, ELOG, "elog")
+  _(6, ELOG, "elog") \
+  _(7, PROMISC, "promisc") \
+  _(8, RX_INT, "rx-interrupts")
 
 enum
 {
@@ -172,6 +183,7 @@ typedef struct
   u8 hwaddr[6];
   u16 num_queue_pairs;
   u16 max_vectors;
+  u16 n_rx_irqs;
   u16 max_mtu;
   u32 rss_key_size;
   u32 rss_lut_size;
@@ -191,9 +203,26 @@ typedef struct
 typedef enum
 {
   AVF_PROCESS_EVENT_START = 1,
-  AVF_PROCESS_EVENT_STOP = 2,
+  AVF_PROCESS_EVENT_DELETE_IF = 2,
   AVF_PROCESS_EVENT_AQ_INT = 3,
+  AVF_PROCESS_EVENT_REQ = 4,
 } avf_process_event_t;
+
+typedef enum
+{
+  AVF_PROCESS_REQ_ADD_DEL_ETH_ADDR = 1,
+  AVF_PROCESS_REQ_CONFIG_PROMISC_MDDE = 2,
+} avf_process_req_type_t;
+
+typedef struct
+{
+  avf_process_req_type_t type;
+  u32 dev_instance;
+  u32 calling_process_index;
+  u8 eth_addr[6];
+  int is_add, is_enable;
+  clib_error_t *error;
+} avf_process_req_t;
 
 typedef struct
 {
@@ -214,7 +243,7 @@ typedef struct
 {
   u16 msg_id_base;
 
-  avf_device_t *devices;
+  avf_device_t **devices;
   avf_per_thread_data_t *per_thread_data;
 
   vlib_log_class_t log_class;
@@ -237,15 +266,21 @@ typedef struct
 } avf_create_if_args_t;
 
 void avf_create_if (vlib_main_t * vm, avf_create_if_args_t * args);
-void avf_delete_if (vlib_main_t * vm, avf_device_t * ad);
 
 extern vlib_node_registration_t avf_input_node;
+extern vlib_node_registration_t avf_process_node;
 extern vnet_device_class_t avf_device_class;
 
 /* format.c */
 format_function_t format_avf_device;
 format_function_t format_avf_device_name;
 format_function_t format_avf_input_trace;
+
+static_always_inline avf_device_t *
+avf_get_device (u32 dev_instance)
+{
+  return pool_elt_at_index (avf_main.devices, dev_instance)[0];
+}
 
 static inline u32
 avf_get_u32 (void *start, int offset)
@@ -327,7 +362,8 @@ typedef struct
 } avf_input_trace_t;
 
 #define foreach_avf_tx_func_error	       \
-_(NO_FREE_SLOTS, "no free tx slots")
+  _(SEGMENT_SIZE_EXCEEDED, "segment size exceeded")	\
+  _(NO_FREE_SLOTS, "no free tx slots")
 
 typedef enum
 {

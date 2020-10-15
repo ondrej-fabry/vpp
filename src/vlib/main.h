@@ -40,6 +40,7 @@
 #ifndef included_vlib_main_h
 #define included_vlib_main_h
 
+#include <vppinfra/callback_data.h>
 #include <vppinfra/elog.h>
 #include <vppinfra/format.h>
 #include <vppinfra/longjmp.h>
@@ -73,6 +74,49 @@ typedef struct
   u32 filter_classify_table_index;
 } vnet_pcap_t;
 
+typedef struct
+{
+  u8 trace_filter_enable;
+  u32 trace_classify_table_index;
+  u32 trace_filter_set_index;
+} vlib_trace_filter_t;
+
+typedef enum
+{
+  VLIB_NODE_RUNTIME_PERF_BEFORE,
+  VLIB_NODE_RUNTIME_PERF_AFTER,
+  VLIB_NODE_RUNTIME_PERF_RESET,
+} vlib_node_runtime_perf_call_type_t;
+
+typedef struct
+{
+  struct vlib_main_t *vm;
+  vlib_node_runtime_t *node;
+  vlib_frame_t *frame;
+  uword packets;
+  u64 cpu_time_now;
+  vlib_node_runtime_perf_call_type_t call_type;
+} vlib_node_runtime_perf_callback_args_t;
+
+struct vlib_node_runtime_perf_callback_data_t;
+
+typedef void (*vlib_node_runtime_perf_callback_fp_t)
+  (struct vlib_node_runtime_perf_callback_data_t * data,
+   vlib_node_runtime_perf_callback_args_t * args);
+
+typedef struct vlib_node_runtime_perf_callback_data_t
+{
+  vlib_node_runtime_perf_callback_fp_t fp;
+  union
+  {
+    void *v;
+    u64 u;
+  } u[3];
+} vlib_node_runtime_perf_callback_data_t;
+
+clib_callback_data_typedef (vlib_node_runtime_perf_callback_set_t,
+			    vlib_node_runtime_perf_callback_data_t);
+
 typedef struct vlib_main_t
 {
   CLIB_CACHE_LINE_ALIGN_MARK (cacheline0);
@@ -89,27 +133,24 @@ typedef struct vlib_main_t
   u64 cpu_time_main_loop_start;
 
   /* Incremented once for each main loop. */
-  u32 main_loop_count;
+  volatile u32 main_loop_count;
 
   /* Count of vectors processed this main loop. */
   u32 main_loop_vectors_processed;
   u32 main_loop_nodes_processed;
 
-  /* Circular buffer of input node vector counts.
-     Indexed by low bits of
-     (main_loop_count >> VLIB_LOG2_INPUT_VECTORS_PER_MAIN_LOOP). */
-  u32 vector_counts_per_main_loop[2];
-  u32 node_counts_per_main_loop[2];
+  /* Internal node vectors, calls */
+  u64 internal_node_vectors;
+  u64 internal_node_calls;
+  u64 internal_node_vectors_last_clear;
+  u64 internal_node_calls_last_clear;
+
+  /* Instantaneous vector rate */
+  u32 internal_node_last_vectors_per_main_loop;
 
   /* Main loop hw / sw performance counters */
-  void (**vlib_node_runtime_perf_counter_cbs) (struct vlib_main_t *,
-					       u64 *, u64 *,
-					       vlib_node_runtime_t *,
-					       vlib_frame_t *, int);
-  void (**vlib_node_runtime_perf_counter_cb_tmp) (struct vlib_main_t *,
-						  u64 *, u64 *,
-						  vlib_node_runtime_t *,
-						  vlib_frame_t *, int);
+  vlib_node_runtime_perf_callback_set_t vlib_node_runtime_perf_callbacks;
+
   /* Every so often we switch to the next counter. */
 #define VLIB_LOG2_MAIN_LOOPS_PER_STATS_UPDATE 7
 
@@ -161,6 +202,9 @@ typedef struct vlib_main_t
 
   /* pcap rx / tx tracing */
   vnet_pcap_t pcap;
+
+  /* Packet trace capture filter */
+  vlib_trace_filter_t trace_filter;
 
   /* Error handling. */
   vlib_error_main_t error_main;
@@ -221,9 +265,10 @@ typedef struct vlib_main_t
   u8 **argv;
 
   /* Top of (worker) dispatch loop callback */
-  void (**volatile worker_thread_main_loop_callbacks) (struct vlib_main_t *);
+  void (**volatile worker_thread_main_loop_callbacks)
+    (struct vlib_main_t *, u64 t);
   void (**volatile worker_thread_main_loop_callback_tmp)
-    (struct vlib_main_t *);
+    (struct vlib_main_t *, u64 t);
   clib_spinlock_t worker_thread_main_loop_callback_lock;
 
   /* debugging */
@@ -238,6 +283,14 @@ typedef struct vlib_main_t
    */
   int need_vlib_worker_thread_node_runtime_update;
 
+  /* Dispatch loop time accounting */
+  u64 loops_this_reporting_interval;
+  f64 loop_interval_end;
+  f64 loop_interval_start;
+  f64 loops_per_second;
+  f64 seconds_per_loop;
+  f64 damping_constant;
+
   /*
    * Barrier epoch - Set to current time, each time barrier_sync or
    * barrier_release is called with zero recursion.
@@ -247,6 +300,12 @@ typedef struct vlib_main_t
   /* Earliest barrier can be closed again */
   f64 barrier_no_close_before;
 
+  /* Barrier counter callback */
+  void (**volatile barrier_perf_callbacks)
+    (struct vlib_main_t *, u64 t, int leave);
+  void (**volatile barrier_perf_callbacks_tmp)
+    (struct vlib_main_t *, u64 t, int leave);
+
   /* Need to check the frame queues */
   volatile uword check_frame_queues;
 
@@ -255,6 +314,14 @@ typedef struct vlib_main_t
   uword *processing_rpc_requests;
   clib_spinlock_t pending_rpc_lock;
 
+  /* buffer fault injector */
+  u32 buffer_alloc_success_seed;
+  f64 buffer_alloc_success_rate;
+
+#ifdef CLIB_SANITIZE_ADDR
+  /* address sanitizer stack save */
+  void *asan_stack_save;
+#endif
 } vlib_main_t;
 
 /* Global main structure. */
@@ -265,6 +332,13 @@ void vlib_worker_loop (vlib_main_t * vm);
 always_inline f64
 vlib_time_now (vlib_main_t * vm)
 {
+#if CLIB_DEBUG > 0
+  extern __thread uword __os_thread_index;
+#endif
+  /*
+   * Make sure folks don't pass &vlib_global_main from a worker thread.
+   */
+  ASSERT (vm->thread_index == __os_thread_index);
   return clib_time_now (&vm->clib_time) + vm->time_offset;
 }
 
@@ -323,73 +397,65 @@ vlib_panic (vlib_main_t * vm)
   vlib_panic_with_error (vm, 0);
 }
 
-always_inline u32
-vlib_vector_input_stats_index (vlib_main_t * vm, word delta)
-{
-  u32 i;
-  i = vm->main_loop_count >> VLIB_LOG2_MAIN_LOOPS_PER_STATS_UPDATE;
-  ASSERT (is_pow2 (ARRAY_LEN (vm->vector_counts_per_main_loop)));
-  return (i + delta) & (ARRAY_LEN (vm->vector_counts_per_main_loop) - 1);
-}
 
-/* Estimate input rate based on previous
-   2^VLIB_LOG2_MAIN_LOOPS_PER_STATS_UPDATE
-   samples. */
-always_inline u32
-vlib_last_vectors_per_main_loop (vlib_main_t * vm)
-{
-  u32 i = vlib_vector_input_stats_index (vm, -1);
-  u32 n = vm->vector_counts_per_main_loop[i];
-  return n >> VLIB_LOG2_MAIN_LOOPS_PER_STATS_UPDATE;
-}
-
-/* Total ave vector count per iteration of main loop. */
 always_inline f64
-vlib_last_vectors_per_main_loop_as_f64 (vlib_main_t * vm)
+vlib_internal_node_vector_rate (vlib_main_t * vm)
 {
-  u32 i = vlib_vector_input_stats_index (vm, -1);
-  u32 v = vm->vector_counts_per_main_loop[i];
-  return (f64) v / (f64) (1 << VLIB_LOG2_MAIN_LOOPS_PER_STATS_UPDATE);
+  u64 vectors;
+  u64 calls;
+
+  calls = vm->internal_node_calls - vm->internal_node_calls_last_clear;
+
+  if (PREDICT_FALSE (calls == 0))
+    return 0.0;
+
+  vectors = vm->internal_node_vectors - vm->internal_node_vectors_last_clear;
+
+  return (f64) vectors / (f64) calls;
 }
 
-/* Total ave vectors/node count per iteration of main loop. */
-always_inline f64
-vlib_last_vector_length_per_node (vlib_main_t * vm)
+always_inline void
+vlib_clear_internal_node_vector_rate (vlib_main_t * vm)
 {
-  u32 i = vlib_vector_input_stats_index (vm, -1);
-  u32 v = vm->vector_counts_per_main_loop[i];
-  u32 n = vm->node_counts_per_main_loop[i];
-  return n == 0 ? 0 : (f64) v / (f64) n;
+  vm->internal_node_calls_last_clear = vm->internal_node_calls;
+  vm->internal_node_vectors_last_clear = vm->internal_node_vectors;
 }
-
-extern u32 wraps;
 
 always_inline void
 vlib_increment_main_loop_counter (vlib_main_t * vm)
 {
-  u32 i, c, n, v, is_wrap;
-
-  c = vm->main_loop_count++;
-
-  is_wrap = (c & pow2_mask (VLIB_LOG2_MAIN_LOOPS_PER_STATS_UPDATE)) == 0;
-
-  if (is_wrap)
-    wraps++;
-
-  i = vlib_vector_input_stats_index (vm, /* delta */ is_wrap);
-
-  v = is_wrap ? 0 : vm->vector_counts_per_main_loop[i];
-  n = is_wrap ? 0 : vm->node_counts_per_main_loop[i];
-
-  v += vm->main_loop_vectors_processed;
-  n += vm->main_loop_nodes_processed;
-  vm->main_loop_vectors_processed = 0;
-  vm->main_loop_nodes_processed = 0;
-  vm->vector_counts_per_main_loop[i] = v;
-  vm->node_counts_per_main_loop[i] = n;
+  vm->main_loop_count++;
+  vm->internal_node_last_vectors_per_main_loop = 0;
 
   if (PREDICT_FALSE (vm->main_loop_exit_now))
     clib_longjmp (&vm->main_loop_exit, VLIB_MAIN_LOOP_EXIT_CLI);
+}
+
+always_inline u32
+vlib_last_vectors_per_main_loop (vlib_main_t * vm)
+{
+  return vm->internal_node_last_vectors_per_main_loop;
+}
+
+always_inline void
+vlib_node_runtime_perf_counter (vlib_main_t * vm, vlib_node_runtime_t * node,
+				vlib_frame_t * frame, uword n, u64 t,
+				vlib_node_runtime_perf_call_type_t call_type)
+{
+  vlib_node_runtime_perf_callback_data_t *v =
+    clib_callback_data_check_and_get (&vm->vlib_node_runtime_perf_callbacks);
+  if (vec_len (v))
+    {
+      vlib_node_runtime_perf_callback_args_t args = {
+	.vm = vm,
+	.node = node,
+	.frame = frame,
+	.packets = n,
+	.cpu_time_now = t,
+	.call_type = call_type,
+      };
+      clib_callback_data_call_vec (v, &args);
+    }
 }
 
 always_inline void vlib_set_queue_signal_callback
@@ -423,6 +489,8 @@ typedef struct
 } vlib_pcap_dispatch_trace_args_t;
 
 int vlib_pcap_dispatch_trace_configure (vlib_pcap_dispatch_trace_args_t *);
+vlib_main_t *vlib_get_main_not_inline (void);
+elog_main_t *vlib_get_elog_main_not_inline ();
 
 #endif /* included_vlib_main_h */
 

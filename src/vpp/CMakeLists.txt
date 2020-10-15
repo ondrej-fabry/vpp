@@ -33,17 +33,24 @@ add_custom_target(vpp_version_h
 ##############################################################################
 option(VPP_API_TEST_BUILTIN "Use builtin VPP API test." ON)
 
+configure_file(
+  ${CMAKE_SOURCE_DIR}/vpp/vnet/config.h.in
+  ${CMAKE_BINARY_DIR}/vpp/vnet/config.h
+)
+
 set(VPP_API_FILES
   api/vpe_types.api
   api/vpe.api
 )
 
-vpp_add_api_files(vpp ${VPP_API_FILES})
+vpp_add_api_files(vpp core vpp ${VPP_API_FILES})
 
 foreach(file ${VPP_API_FILES})
   get_filename_component(dir ${file} DIRECTORY)
   install(
     FILES ${CMAKE_CURRENT_BINARY_DIR}/${file}.h
+    ${CMAKE_CURRENT_BINARY_DIR}/${file}_enum.h
+    ${CMAKE_CURRENT_BINARY_DIR}/${file}_types.h
     DESTINATION include/vpp/${dir}
     COMPONENT vpp-dev
   )
@@ -66,6 +73,7 @@ if(VPP_API_TEST_BUILTIN)
     api/api_main.c
     api/plugin.c
     api/types.c
+    ../vnet/arp/arp_test.c
   )
   add_definitions(-DVPP_API_TEST_BUILTIN=1)
 endif()

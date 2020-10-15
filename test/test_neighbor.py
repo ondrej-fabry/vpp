@@ -1,6 +1,7 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import unittest
+import os
 from socket import AF_INET, AF_INET6, inet_pton
 
 from framework import VppTestCase, VppTestRunner
@@ -12,7 +13,7 @@ from vpp_papi import VppEnum
 import scapy.compat
 from scapy.packet import Raw
 from scapy.layers.l2 import Ether, ARP, Dot1Q
-from scapy.layers.inet import IP, UDP
+from scapy.layers.inet import IP, UDP, TCP
 from scapy.layers.inet6 import IPv6
 from scapy.contrib.mpls import MPLS
 from scapy.layers.inet6 import IPv6
@@ -156,6 +157,24 @@ class ARPTestCase(VppTestCase):
         self.pg1.generate_remote_hosts(11)
 
         #
+        # watch for:
+        #  - all neighbour events
+        #  - all neighbor events on pg1
+        #  - neighbor events for host[1] on pg1
+        #
+        self.vapi.want_ip_neighbor_events(enable=1,
+                                          pid=os.getpid())
+        self.vapi.want_ip_neighbor_events(enable=1,
+                                          pid=os.getpid(),
+                                          sw_if_index=self.pg1.sw_if_index)
+        self.vapi.want_ip_neighbor_events(enable=1,
+                                          pid=os.getpid(),
+                                          sw_if_index=self.pg1.sw_if_index,
+                                          ip=self.pg1.remote_hosts[1].ip4)
+
+        self.logger.info(self.vapi.cli("sh ip neighbor-watcher"))
+
+        #
         # Send IP traffic to one of these unresolved hosts.
         #  expect the generation of an ARP request
         #
@@ -183,6 +202,14 @@ class ARPTestCase(VppTestCase):
                               self.pg1.remote_hosts[1].mac,
                               self.pg1.remote_hosts[1].ip4)
         dyn_arp.add_vpp_config()
+        self.assertTrue(dyn_arp.query_vpp_config())
+
+        # this matches all of the listnerers
+        es = [self.vapi.wait_for_event(1, "ip_neighbor_event")
+              for i in range(3)]
+        for e in es:
+            self.assertEqual(str(e.neighbor.ip_address),
+                             self.pg1.remote_hosts[1].ip4)
 
         #
         # now we expect IP traffic forwarded
@@ -214,6 +241,11 @@ class ARPTestCase(VppTestCase):
                                  self.pg1.remote_hosts[2].ip4,
                                  is_static=1)
         static_arp.add_vpp_config()
+        es = [self.vapi.wait_for_event(1, "ip_neighbor_event")
+              for i in range(2)]
+        for e in es:
+            self.assertEqual(str(e.neighbor.ip_address),
+                             self.pg1.remote_hosts[2].ip4)
 
         static_p = (Ether(dst=self.pg0.local_mac, src=self.pg0.remote_mac) /
                     IP(src=self.pg0.remote_ip4,
@@ -232,6 +264,19 @@ class ARPTestCase(VppTestCase):
                        self.pg1.remote_hosts[2].mac,
                        self.pg0.remote_ip4,
                        self.pg1._remote_hosts[2].ip4)
+
+        #
+        # remove all the listeners
+        #
+        self.vapi.want_ip_neighbor_events(enable=0,
+                                          pid=os.getpid())
+        self.vapi.want_ip_neighbor_events(enable=0,
+                                          pid=os.getpid(),
+                                          sw_if_index=self.pg1.sw_if_index)
+        self.vapi.want_ip_neighbor_events(enable=0,
+                                          pid=os.getpid(),
+                                          sw_if_index=self.pg1.sw_if_index,
+                                          ip=self.pg1.remote_hosts[1].ip4)
 
         #
         # flap the link. dynamic ARPs get flush, statics don't
@@ -260,6 +305,8 @@ class ARPTestCase(VppTestCase):
                             self.pg1.local_ip4,
                             self.pg1._remote_hosts[1].ip4)
 
+        self.assertFalse(dyn_arp.query_vpp_config())
+        self.assertTrue(static_arp.query_vpp_config())
         #
         # Send an ARP request from one of the so-far unlearned remote hosts
         #
@@ -311,7 +358,16 @@ class ARPTestCase(VppTestCase):
         #
         self.pg2.set_unnumbered(self.pg1.sw_if_index)
 
+        #
+        # test the unnumbered dump both by all interfaces and just the enabled
+        # one
+        #
         unnum = self.vapi.ip_unnumbered_dump()
+        self.assertTrue(len(unnum))
+        self.assertEqual(unnum[0].ip_sw_if_index, self.pg1.sw_if_index)
+        self.assertEqual(unnum[0].sw_if_index, self.pg2.sw_if_index)
+        unnum = self.vapi.ip_unnumbered_dump(self.pg2.sw_if_index)
+        self.assertTrue(len(unnum))
         self.assertEqual(unnum[0].ip_sw_if_index, self.pg1.sw_if_index)
         self.assertEqual(unnum[0].sw_if_index, self.pg2.sw_if_index)
 
@@ -675,7 +731,6 @@ class ARPTestCase(VppTestCase):
         #
         # cleanup
         #
-        dyn_arp.remove_vpp_config()
         static_arp.remove_vpp_config()
         self.pg2.unset_unnumbered(self.pg1.sw_if_index)
 
@@ -722,11 +777,7 @@ class ARPTestCase(VppTestCase):
         # Send the ARP request with an originating address that
         # is VPP's own address
         #
-        self.pg2.add_stream(arp_req_from_me)
-        self.pg_enable_capture(self.pg_interfaces)
-        self.pg_start()
-
-        rx = self.pg2.get_capture(1)
+        rx = self.send_and_expect(self.pg2, [arp_req_from_me], self.pg2)
         self.verify_arp_resp(rx[0],
                              self.pg2.local_mac,
                              self.pg2.remote_mac,
@@ -739,6 +790,48 @@ class ARPTestCase(VppTestCase):
         self.assertFalse(find_nbr(self,
                                   self.pg2.sw_if_index,
                                   self.pg0.local_ip4))
+
+        #
+        # setup a punt redirect so packets from the uplink go to the tap
+        #
+        self.vapi.ip_punt_redirect(self.pg0.sw_if_index,
+                                   self.pg2.sw_if_index,
+                                   self.pg0.local_ip4)
+
+        p_tcp = (Ether(src=self.pg0.remote_mac,
+                       dst=self.pg0.local_mac,) /
+                 IP(src=self.pg0.remote_ip4,
+                    dst=self.pg0.local_ip4) /
+                 TCP(sport=80, dport=80) /
+                 Raw())
+        rx = self.send_and_expect(self.pg0, [p_tcp], self.pg2)
+
+        # there's no ARP entry so this is an ARP req
+        self.assertTrue(rx[0].haslayer(ARP))
+
+        # and ARP entry for VPP's pg0 address on the host interface
+        n1 = VppNeighbor(self,
+                         self.pg2.sw_if_index,
+                         self.pg2.remote_mac,
+                         self.pg0.local_ip4,
+                         is_no_fib_entry=True).add_vpp_config()
+        # now the packets shold forward
+        rx = self.send_and_expect(self.pg0, [p_tcp], self.pg2)
+        self.assertFalse(rx[0].haslayer(ARP))
+        self.assertEqual(rx[0][Ether].dst, self.pg2.remote_mac)
+
+        #
+        # flush the neighbor cache on the uplink
+        #
+        af = VppEnum.vl_api_address_family_t
+        self.vapi.ip_neighbor_flush(af.ADDRESS_IP4, self.pg0.sw_if_index)
+
+        # ensure we can still resolve the ARPs on the uplink
+        self.pg0.resolve_arp()
+
+        self.assertTrue(find_nbr(self,
+                                 self.pg0.sw_if_index,
+                                 self.pg0.remote_ip4))
 
         #
         # cleanup
@@ -937,7 +1030,7 @@ class ARPTestCase(VppTestCase):
                    dst=self.pg0.local_mac) /
              IP(src=self.pg0.remote_ip4, dst="10.0.0.1") /
              UDP(sport=1234, dport=1234) /
-             Raw('\xa5' * 100))
+             Raw(b'\xa5' * 100))
 
         self.pg0.add_stream(p)
         self.pg_enable_capture(self.pg_interfaces)
@@ -1151,7 +1244,118 @@ class ARPTestCase(VppTestCase):
         # clean-up
         #
         self.pg2.unconfig_ip4()
+        static_arp.remove_vpp_config()
         self.pg2.set_table_ip4(0)
+
+    def test_arp_static_replace_dynamic_same_mac(self):
+        """ ARP Static can replace Dynamic (same mac) """
+        self.pg2.generate_remote_hosts(1)
+
+        dyn_arp = VppNeighbor(self,
+                              self.pg2.sw_if_index,
+                              self.pg2.remote_hosts[0].mac,
+                              self.pg2.remote_hosts[0].ip4)
+        static_arp = VppNeighbor(self,
+                                 self.pg2.sw_if_index,
+                                 self.pg2.remote_hosts[0].mac,
+                                 self.pg2.remote_hosts[0].ip4,
+                                 is_static=1)
+
+        #
+        # Add a dynamic ARP entry
+        #
+        dyn_arp.add_vpp_config()
+
+        #
+        # We should find the dynamic nbr
+        #
+        self.assertFalse(find_nbr(self,
+                                  self.pg2.sw_if_index,
+                                  self.pg2.remote_hosts[0].ip4,
+                                  is_static=1))
+        self.assertTrue(find_nbr(self,
+                                 self.pg2.sw_if_index,
+                                 self.pg2.remote_hosts[0].ip4,
+                                 is_static=0,
+                                 mac=self.pg2.remote_hosts[0].mac))
+
+        #
+        # Add a static ARP entry with the same mac
+        #
+        static_arp.add_vpp_config()
+
+        #
+        # We should now find the static nbr with the same mac
+        #
+        self.assertFalse(find_nbr(self,
+                                  self.pg2.sw_if_index,
+                                  self.pg2.remote_hosts[0].ip4,
+                                  is_static=0))
+        self.assertTrue(find_nbr(self,
+                                 self.pg2.sw_if_index,
+                                 self.pg2.remote_hosts[0].ip4,
+                                 is_static=1,
+                                 mac=self.pg2.remote_hosts[0].mac))
+
+        #
+        # clean-up
+        #
+        static_arp.remove_vpp_config()
+
+    def test_arp_static_replace_dynamic_diff_mac(self):
+        """ ARP Static can replace Dynamic (diff mac) """
+        self.pg2.generate_remote_hosts(2)
+
+        dyn_arp = VppNeighbor(self,
+                              self.pg2.sw_if_index,
+                              self.pg2.remote_hosts[0].mac,
+                              self.pg2.remote_hosts[0].ip4)
+        static_arp = VppNeighbor(self,
+                                 self.pg2.sw_if_index,
+                                 self.pg2.remote_hosts[1].mac,
+                                 self.pg2.remote_hosts[0].ip4,
+                                 is_static=1)
+
+        #
+        # Add a dynamic ARP entry
+        #
+        dyn_arp.add_vpp_config()
+
+        #
+        # We should find the dynamic nbr
+        #
+        self.assertFalse(find_nbr(self,
+                                  self.pg2.sw_if_index,
+                                  self.pg2.remote_hosts[0].ip4,
+                                  is_static=1))
+        self.assertTrue(find_nbr(self,
+                                 self.pg2.sw_if_index,
+                                 self.pg2.remote_hosts[0].ip4,
+                                 is_static=0,
+                                 mac=self.pg2.remote_hosts[0].mac))
+
+        #
+        # Add a static ARP entry with a changed mac
+        #
+        static_arp.add_vpp_config()
+
+        #
+        # We should now find the static nbr with a changed mac
+        #
+        self.assertFalse(find_nbr(self,
+                                  self.pg2.sw_if_index,
+                                  self.pg2.remote_hosts[0].ip4,
+                                  is_static=0))
+        self.assertTrue(find_nbr(self,
+                                 self.pg2.sw_if_index,
+                                 self.pg2.remote_hosts[0].ip4,
+                                 is_static=1,
+                                 mac=self.pg2.remote_hosts[1].mac))
+
+        #
+        # clean-up
+        #
+        static_arp.remove_vpp_config()
 
     def test_arp_incomplete(self):
         """ ARP Incomplete"""
@@ -1231,6 +1435,7 @@ class ARPTestCase(VppTestCase):
         # Generate some hosts on the LAN
         #
         self.pg1.generate_remote_hosts(4)
+        self.pg2.generate_remote_hosts(4)
 
         #
         # And an ARP entry
@@ -1321,6 +1526,36 @@ class ARPTestCase(VppTestCase):
         self.assertFalse(find_nbr(self,
                                   self.pg1.sw_if_index,
                                   self.pg1.remote_hosts[2].ip4))
+
+        #
+        # IP address in different subnets are not learnt
+        #
+        self.pg2.configure_ipv4_neighbors()
+
+        for op in ["is-at", "who-has"]:
+            p1 = [(Ether(dst="ff:ff:ff:ff:ff:ff",
+                         src=self.pg2.remote_hosts[1].mac) /
+                   ARP(op=op,
+                       hwdst=self.pg2.local_mac,
+                       hwsrc=self.pg2.remote_hosts[1].mac,
+                       pdst=self.pg2.remote_hosts[1].ip4,
+                       psrc=self.pg2.remote_hosts[1].ip4)),
+                  (Ether(dst="ff:ff:ff:ff:ff:ff",
+                         src=self.pg2.remote_hosts[1].mac) /
+                   ARP(op=op,
+                       hwdst="ff:ff:ff:ff:ff:ff",
+                       hwsrc=self.pg2.remote_hosts[1].mac,
+                       pdst=self.pg2.remote_hosts[1].ip4,
+                       psrc=self.pg2.remote_hosts[1].ip4))]
+
+            self.send_and_assert_no_replies(self.pg1, p1)
+            self.assertFalse(find_nbr(self,
+                                      self.pg1.sw_if_index,
+                                      self.pg2.remote_hosts[1].ip4))
+
+        # they are all dropped because the subnet's don't match
+        self.assertEqual(4, self.statistics.get_err_counter(
+            "/err/arp-reply/IP4 destination address not local to subnet"))
 
     def test_arp_incomplete(self):
         """ Incomplete Entries """
@@ -1417,6 +1652,71 @@ class ARPTestCase(VppTestCase):
                              self.pg0.remote_mac,
                              self.pg0.remote_hosts[1].ip4,
                              self.pg0.remote_ip4)
+
+    def test_arp_table_swap(self):
+        #
+        # Generate some hosts on the LAN
+        #
+        N_NBRS = 4
+        self.pg1.generate_remote_hosts(N_NBRS)
+
+        for n in range(N_NBRS):
+            # a route thru each neighbour
+            VppIpRoute(self, "10.0.0.%d" % n, 32,
+                       [VppRoutePath(self.pg1.remote_hosts[n].ip4,
+                                     self.pg1.sw_if_index)]).add_vpp_config()
+
+            # resolve each neighbour
+            p1 = (Ether(dst=self.pg1.local_mac, src=self.pg1.remote_mac) /
+                  ARP(op="is-at", hwdst=self.pg1.local_mac,
+                      hwsrc="00:00:5e:00:01:09", pdst=self.pg1.local_ip4,
+                      psrc=self.pg1.remote_hosts[n].ip4))
+
+            self.send_and_assert_no_replies(self.pg1, p1, "ARP reply")
+
+        self.logger.info(self.vapi.cli("sh ip neighbors"))
+
+        #
+        # swap the table pg1 is in
+        #
+        table = VppIpTable(self, 100).add_vpp_config()
+
+        self.pg1.unconfig_ip4()
+        self.pg1.set_table_ip4(100)
+        self.pg1.config_ip4()
+
+        #
+        # all neighbours are cleared
+        #
+        for n in range(N_NBRS):
+            self.assertFalse(find_nbr(self,
+                                      self.pg1.sw_if_index,
+                                      self.pg1.remote_hosts[n].ip4))
+
+        #
+        # packets to all neighbours generate ARP requests
+        #
+        for n in range(N_NBRS):
+            # a route thru each neighbour
+            VppIpRoute(self, "10.0.0.%d" % n, 32,
+                       [VppRoutePath(self.pg1.remote_hosts[n].ip4,
+                                     self.pg1.sw_if_index)],
+                       table_id=100).add_vpp_config()
+
+            p = (Ether(src=self.pg1.remote_hosts[n].mac,
+                       dst=self.pg1.local_mac) /
+                 IP(src=self.pg1.remote_hosts[n].ip4,
+                    dst="10.0.0.%d" % n) /
+                 Raw(b'0x5' * 100))
+            rxs = self.send_and_expect(self.pg1, [p], self.pg1)
+            for rx in rxs:
+                self.verify_arp_req(rx,
+                                    self.pg1.local_mac,
+                                    self.pg1.local_ip4,
+                                    self.pg1.remote_hosts[n].ip4)
+
+        self.pg1.unconfig_ip4()
+        self.pg1.set_table_ip4(0)
 
 
 class NeighborStatsTestCase(VppTestCase):
@@ -1530,6 +1830,431 @@ class NeighborStatsTestCase(VppTestCase):
 
         rx = self.send_and_expect(self.pg1, p1 * NUM_PKTS, self.pg0)
         self.assertEqual(NUM_PKTS+16, nd1.get_stats()['packets'])
+
+
+class NeighborAgeTestCase(VppTestCase):
+    """ ARP/ND Aging """
+
+    @classmethod
+    def setUpClass(cls):
+        super(NeighborAgeTestCase, cls).setUpClass()
+
+    @classmethod
+    def tearDownClass(cls):
+        super(NeighborAgeTestCase, cls).tearDownClass()
+
+    def setUp(self):
+        super(NeighborAgeTestCase, self).setUp()
+
+        self.create_pg_interfaces(range(1))
+
+        # pg0 configured with ip4 and 6 addresses used for input
+        # pg1 configured with ip4 and 6 addresses used for output
+        # pg2 is unnumbered to pg0
+        for i in self.pg_interfaces:
+            i.admin_up()
+            i.config_ip4()
+            i.config_ip6()
+            i.resolve_arp()
+            i.resolve_ndp()
+
+    def tearDown(self):
+        super(NeighborAgeTestCase, self).tearDown()
+
+        for i in self.pg_interfaces:
+            i.unconfig_ip4()
+            i.unconfig_ip6()
+            i.admin_down()
+
+    def wait_for_no_nbr(self, intf, address,
+                        n_tries=50, s_time=1):
+        while (n_tries):
+            if not find_nbr(self, intf, address):
+                return True
+            n_tries = n_tries - 1
+            self.sleep(s_time)
+
+        return False
+
+    def verify_arp_req(self, rx, smac, sip, dip):
+        ether = rx[Ether]
+        self.assertEqual(ether.dst, "ff:ff:ff:ff:ff:ff")
+        self.assertEqual(ether.src, smac)
+
+        arp = rx[ARP]
+        self.assertEqual(arp.hwtype, 1)
+        self.assertEqual(arp.ptype, 0x800)
+        self.assertEqual(arp.hwlen, 6)
+        self.assertEqual(arp.plen, 4)
+        self.assertEqual(arp.op, arp_opts["who-has"])
+        self.assertEqual(arp.hwsrc, smac)
+        self.assertEqual(arp.hwdst, "00:00:00:00:00:00")
+        self.assertEqual(arp.psrc, sip)
+        self.assertEqual(arp.pdst, dip)
+
+    def test_age(self):
+        """ Aging/Recycle """
+
+        self.vapi.cli("set logging unthrottle 0")
+        self.vapi.cli("set logging size %d" % 0xffff)
+
+        self.pg0.generate_remote_hosts(201)
+
+        vaf = VppEnum.vl_api_address_family_t
+
+        #
+        # start listening on all interfaces
+        #
+        self.pg_enable_capture(self.pg_interfaces)
+
+        #
+        # Set the neighbor configuration:
+        #   limi = 200
+        #   age  = 0 seconds
+        #   recycle = false
+        #
+        self.vapi.ip_neighbor_config(af=vaf.ADDRESS_IP4,
+                                     max_number=200,
+                                     max_age=0,
+                                     recycle=False)
+
+        self.vapi.cli("sh ip neighbor-config")
+
+        # add the 198 neighbours that should pass (-1 for one created in setup)
+        for ii in range(200):
+            VppNeighbor(self,
+                        self.pg0.sw_if_index,
+                        self.pg0.remote_hosts[ii].mac,
+                        self.pg0.remote_hosts[ii].ip4).add_vpp_config()
+
+        # one more neighbor over the limit should fail
+        with self.vapi.assert_negative_api_retval():
+            VppNeighbor(self,
+                        self.pg0.sw_if_index,
+                        self.pg0.remote_hosts[200].mac,
+                        self.pg0.remote_hosts[200].ip4).add_vpp_config()
+
+        #
+        # change the config to allow recycling the old neighbors
+        #
+        self.vapi.ip_neighbor_config(af=vaf.ADDRESS_IP4,
+                                     max_number=200,
+                                     max_age=0,
+                                     recycle=True)
+
+        # now new additions are allowed
+        VppNeighbor(self,
+                    self.pg0.sw_if_index,
+                    self.pg0.remote_hosts[200].mac,
+                    self.pg0.remote_hosts[200].ip4).add_vpp_config()
+
+        # add the first neighbor we configured has been re-used
+        self.assertFalse(find_nbr(self,
+                                  self.pg0.sw_if_index,
+                                  self.pg0.remote_hosts[0].ip4))
+        self.assertTrue(find_nbr(self,
+                                 self.pg0.sw_if_index,
+                                 self.pg0.remote_hosts[200].ip4))
+
+        #
+        # change the config to age old neighbors
+        #
+        self.vapi.ip_neighbor_config(af=vaf.ADDRESS_IP4,
+                                     max_number=200,
+                                     max_age=2,
+                                     recycle=True)
+
+        self.vapi.cli("sh ip4 neighbor-sorted")
+
+        #
+        # expect probes from all these ARP entries as they age
+        # 3 probes for each neighbor 3*200 = 600
+        rxs = self.pg0.get_capture(600, timeout=8)
+
+        for ii in range(3):
+            for jj in range(200):
+                rx = rxs[ii*200 + jj]
+                # rx.show()
+
+        #
+        # 3 probes sent then 1 more second to see if a reply comes, before
+        # they age out
+        #
+        for jj in range(1, 201):
+            self.wait_for_no_nbr(self.pg0.sw_if_index,
+                                 self.pg0.remote_hosts[jj].ip4)
+
+        self.assertFalse(self.vapi.ip_neighbor_dump(sw_if_index=0xffffffff,
+                                                    af=vaf.ADDRESS_IP4))
+
+        #
+        # load up some neighbours again with 2s aging enabled
+        # they should be removed after 10s (2s age + 4s for probes + gap)
+        #
+        for ii in range(10):
+            VppNeighbor(self,
+                        self.pg0.sw_if_index,
+                        self.pg0.remote_hosts[ii].mac,
+                        self.pg0.remote_hosts[ii].ip4).add_vpp_config()
+        self.sleep(10)
+        self.assertFalse(self.vapi.ip_neighbor_dump(sw_if_index=0xffffffff,
+                                                    af=vaf.ADDRESS_IP4))
+
+        #
+        # check if we can set age and recycle with empty neighbor list
+        #
+        self.vapi.ip_neighbor_config(af=vaf.ADDRESS_IP4,
+                                     max_number=200,
+                                     max_age=1000,
+                                     recycle=True)
+
+        #
+        # load up some neighbours again, then disable the aging
+        # they should still be there in 10 seconds time
+        #
+        for ii in range(10):
+            VppNeighbor(self,
+                        self.pg0.sw_if_index,
+                        self.pg0.remote_hosts[ii].mac,
+                        self.pg0.remote_hosts[ii].ip4).add_vpp_config()
+        self.vapi.ip_neighbor_config(af=vaf.ADDRESS_IP4,
+                                     max_number=200,
+                                     max_age=0,
+                                     recycle=False)
+
+        self.sleep(10)
+        self.assertTrue(find_nbr(self,
+                                 self.pg0.sw_if_index,
+                                 self.pg0.remote_hosts[0].ip4))
+
+
+class NeighborReplaceTestCase(VppTestCase):
+    """ ARP/ND Replacement """
+
+    @classmethod
+    def setUpClass(cls):
+        super(NeighborReplaceTestCase, cls).setUpClass()
+
+    @classmethod
+    def tearDownClass(cls):
+        super(NeighborReplaceTestCase, cls).tearDownClass()
+
+    def setUp(self):
+        super(NeighborReplaceTestCase, self).setUp()
+
+        self.create_pg_interfaces(range(4))
+
+        # pg0 configured with ip4 and 6 addresses used for input
+        # pg1 configured with ip4 and 6 addresses used for output
+        # pg2 is unnumbered to pg0
+        for i in self.pg_interfaces:
+            i.admin_up()
+            i.config_ip4()
+            i.config_ip6()
+            i.resolve_arp()
+            i.resolve_ndp()
+
+    def tearDown(self):
+        super(NeighborReplaceTestCase, self).tearDown()
+
+        for i in self.pg_interfaces:
+            i.unconfig_ip4()
+            i.unconfig_ip6()
+            i.admin_down()
+
+    def test_replace(self):
+        """ replace """
+
+        N_HOSTS = 16
+
+        for i in self.pg_interfaces:
+            i.generate_remote_hosts(N_HOSTS)
+            i.configure_ipv4_neighbors()
+            i.configure_ipv6_neighbors()
+
+        # replace them all
+        self.vapi.ip_neighbor_replace_begin()
+        self.vapi.ip_neighbor_replace_end()
+
+        for i in self.pg_interfaces:
+            for h in range(N_HOSTS):
+                self.assertFalse(find_nbr(self,
+                                          self.pg0.sw_if_index,
+                                          self.pg0.remote_hosts[h].ip4))
+                self.assertFalse(find_nbr(self,
+                                          self.pg0.sw_if_index,
+                                          self.pg0.remote_hosts[h].ip6))
+
+        #
+        # and them all back via the API
+        #
+        for i in self.pg_interfaces:
+            for h in range(N_HOSTS):
+                VppNeighbor(self,
+                            i.sw_if_index,
+                            i.remote_hosts[h].mac,
+                            i.remote_hosts[h].ip4).add_vpp_config()
+                VppNeighbor(self,
+                            i.sw_if_index,
+                            i.remote_hosts[h].mac,
+                            i.remote_hosts[h].ip6).add_vpp_config()
+
+        #
+        # begin the replacement again, this time touch some
+        # the neighbours on pg1 so they are not deleted
+        #
+        self.vapi.ip_neighbor_replace_begin()
+
+        # update from the API all neighbours on pg1
+        for h in range(N_HOSTS):
+            VppNeighbor(self,
+                        self.pg1.sw_if_index,
+                        self.pg1.remote_hosts[h].mac,
+                        self.pg1.remote_hosts[h].ip4).add_vpp_config()
+            VppNeighbor(self,
+                        self.pg1.sw_if_index,
+                        self.pg1.remote_hosts[h].mac,
+                        self.pg1.remote_hosts[h].ip6).add_vpp_config()
+
+        # update from the data-plane all neighbours on pg3
+        self.pg3.configure_ipv4_neighbors()
+        self.pg3.configure_ipv6_neighbors()
+
+        # complete the replacement
+        self.logger.info(self.vapi.cli("sh ip neighbors"))
+        self.vapi.ip_neighbor_replace_end()
+
+        for i in self.pg_interfaces:
+            if i == self.pg1 or i == self.pg3:
+                # neighbours on pg1 and pg3 are still present
+                for h in range(N_HOSTS):
+                    self.assertTrue(find_nbr(self,
+                                             i.sw_if_index,
+                                             i.remote_hosts[h].ip4))
+                    self.assertTrue(find_nbr(self,
+                                             i.sw_if_index,
+                                             i.remote_hosts[h].ip6))
+            else:
+                # all other neighbours are toast
+                for h in range(N_HOSTS):
+                    self.assertFalse(find_nbr(self,
+                                              i.sw_if_index,
+                                              i.remote_hosts[h].ip4))
+                    self.assertFalse(find_nbr(self,
+                                              i.sw_if_index,
+                                              i.remote_hosts[h].ip6))
+
+
+class NeighborFlush(VppTestCase):
+    """ Neighbor Flush """
+
+    @classmethod
+    def setUpClass(cls):
+        super(NeighborFlush, cls).setUpClass()
+
+    @classmethod
+    def tearDownClass(cls):
+        super(NeighborFlush, cls).tearDownClass()
+
+    def setUp(self):
+        super(NeighborFlush, self).setUp()
+
+        self.create_pg_interfaces(range(2))
+
+        for i in self.pg_interfaces:
+            i.admin_up()
+            i.config_ip4()
+            i.config_ip6()
+            i.resolve_arp()
+            i.resolve_ndp()
+
+    def tearDown(self):
+        super(NeighborFlush, self).tearDown()
+
+        for i in self.pg_interfaces:
+            i.unconfig_ip4()
+            i.unconfig_ip6()
+            i.admin_down()
+
+    def test_flush(self):
+        """ Neighbour Flush """
+
+        e = VppEnum
+        nf = e.vl_api_ip_neighbor_flags_t
+        af = e.vl_api_address_family_t
+        N_HOSTS = 16
+        static = [False, True]
+        self.pg0.generate_remote_hosts(N_HOSTS)
+        self.pg1.generate_remote_hosts(N_HOSTS)
+
+        for s in static:
+            # a few v4 and v6 dynamic neoghbors
+            for n in range(N_HOSTS):
+                VppNeighbor(self,
+                            self.pg0.sw_if_index,
+                            self.pg0.remote_hosts[n].mac,
+                            self.pg0.remote_hosts[n].ip4,
+                            is_static=s).add_vpp_config()
+                VppNeighbor(self,
+                            self.pg1.sw_if_index,
+                            self.pg1.remote_hosts[n].mac,
+                            self.pg1.remote_hosts[n].ip6,
+                            is_static=s).add_vpp_config()
+
+            # flush the interfaces individually
+            self.vapi.ip_neighbor_flush(af.ADDRESS_IP4, self.pg0.sw_if_index)
+
+            # check we haven't flushed that which we shouldn't
+            for n in range(N_HOSTS):
+                self.assertTrue(find_nbr(self,
+                                         self.pg1.sw_if_index,
+                                         self.pg1.remote_hosts[n].ip6,
+                                         is_static=s))
+
+            self.vapi.ip_neighbor_flush(af.ADDRESS_IP6, self.pg1.sw_if_index)
+
+            for n in range(N_HOSTS):
+                self.assertFalse(find_nbr(self,
+                                          self.pg0.sw_if_index,
+                                          self.pg0.remote_hosts[n].ip4))
+                self.assertFalse(find_nbr(self,
+                                          self.pg1.sw_if_index,
+                                          self.pg1.remote_hosts[n].ip6))
+
+            # add the nieghbours back
+            for n in range(N_HOSTS):
+                VppNeighbor(self,
+                            self.pg0.sw_if_index,
+                            self.pg0.remote_hosts[n].mac,
+                            self.pg0.remote_hosts[n].ip4,
+                            is_static=s).add_vpp_config()
+                VppNeighbor(self,
+                            self.pg1.sw_if_index,
+                            self.pg1.remote_hosts[n].mac,
+                            self.pg1.remote_hosts[n].ip6,
+                            is_static=s).add_vpp_config()
+
+            self.logger.info(self.vapi.cli("sh ip neighbor"))
+
+            # flush both interfaces at the same time
+            self.vapi.ip_neighbor_flush(af.ADDRESS_IP6, 0xffffffff)
+
+            # check we haven't flushed that which we shouldn't
+            for n in range(N_HOSTS):
+                self.assertTrue(find_nbr(self,
+                                         self.pg0.sw_if_index,
+                                         self.pg0.remote_hosts[n].ip4,
+                                         is_static=s))
+
+            self.vapi.ip_neighbor_flush(af.ADDRESS_IP4, 0xffffffff)
+
+            for n in range(N_HOSTS):
+                self.assertFalse(find_nbr(self,
+                                          self.pg0.sw_if_index,
+                                          self.pg0.remote_hosts[n].ip4))
+                self.assertFalse(find_nbr(self,
+                                          self.pg1.sw_if_index,
+                                          self.pg1.remote_hosts[n].ip6))
 
 
 if __name__ == '__main__':

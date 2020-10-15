@@ -14,9 +14,37 @@
  */
 
 #include <vnet/feature/feature.h>
-#include <vnet/adj/adj.h>
 
 vnet_feature_main_t feature_main;
+
+typedef struct vnet_feature_upd_registration_t_
+{
+  vnet_feature_update_cb_t cb;
+  void *data;
+} vnet_feature_upd_registration_t;
+
+static vnet_feature_upd_registration_t *regs;
+
+void
+vnet_feature_register (vnet_feature_update_cb_t cb, void *data)
+{
+  vnet_feature_upd_registration_t *reg;
+
+  vec_add2 (regs, reg, 1);
+
+  reg->cb = cb;
+  reg->data = data;
+}
+
+static void
+vent_feature_reg_invoke (u32 sw_if_index, u8 arc_index, u8 is_enable)
+{
+  vnet_feature_upd_registration_t *reg;
+
+  vec_foreach (reg, regs)
+    reg->cb (sw_if_index, arc_index, is_enable, reg->data);
+}
+
 
 static clib_error_t *
 vnet_feature_init (vlib_main_t * vm)
@@ -122,6 +150,7 @@ vnet_feature_init (vlib_main_t * vm)
       vcm = &cm->config_main;
       if ((error = vnet_feature_arc_init
 	   (vm, vcm, areg->start_nodes, areg->n_start_nodes,
+	    areg->last_in_arc,
 	    fm->next_feature_by_arc[arc_index],
 	    fm->next_constraint_by_arc[arc_index],
 	    &fm->feature_nodes[arc_index])))
@@ -264,7 +293,7 @@ vnet_feature_enable_disable_with_index (u8 arc_index, u32 feature_index,
   fm->sw_if_index_has_features[arc_index] =
     clib_bitmap_set (fm->sw_if_index_has_features[arc_index], sw_if_index,
 		     (feature_count > 0));
-  adj_feature_update (sw_if_index, arc_index, (feature_count > 0));
+  vent_feature_reg_invoke (sw_if_index, arc_index, (feature_count > 0));
 
   fm->feature_count_by_sw_if_index[arc_index][sw_if_index] = feature_count;
   return 0;
@@ -289,6 +318,89 @@ vnet_feature_enable_disable (const char *arc_name, const char *node_name,
 						 sw_if_index, enable_disable,
 						 feature_config,
 						 n_feature_config_bytes);
+}
+
+int
+vnet_feature_is_enabled (const char *arc_name, const char *feature_node_name,
+			 u32 sw_if_index)
+{
+  vnet_feature_main_t *fm = &feature_main;
+  vnet_feature_config_main_t *cm;
+  vnet_config_main_t *ccm;
+  vnet_config_t *current_config;
+  vnet_config_feature_t *f;
+  u32 feature_index;
+  u32 ci;
+  u8 arc_index;
+  u32 *p;
+
+  arc_index = vnet_get_feature_arc_index (arc_name);
+
+  /* No such arc? */
+  if (arc_index == (u8) ~ 0)
+    return VNET_API_ERROR_INVALID_VALUE;
+
+  feature_index = vnet_get_feature_index (arc_index, feature_node_name);
+
+  /* No such feature? */
+  if (feature_index == (u32) ~ 0)
+    return VNET_API_ERROR_INVALID_VALUE_2;
+
+  cm = &fm->feature_config_mains[arc_index];
+
+  if (sw_if_index < vec_len (cm->config_index_by_sw_if_index))
+    ci = vec_elt (cm->config_index_by_sw_if_index, sw_if_index);
+  else
+    /* sw_if_index out of range, certainly not enabled */
+    return VNET_API_ERROR_INVALID_SW_IF_INDEX;
+
+  /* No features were ever configured? */
+  if (ci == ~0)
+    return 0;
+
+  ccm = &cm->config_main;
+
+  p = heap_elt_at_index (ccm->config_string_heap, ci);
+
+  current_config = pool_elt_at_index (ccm->config_pool, p[-1]);
+
+  /* Find feature with the required index */
+  vec_foreach (f, current_config->features)
+  {
+    if (f->feature_index == feature_index)
+      /* Feature was enabled */
+      return 1;
+  }
+  /* feature wasn't enabled */
+  return 0;
+}
+
+
+u32
+vnet_feature_modify_end_node (u8 arc_index,
+			      u32 sw_if_index, u32 end_node_index)
+{
+  vnet_feature_main_t *fm = &feature_main;
+  vnet_feature_config_main_t *cm;
+  u32 ci;
+
+  if (arc_index == (u8) ~ 0)
+    return VNET_API_ERROR_INVALID_VALUE;
+
+  if (end_node_index == ~0)
+    return VNET_API_ERROR_INVALID_VALUE_2;
+
+  cm = &fm->feature_config_mains[arc_index];
+  vec_validate_init_empty (cm->config_index_by_sw_if_index, sw_if_index, ~0);
+  ci = cm->config_index_by_sw_if_index[sw_if_index];
+
+  ci = vnet_config_modify_end_node (vlib_get_main (), &cm->config_main,
+				    ci, end_node_index);
+
+  if (ci != ~0)
+    cm->config_index_by_sw_if_index[sw_if_index] = ci;
+
+  return ci;
 }
 
 static int
@@ -366,7 +478,7 @@ show_features_command_fn (vlib_main_t * vm,
 /* *INDENT-OFF* */
 VLIB_CLI_COMMAND (show_features_command, static) = {
   .path = "show features",
-  .short_help = "show features",
+  .short_help = "show features [verbose]",
   .function = show_features_command_fn,
 };
 /* *INDENT-ON* */
@@ -436,6 +548,14 @@ vnet_interface_features_show (vlib_main_t * vm, u32 sw_if_index, int verbose)
 	  else
 	    vlib_cli_output (vm, "  %v", n->name);
 	}
+      if (verbose)
+	{
+	  n =
+	    vlib_get_node (vm,
+			   vcm->end_node_indices_by_user_index
+			   [current_config_index]);
+	  vlib_cli_output (vm, "  [end] %v", n->name);
+	}
     }
 }
 
@@ -460,20 +580,21 @@ set_interface_features_command_fn (vlib_main_t * vm,
   while (unformat_check_input (line_input) != UNFORMAT_END_OF_INPUT)
     {
       if (unformat
-	  (line_input, "%U %v", unformat_vnet_sw_interface, vnm, &sw_if_index,
-	   &feature_name))
-	;
-      else if (unformat (line_input, "arc %v", &arc_name))
+	  (line_input, "%U %s arc %s", unformat_vnet_sw_interface, vnm,
+	   &sw_if_index, &feature_name, &arc_name))
 	;
       else if (unformat (line_input, "disable"))
 	enable = 0;
       else
 	{
-	  if (feature_name && arc_name)
-	    break;
 	  error = unformat_parse_error (line_input);
 	  goto done;
 	}
+    }
+  if (!feature_name || !arc_name)
+    {
+      error = clib_error_return (0, "Both feature name and arc required...");
+      goto done;
     }
 
   if (sw_if_index == ~0)
@@ -485,13 +606,28 @@ set_interface_features_command_fn (vlib_main_t * vm,
   vec_add1 (arc_name, 0);
   vec_add1 (feature_name, 0);
 
+  u8 arc_index;
+
+  arc_index = vnet_get_feature_arc_index ((const char *) arc_name);
+
+  if (arc_index == (u8) ~ 0)
+    {
+      error =
+	clib_error_return (0, "Unknown arc name (%s)... ",
+			   (const char *) arc_name);
+      goto done;
+    }
+
   vnet_feature_registration_t *reg;
   reg =
     vnet_get_feature_reg ((const char *) arc_name,
 			  (const char *) feature_name);
   if (reg == 0)
     {
-      error = clib_error_return (0, "Unknown feature...");
+      error =
+	clib_error_return (0,
+			   "Feature (%s) not registered to arc (%s)... See 'show features verbose' for valid feature/arc combinations. ",
+			   feature_name, arc_name);
       goto done;
     }
   if (reg->enable_disable_cb)

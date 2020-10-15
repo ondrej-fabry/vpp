@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import unittest
 
@@ -37,9 +37,9 @@ class TestSession(VppTestCase):
             table_id += 1
 
         # Configure namespaces
-        self.vapi.app_namespace_add_del(namespace_id=b"0",
+        self.vapi.app_namespace_add_del(namespace_id="0",
                                         sw_if_index=self.loop0.sw_if_index)
-        self.vapi.app_namespace_add_del(namespace_id=b"1",
+        self.vapi.app_namespace_add_del(namespace_id="1",
                                         sw_if_index=self.loop1.sw_if_index)
 
     def tearDown(self):
@@ -119,6 +119,10 @@ class TestSessionUnitTests(VppTestCase):
 
 class TestSvmFifoUnitTests(VppTestCase):
     """ SVM Fifo Unit Tests Case """
+
+    @classmethod
+    def force_solo(cls):
+        return True
 
     @classmethod
     def setUpClass(cls):

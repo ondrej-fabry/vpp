@@ -79,11 +79,36 @@ do {							\
     }							\
 } while (0)
 
-#if defined(__clang__)
-#define STATIC_ASSERT(truth,...)
-#else
+/*
+ * This version always generates code, and has a Coverity-specific
+ * version to stop Coverity complaining about
+ * ALWAYS_ASSERT(p != 0); p->member...
+ */
+
+#ifndef __COVERITY__
+#define ALWAYS_ASSERT(truth)				\
+do {							\
+  if (PREDICT_FALSE(!(truth)))                          \
+    {							\
+      _clib_error (CLIB_ERROR_ABORT, 0, 0,		\
+		   "%s:%d (%s) assertion `%s' fails",	\
+		   __FILE__,				\
+		   (uword) __LINE__,			\
+		   clib_error_function,			\
+		   # truth);				\
+    }							\
+} while (0)
+#else /* __COVERITY__ */
+#define ALWAYS_ASSERT(truth)                    \
+do {                                            \
+  if (PREDICT_FALSE(!(truth)))                  \
+    {                                           \
+      abort();                                  \
+    }                                           \
+} while (0)
+#endif /* __COVERITY */
+
 #define STATIC_ASSERT(truth,...) _Static_assert(truth, __VA_ARGS__)
-#endif
 
 #define STATIC_ASSERT_SIZEOF(d, s) \
   STATIC_ASSERT (sizeof (d) == s, "Size of " #d " must be " # s " bytes")

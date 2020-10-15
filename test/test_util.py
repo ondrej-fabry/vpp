@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """Test framework utility functions tests"""
 
 import unittest
@@ -7,8 +7,15 @@ from vpp_papi import mac_pton, mac_ntop
 
 
 class TestUtil (unittest.TestCase):
-    """ MAC to binary and back """
+    """ Test framework utility tests """
+
+    @classmethod
+    def force_solo(cls):
+        """ if the test case class is timing-sensitive - return true """
+        return False
+
     def test_mac_to_binary(self):
+        """ MAC to binary and back """
         mac = 'aa:bb:cc:dd:ee:ff'
         b = mac_pton(mac)
         mac2 = mac_ntop(b)

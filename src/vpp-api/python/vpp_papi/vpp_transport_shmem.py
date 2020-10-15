@@ -24,7 +24,8 @@ int vac_msg_table_max_index(void);
 void vac_rx_suspend (void);
 void vac_rx_resume (void);
 void vac_set_error_handler(vac_error_callback_t);
- """)
+void vac_mem_init (size_t size);
+""")
 
 vpp_object = None
 
@@ -66,6 +67,8 @@ class VppTransport(object):
         self.parent = parent
         global vpp_object
         vpp_object = parent
+
+        vpp_api.vac_mem_init(0)
 
         # Register error handler
         vpp_api.vac_set_error_handler(vac_error_handler)
@@ -116,12 +119,14 @@ class VppTransport(object):
             raise VppTransportShmemIOError(1, 'Not connected')
         return vpp_api.vac_write(bytes(buf), len(buf))
 
-    def read(self):
+    def read(self, timeout=None):
         if not self.connected:
             raise VppTransportShmemIOError(1, 'Not connected')
+        if timeout is None:
+            timeout = self.read_timeout
         mem = ffi.new("char **")
         size = ffi.new("int *")
-        rv = vpp_api.vac_read(mem, size, self.read_timeout)
+        rv = vpp_api.vac_read(mem, size, timeout)
         if rv:
             strerror = 'vac_read failed.  It is likely that VPP died.'
             raise VppTransportShmemIOError(rv, strerror)

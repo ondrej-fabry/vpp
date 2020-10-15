@@ -54,6 +54,7 @@
 #include <vnet/ip/ip6_packet.h>
 #include <vnet/udp/udp_packet.h>
 #include <vnet/devices/devices.h>
+#include <vnet/gso/gro_func.h>
 
 static int
 validate_buffer_data2 (vlib_buffer_t * b, pg_stream_t * s,
@@ -1106,6 +1107,8 @@ init_buffers_inline (vlib_main_t * vm,
 
       b0 = vlib_get_buffer (vm, bi0);
       b1 = vlib_get_buffer (vm, bi1);
+      b0->flags |= s->buffer_flags;
+      b1->flags |= s->buffer_flags;
 
       vnet_buffer (b0)->sw_if_index[VLIB_RX] =
 	vnet_buffer (b1)->sw_if_index[VLIB_RX] = s->sw_if_index[VLIB_RX];
@@ -1135,6 +1138,7 @@ init_buffers_inline (vlib_main_t * vm,
       n_left -= 1;
 
       b0 = vlib_get_buffer (vm, bi0);
+      b0->flags |= s->buffer_flags;
       vnet_buffer (b0)->sw_if_index[VLIB_RX] = s->sw_if_index[VLIB_RX];
       vnet_buffer (b0)->sw_if_index[VLIB_TX] = s->sw_if_index[VLIB_TX];
 
@@ -1269,7 +1273,7 @@ pg_stream_fill_replay (pg_main_t * pg, pg_stream_t * s, u32 n_alloc)
 	  clib_memcpy_fast (b->data, d0 + data_offset, bytes_this_chunk);
 	  vnet_buffer (b)->sw_if_index[VLIB_RX] = s->sw_if_index[VLIB_RX];
 	  vnet_buffer (b)->sw_if_index[VLIB_TX] = s->sw_if_index[VLIB_TX];
-	  b->flags = 0;
+	  b->flags = s->buffer_flags;
 	  b->next_buffer = 0;
 	  b->current_data = 0;
 	  b->current_length = bytes_this_chunk;
@@ -1527,17 +1531,16 @@ pg_input_trace (pg_main_t * pg,
 }
 
 static_always_inline void
-fill_gso_buffer_flags (vlib_main_t * vm, u32 * buffers, u32 n_buffers,
-		       u32 packet_data_size)
+fill_buffer_offload_flags (vlib_main_t * vm, u32 * buffers, u32 n_buffers,
+			   int gso_enabled, u32 gso_size)
 {
-
   for (int i = 0; i < n_buffers; i++)
     {
       vlib_buffer_t *b0 = vlib_get_buffer (vm, buffers[i]);
       u8 l4_proto = 0;
-      u8 l4_hdr_sz = 0;
 
-      ethernet_header_t *eh = (ethernet_header_t *) b0->data;
+      ethernet_header_t *eh =
+	(ethernet_header_t *) vlib_buffer_get_current (b0);
       u16 ethertype = clib_net_to_host_u16 (eh->type);
       u16 l2hdr_sz = sizeof (ethernet_header_t);
 
@@ -1557,48 +1560,50 @@ fill_gso_buffer_flags (vlib_main_t * vm, u32 * buffers, u32 n_buffers,
 
       vnet_buffer (b0)->l2_hdr_offset = 0;
       vnet_buffer (b0)->l3_hdr_offset = l2hdr_sz;
+
       if (PREDICT_TRUE (ethertype == ETHERNET_TYPE_IP4))
 	{
-	  ip4_header_t *ip4 = (ip4_header_t *) (b0->data + l2hdr_sz);
+	  ip4_header_t *ip4 =
+	    (ip4_header_t *) (vlib_buffer_get_current (b0) + l2hdr_sz);
 	  vnet_buffer (b0)->l4_hdr_offset = l2hdr_sz + ip4_header_bytes (ip4);
 	  l4_proto = ip4->protocol;
 	  b0->flags |=
-	    (VNET_BUFFER_F_IS_IP4 | VNET_BUFFER_F_L2_HDR_OFFSET_VALID
-	     | VNET_BUFFER_F_L3_HDR_OFFSET_VALID |
-	     VNET_BUFFER_F_L4_HDR_OFFSET_VALID);
-	  b0->flags |= VNET_BUFFER_F_OFFLOAD_IP_CKSUM;
+	    (VNET_BUFFER_F_IS_IP4 | VNET_BUFFER_F_OFFLOAD_IP_CKSUM);
+	  b0->flags |= (VNET_BUFFER_F_L2_HDR_OFFSET_VALID
+			| VNET_BUFFER_F_L3_HDR_OFFSET_VALID |
+			VNET_BUFFER_F_L4_HDR_OFFSET_VALID);
 	}
       else if (PREDICT_TRUE (ethertype == ETHERNET_TYPE_IP6))
 	{
-	  ip6_header_t *ip6 = (ip6_header_t *) (b0->data + l2hdr_sz);
-	  /* FIXME IPv6 EH traversal */
+	  ip6_header_t *ip6 =
+	    (ip6_header_t *) (vlib_buffer_get_current (b0) + l2hdr_sz);
 	  vnet_buffer (b0)->l4_hdr_offset = l2hdr_sz + sizeof (ip6_header_t);
+	  /* FIXME IPv6 EH traversal */
 	  l4_proto = ip6->protocol;
 	  b0->flags |=
-	    (VNET_BUFFER_F_IS_IP6 | VNET_BUFFER_F_L2_HDR_OFFSET_VALID
-	     | VNET_BUFFER_F_L3_HDR_OFFSET_VALID |
+	    (VNET_BUFFER_F_IS_IP6 | VNET_BUFFER_F_L2_HDR_OFFSET_VALID |
+	     VNET_BUFFER_F_L3_HDR_OFFSET_VALID |
 	     VNET_BUFFER_F_L4_HDR_OFFSET_VALID);
 	}
+
       if (l4_proto == IP_PROTOCOL_TCP)
 	{
 	  b0->flags |= VNET_BUFFER_F_OFFLOAD_TCP_CKSUM;
-	  tcp_header_t *tcp = (tcp_header_t *) (b0->data +
-						vnet_buffer
-						(b0)->l4_hdr_offset);
-	  l4_hdr_sz = tcp_header_bytes (tcp);
-	  tcp->checksum = 0;
-	  vnet_buffer2 (b0)->gso_l4_hdr_sz = l4_hdr_sz;
-	  vnet_buffer2 (b0)->gso_size = packet_data_size;
-	  b0->flags |= VNET_BUFFER_F_GSO;
+
+	  /* only set GSO flag for chained buffers */
+	  if (gso_enabled && (b0->flags & VLIB_BUFFER_NEXT_PRESENT))
+	    {
+	      b0->flags |= VNET_BUFFER_F_GSO;
+	      tcp_header_t *tcp =
+		(tcp_header_t *) (vlib_buffer_get_current (b0) +
+				  vnet_buffer (b0)->l4_hdr_offset);
+	      vnet_buffer2 (b0)->gso_l4_hdr_sz = tcp_header_bytes (tcp);
+	      vnet_buffer2 (b0)->gso_size = gso_size;
+	    }
 	}
       else if (l4_proto == IP_PROTOCOL_UDP)
 	{
 	  b0->flags |= VNET_BUFFER_F_OFFLOAD_UDP_CKSUM;
-	  udp_header_t *udp = (udp_header_t *) (b0->data +
-						vnet_buffer
-						(b0)->l4_hdr_offset);
-	  vnet_buffer2 (b0)->gso_l4_hdr_sz = sizeof (*udp);
-	  udp->checksum = 0;
 	}
     }
 }
@@ -1618,9 +1623,11 @@ pg_generate_packets (vlib_node_runtime_t * node,
   u8 feature_arc_index = fm->device_input_feature_arc_index;
   cm = &fm->feature_config_mains[feature_arc_index];
   u32 current_config_index = ~(u32) 0;
-  pg_interface_t *pi = pool_elt_at_index (pg->interfaces, s->pg_if_index);
+  pg_interface_t *pi;
   int i;
 
+  pi = pool_elt_at_index (pg->interfaces,
+			  pg->if_id_by_sw_if_index[s->sw_if_index[VLIB_RX]]);
   bi0 = s->buffer_indices;
 
   n_packets_in_fifo = pg_stream_fill (pg, s, n_packets_to_generate);
@@ -1635,6 +1642,9 @@ pg_generate_packets (vlib_node_runtime_t * node,
       vnet_get_config_data (&cm->config_main, &current_config_index,
 			    &next_index, 0);
     }
+
+  if (PREDICT_FALSE (pi->coalesce_enabled))
+    vnet_gro_flow_table_schedule_node_on_dispatcher (vm, pi->flow_table);
 
   while (n_packets_to_generate > 0)
     {
@@ -1694,8 +1704,14 @@ pg_generate_packets (vlib_node_runtime_t * node,
 	    vnet_buffer (b)->feature_arc_index = feature_arc_index;
 	  }
 
-      if (pi->gso_enabled)
-	fill_gso_buffer_flags (vm, to_next, n_this_frame, pi->gso_size);
+      if (pi->gso_enabled ||
+	  (s->buffer_flags & (VNET_BUFFER_F_OFFLOAD_TCP_CKSUM |
+			      VNET_BUFFER_F_OFFLOAD_UDP_CKSUM |
+			      VNET_BUFFER_F_OFFLOAD_IP_CKSUM)))
+	{
+	  fill_buffer_offload_flags (vm, to_next, n_this_frame,
+				     pi->gso_enabled, pi->gso_size);
+	}
 
       n_trace = vlib_get_trace_count (vm, node);
       if (n_trace > 0)
@@ -1762,8 +1778,8 @@ pg_input_stream (vlib_node_runtime_t * node, pg_main_t * pg, pg_stream_t * s)
     n_packets = s->n_packets_limit - s->n_packets_generated;
 
   /* Generate up to one frame's worth of packets. */
-  if (n_packets > VLIB_FRAME_SIZE)
-    n_packets = VLIB_FRAME_SIZE;
+  if (n_packets > s->n_max_frame)
+    n_packets = s->n_max_frame;
 
   if (n_packets > 0)
     n_packets = pg_generate_packets (node, pg, s, n_packets);
@@ -1808,6 +1824,124 @@ VLIB_REGISTER_NODE (pg_input_node) = {
   .state = VLIB_NODE_STATE_DISABLED,
 };
 /* *INDENT-ON* */
+
+VLIB_NODE_FN (pg_input_mac_filter) (vlib_main_t * vm,
+				    vlib_node_runtime_t * node,
+				    vlib_frame_t * frame)
+{
+  vlib_buffer_t *bufs[VLIB_FRAME_SIZE], **b = bufs;
+  u16 nexts[VLIB_FRAME_SIZE], *next;
+  pg_main_t *pg = &pg_main;
+  u32 n_left, *from;
+
+  from = vlib_frame_vector_args (frame);
+  n_left = frame->n_vectors;
+  next = nexts;
+
+  clib_memset_u16 (next, 0, VLIB_FRAME_SIZE);
+
+  vlib_get_buffers (vm, from, bufs, n_left);
+
+  while (n_left)
+    {
+      const ethernet_header_t *eth;
+      pg_interface_t *pi;
+      mac_address_t in;
+
+      pi = pool_elt_at_index
+	(pg->interfaces,
+	 pg->if_id_by_sw_if_index[vnet_buffer (b[0])->sw_if_index[VLIB_RX]]);
+      eth = vlib_buffer_get_current (b[0]);
+
+      mac_address_from_bytes (&in, eth->dst_address);
+
+      if (PREDICT_FALSE (ethernet_address_cast (in.bytes)))
+	{
+	  mac_address_t *allowed;
+
+	  if (0 != vec_len (pi->allowed_mcast_macs))
+	    {
+	      vec_foreach (allowed, pi->allowed_mcast_macs)
+	      {
+		if (0 != mac_address_cmp (allowed, &in))
+		  break;
+	      }
+
+	      if (vec_is_member (allowed, pi->allowed_mcast_macs))
+		vnet_feature_next_u16 (&next[0], b[0]);
+	    }
+	}
+
+      b += 1;
+      next += 1;
+      n_left -= 1;
+    }
+
+  vlib_buffer_enqueue_to_next (vm, node, from, nexts, frame->n_vectors);
+
+  return (frame->n_vectors);
+}
+
+/* *INDENT-OFF* */
+VLIB_REGISTER_NODE (pg_input_mac_filter) = {
+  .name = "pg-input-mac-filter",
+  .vector_size = sizeof (u32),
+  .format_trace = format_pg_input_trace,
+  .n_next_nodes = 1,
+  .next_nodes = {
+    [0] = "error-drop",
+  },
+};
+VNET_FEATURE_INIT (pg_input_mac_filter_feat, static) = {
+  .arc_name = "device-input",
+  .node_name = "pg-input-mac-filter",
+};
+/* *INDENT-ON* */
+
+static clib_error_t *
+pg_input_mac_filter_cfg (vlib_main_t * vm,
+			 unformat_input_t * input, vlib_cli_command_t * cmd)
+{
+  unformat_input_t _line_input, *line_input = &_line_input;
+  u32 sw_if_index = ~0;
+  int is_enable;
+
+  if (!unformat_user (input, unformat_line_input, line_input))
+    return 0;
+
+  while (unformat_check_input (line_input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (line_input, "%U",
+		    unformat_vnet_sw_interface,
+		    vnet_get_main (), &sw_if_index))
+	;
+      else if (unformat (line_input, "%U",
+			 unformat_vlib_enable_disable, &is_enable))
+	;
+      else
+	return clib_error_create ("unknown input `%U'",
+				  format_unformat_error, line_input);
+    }
+  unformat_free (line_input);
+
+  if (~0 == sw_if_index)
+    return clib_error_create ("specify interface");
+
+  vnet_feature_enable_disable ("device-input",
+			       "pg-input-mac-filter",
+			       sw_if_index, is_enable, 0, 0);
+
+  return NULL;
+}
+
+/* *INDENT-OFF* */
+VLIB_CLI_COMMAND (enable_streams_cli, static) = {
+  .path = "packet-generator mac-filter",
+  .short_help = "packet-generator mac-filter <INTERFACE> <on|off>",
+  .function = pg_input_mac_filter_cfg,
+};
+/* *INDENT-ON* */
+
 
 /*
  * fd.io coding-style-patch-verification: ON

@@ -1,7 +1,8 @@
 import os
-import time
 import socket
+from socket import inet_pton, inet_ntop
 import struct
+import time
 from traceback import format_exc, format_stack
 
 import scapy.compat
@@ -15,7 +16,6 @@ from scapy.layers.inet6 import IPv6, ICMPv6ND_NS, ICMPv6ND_NA,\
     IPv6ExtHdrHopByHop
 from util import ppp, ppc
 from scapy.utils6 import in6_getnsma, in6_getnsmac, in6_ismaddr
-from scapy.utils import inet_pton, inet_ntop
 
 
 class CaptureTimeoutError(Exception):
@@ -56,6 +56,13 @@ class VppPGInterface(VppInterface):
     def gso_size(self):
         """gso size on packet-generator interface"""
         return self._gso_size
+
+    @property
+    def coalesce_is_enabled(self):
+        """coalesce enabled on packet-generator interface"""
+        if self._coalesce_enabled == 0:
+            return "coalesce-disabled"
+        return "coalesce-enabled"
 
     @property
     def out_path(self):
@@ -113,6 +120,7 @@ class VppPGInterface(VppInterface):
         self._pg_index = pg_index
         self._gso_enabled = gso
         self._gso_size = gso_size
+        self._coalesce_enabled = 0
         self._out_file = "pg%u_out.pcap" % self.pg_index
         self._out_path = self.test.tempdir + "/" + self._out_file
         self._in_file = "pg%u_in.pcap" % self.pg_index
@@ -159,6 +167,18 @@ class VppPGInterface(VppInterface):
 
     def disable_capture(self):
         self.test.vapi.cli("%s disable" % self.capture_cli)
+
+    def coalesce_enable(self):
+        """ Enable packet coalesce on this packet-generator interface"""
+        self._coalesce_enabled = 1
+        self.test.vapi.pg_interface_enable_disable_coalesce(self.sw_if_index,
+                                                            1)
+
+    def coalesce_disable(self):
+        """ Disable packet coalesce on this packet-generator interface"""
+        self._coalesce_enabled = 0
+        self.test.vapi.pg_interface_enable_disable_coalesce(self.sw_if_index,
+                                                            0)
 
     def add_stream(self, pkts, nb_replays=None, worker=None):
         """
@@ -295,6 +315,20 @@ class VppPGInterface(VppInterface):
                 raise AssertionError("Capture file present for interface %s" %
                                      self.name)
 
+    def wait_for_pg_stop(self):
+        # wait till packet-generator is stopped
+        # "show packet-generator" while it is still running gives this:
+        # Name               Enabled        Count     Parameters
+        # pcap0-sw_if_inde     Yes           64       limit 64, ...
+        #
+        # also have a 5-minute timeout just in case things go terribly wrong...
+        deadline = time.time() + 300
+        while self.test.vapi.cli('show packet-generator').find("Yes") != -1:
+            self._test.sleep(0.01)  # yield
+            if time.time() > deadline:
+                self.test.logger.debug("Timeout waiting for pg to stop")
+                break
+
     def wait_for_capture_file(self, timeout=1):
         """
         Wait until pcap capture file appears
@@ -303,6 +337,7 @@ class VppPGInterface(VppInterface):
 
         :returns: True/False if the file is present or appears within timeout
         """
+        self.wait_for_pg_stop()
         deadline = time.time() + timeout
         if not os.path.isfile(self.out_path):
             self.test.logger.debug("Waiting for capture file %s to appear, "

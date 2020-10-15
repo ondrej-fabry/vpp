@@ -66,7 +66,7 @@
 #endif
 #endif
 
-#if defined (__AVX512F__)
+#if defined (__AVX512BITALG__)
 #define CLIB_HAVE_VEC512
 #endif
 
@@ -76,6 +76,7 @@
 #endif
 
 #define _vector_size(n) __attribute__ ((vector_size (n)))
+#define _vector_size_unaligned(n) __attribute__ ((vector_size (n),  __aligned__ (1)))
 
 #define foreach_vec64i  _(i,8,8)  _(i,16,4)  _(i,32,2)
 #define foreach_vec64u  _(u,8,8)  _(u,16,4)  _(u,32,2)
@@ -111,6 +112,7 @@
 /* Type Definitions */
 #define _(t,s,c) \
 typedef t##s t##s##x##c _vector_size (s/8*c);	\
+typedef t##s t##s##x##c##u _vector_size_unaligned (s/8*c);	\
 typedef union {	  \
   t##s##x##c as_##t##s##x##c;	\
   t##s as_##t##s[c];	  \
@@ -153,6 +155,15 @@ typedef u32 u32x _vector_size (8);
 typedef u64 u64x _vector_size (8);
 #endif
 
+/* universal inlines */
+#define _(t, s, c) \
+static_always_inline t##s##x##c                                         \
+t##s##x##c##_zero ()                                                    \
+{ return (t##s##x##c) {}; }                                             \
+
+foreach_vec
+#undef _
+
 #undef _vector_size
 
 #define VECTOR_WORD_TYPE(t) t##x
@@ -166,7 +177,10 @@ typedef u64 u64x _vector_size (8);
 #include <vppinfra/vector_avx2.h>
 #endif
 
-#if defined (__AVX512F__)
+#if defined (__AVX512BITALG__)
+/* Due to power level transition issues, we don't preffer AVX-512 on
+   Skylake X and CascadeLake CPUs, AVX512BITALG is introduced on
+   icelake CPUs  */
 #include <vppinfra/vector_avx512.h>
 #endif
 

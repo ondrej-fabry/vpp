@@ -13,9 +13,10 @@
  * limitations under the License.
  */
 
-option version = "4.1.0";
+option version = "4.2.1";
 
 import "vnet/ip/ip_types.api";
+import "vnet/interface_types.api";
 
 /** \brief Add MAP domains
     @param client_index - opaque cookie to identify the sender
@@ -26,7 +27,7 @@ import "vnet/ip/ip_types.api";
     @param ea_bits_len - Embedded Address bits length
     @param psid_offset - Port Set Identifier (PSID) offset
     @param psid_length - PSID length
-    @param mtu - MTU
+    @param mtu - MTU. default 1280
     @param tag - A user field stored with the MAP
 */
 define map_add_domain
@@ -39,7 +40,7 @@ define map_add_domain
   u8 ea_bits_len;
   u8 psid_offset;
   u8 psid_length;
-  u16 mtu;
+  u16 mtu [default=1280];
   string tag[64];
 };
 
@@ -90,8 +91,28 @@ autoreply define map_add_del_rule
 /** \brief Get list of map domains
     @param client_index - opaque cookie to identify the sender
 */
+service {
+  rpc map_domains_get returns map_domains_get_reply
+    stream map_domain_details;
+};
+
+define map_domains_get
+{
+  u32 client_index;
+  u32 context;
+  u32 cursor;
+};
+
+define map_domains_get_reply
+{
+  u32 context;
+  i32 retval;
+  u32 cursor;
+};
+
 define map_domain_dump
 {
+  option deprecated;
   u32 client_index;
   u32 context;
 };
@@ -141,7 +162,7 @@ define map_rule_details
 /** \brief Enable or disable a MAP interface
     @param client_index - opaque cookie to identify the sender
     @param context - sender context, to match reply w/ request
-    @param sw_if_index - 
+    @param sw_if_index -
     @param is_enable - 0=disable, 1=enable interface
     @param is_translation -  0=encapsulation, 1=translation
 */
@@ -149,7 +170,7 @@ autoreply define map_if_enable_disable
 {
   u32 client_index;
   u32 context;
-  u32 sw_if_index;
+  vl_api_interface_index_t sw_if_index;
   bool is_enable;
   bool is_translation; /* 0 - encapsulation, 1 - translation */
 };
@@ -241,28 +262,6 @@ autoreply define map_param_add_del_pre_resolve
   vl_api_ip6_address_t ip6_nh_address;
 };
 
-
-/** \brief Set MAP reassembly parameters
-    @param client_index - opaque cookie to identify the sender
-    @param context - sender context, to match reply w/ request
-    @param is_ip6 - 1 = params apply to IPv6, 0 = params apply to IPv4
-    @param lifetime_ms - reassembly valid lifetime, or ~0
-    @param pool_size - max number of reassemblies, or ~0
-    @param buffers -  max number of reassembly buffers, or ~0 
-    @param ht_ratio - hash-table size factor, or ~0
-*/
-autoreply define map_param_set_reassembly
-{
-  u32 client_index;
-  u32 context;
-  bool is_ip6;
-  u16 lifetime_ms;
-  u16 pool_size;
-  u32 buffers;
-  f64 ht_ratio;
-};
-
-
 /** \brief Set MAP security-check parameters
     @param client_index - opaque cookie to identify the sender
     @param context - sender context, to match reply w/ request
@@ -326,14 +325,6 @@ define map_param_get
     @param icmp6_enable_unreachable - 1 = send ICMP unreachable err msgs
     @param ip4_nh_address - direct IP4 next-hop address
     @param ip6_nh_address - direct IP6 next-hop address
-    @param ip4_lifetime_ms - reassembly valid lifetime, or ~0
-    @param ip4_pool_size - max number of reassemblies, or ~0
-    @param ip4_buffers -  max number of reassembly buffers, or ~0
-    @param ip4_ht_ratio - reassembly valid lifetime, or ~0
-    @param ip6_lifetime_ms - max number of reassemblies, or ~0
-    @param ip6_pool_size - max number of reassemblies, or ~0
-    @param ip6_buffers -  max number of reassembly buffers, or ~0 
-    @param ip6_ht_ratio - hash-table size factor, or ~0
     @param sec_check_enable - 1=enable security check on first inbound packet
     @param sec_check_fragments - 1=enable check on (subsequent) fragments too
     @param tc_copy - 1 = copy packet class/TOS field, 0 = use class instead
@@ -353,12 +344,122 @@ define map_param_get_reply
   u16 ip4_pool_size;
   u32 ip4_buffers;
   f64 ip4_ht_ratio;
-  u16 ip6_lifetime_ms;
-  u16 ip6_pool_size;
-  u32 ip6_buffers;
-  f64 ip6_ht_ratio;
   bool sec_check_enable;
   bool sec_check_fragments;
   bool tc_copy;
   u8 tc_class;
+};
+
+/*
+ * MAP Error counters/messages
+ */
+counters map {
+  none {
+    severity info;
+    type counter64;
+    units "packets";
+    description "valid MAP packets";
+  };
+  bad_protocol {
+    severity error;
+    type counter64;
+    units "packets";
+    description "bad protocol";
+  };
+  sec_check {
+    severity error;
+    type counter64;
+    units "packets";
+    description "security check failed";
+  };
+  encap_sec_check {
+    severity error;
+    type counter64;
+    units "packets";
+    description "encap security check failed";
+  };
+  decap_sec_check {
+    severity error;
+    type counter64;
+    units "packets";
+    description "decap security check failed";
+  };
+  icmp {
+    severity error;
+    type counter64;
+    units "packets";
+    description "unable to translate ICMP";
+  };
+  icmp_relay {
+    severity error;
+    type counter64;
+    units "packets";
+    description "unable to relay ICMP";
+  };
+  unknown {
+    severity error;
+    type counter64;
+    units "packets";
+    description "unknown";
+  };
+  no_binding {
+    severity error;
+    type counter64;
+    units "packets";
+    description "no binding";
+  };
+  no_domain {
+    severity error;
+    type counter64;
+    units "packets";
+    description "no domain";
+  };
+  fragmented {
+    severity error;
+    type counter64;
+    units "packets";
+    description "packet is a fragment";
+  };
+  fragment_memory {
+    severity error;
+    type counter64;
+    units "packets";
+    description "could not cache fragment";
+  };
+  fragment_malformed {
+    severity error;
+    type counter64;
+    units "packets";
+    description "fragment has unexpected format";
+  };
+  fragment_dropped {
+    severity error;
+    type counter64;
+    units "packets";
+    description "dropped cached fragment";
+  };
+  malformed {
+    severity error;
+    type counter64;
+    units "packets";
+    description "malformed packet";
+  };
+  df_set {
+    severity error;
+    type counter64;
+    units "packets";
+    description "can't fragment, DF set";
+  };
+  time_exceeded {
+    severity error;
+    type counter64;
+    units "packets";
+    description "time exceeded";
+  };
+};
+paths {
+  "/err/ip4-map" "map";
+  "/err/ip6-map" "map";
+  "/err/ip4-t-map" "map";
+  "/err/ip6-t-map" "map";
 };

@@ -1,4 +1,4 @@
-pip-tools==3.8.0                        # BSD   Keep this in sync with Makefile's PIP_TOOLS_VERSION
+pip-tools==5.1.2                        # BSD   Keep this in sync with Makefile's PIP_TOOLS_VERSION
 
 aenum>= 2.1.2; python_version < '3.6'   # BSD
 cffi                                    # MIT
@@ -11,9 +11,12 @@ parameterized>=0.6.1                    # BSD
 pexpect                                 # ISC
 psutil                                  # BSD
 pycodestyle                             # MIT (Expat license)       https://pypi.org/project/pycodestyle/
-scapy==2.4.0; python_version >= '2.7' or python_version >= '3.4'    # GPL2  https://github.com/secdev/scapy/blob/master/LICENSE
+scapy==2.4.3; python_version >= '2.7' or python_version >= '3.4'    # GPL2  https://github.com/secdev/scapy/blob/master/LICENSE
 six                                     # MIT
 subprocess32                            # PSF
 syslog_rfc5424_parser>=0.3.1            # ISC
 objgraph                                # MIT
 pympler                                 # Apache-2.0
+sphinx<3.0.0                            # BSD,  sphinx 3.0.0 crashes with a traceback
+sphinx-rtd-theme                        # MIT
+noiseprotocol                           # MIT

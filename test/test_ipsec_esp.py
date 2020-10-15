@@ -1,14 +1,16 @@
 import socket
 import unittest
 from scapy.layers.ipsec import ESP
-from scapy.layers.inet import UDP
+from scapy.layers.inet import IP, ICMP, UDP
 
 from parameterized import parameterized
 from framework import VppTestRunner
 from template_ipsec import IpsecTra46Tests, IpsecTun46Tests, TemplateIpsec, \
     IpsecTcpTests, IpsecTun4Tests, IpsecTra4Tests, config_tra_params, \
-    IPsecIPv4Params, IPsecIPv6Params, \
-    IpsecTra4, IpsecTun4, IpsecTra6, IpsecTun6
+    config_tun_params, IPsecIPv4Params, IPsecIPv6Params, \
+    IpsecTra4, IpsecTun4, IpsecTra6, IpsecTun6, \
+    IpsecTun6HandoffTests, IpsecTun4HandoffTests, \
+    IpsecTra6ExtTests
 from vpp_ipsec import VppIpsecSpd, VppIpsecSpdEntry, VppIpsecSA,\
     VppIpsecSpdItfBinding
 from vpp_ip_route import VppIpRoute, VppRoutePath
@@ -16,6 +18,7 @@ from vpp_ip import DpoProto
 from vpp_papi import VppEnum
 
 NUM_PKTS = 67
+engines_supporting_chain_bufs = ["openssl"]
 
 
 class ConfigIpsecESP(TemplateIpsec):
@@ -71,6 +74,7 @@ class ConfigIpsecESP(TemplateIpsec):
             config_tra_params(p, self.encryption_type)
         for p in params:
             self.config_esp_tun(p)
+            config_tun_params(p, self.encryption_type, self.tun_if)
 
         for p in params:
             d = DpoProto.DPO_PROTO_IP6 if p.is_ipv6 else DpoProto.DPO_PROTO_IP4
@@ -284,13 +288,95 @@ class TemplateIpsecEsp(ConfigIpsecESP):
         super(TemplateIpsecEsp, self).tearDown()
 
 
-class TestIpsecEsp1(TemplateIpsecEsp, IpsecTra46Tests, IpsecTun46Tests):
+class TestIpsecEsp1(TemplateIpsecEsp, IpsecTra46Tests,
+                    IpsecTun46Tests, IpsecTra6ExtTests):
     """ Ipsec ESP - TUN & TRA tests """
-    pass
+
+    @classmethod
+    def setUpClass(cls):
+        super(TestIpsecEsp1, cls).setUpClass()
+
+    @classmethod
+    def tearDownClass(cls):
+        super(TestIpsecEsp1, cls).tearDownClass()
+
+    def setUp(self):
+        super(TestIpsecEsp1, self).setUp()
+
+    def tearDown(self):
+        super(TestIpsecEsp1, self).tearDown()
+
+    def test_tun_46(self):
+        """ ipsec 4o6 tunnel """
+        # add an SPD entry to direct 2.2.2.2 to the v6 tunnel SA
+        p6 = self.ipv6_params
+        p4 = self.ipv4_params
+
+        p6.remote_tun_if_host4 = "2.2.2.2"
+        e = VppEnum.vl_api_ipsec_spd_action_t
+
+        VppIpsecSpdEntry(self,
+                         self.tun_spd,
+                         p6.scapy_tun_sa_id,
+                         self.pg1.remote_addr[p4.addr_type],
+                         self.pg1.remote_addr[p4.addr_type],
+                         p6.remote_tun_if_host4,
+                         p6.remote_tun_if_host4,
+                         0,
+                         priority=10,
+                         policy=e.IPSEC_API_SPD_ACTION_PROTECT,
+                         is_outbound=1).add_vpp_config()
+        VppIpRoute(self,  p6.remote_tun_if_host4, p4.addr_len,
+                   [VppRoutePath(self.tun_if.remote_addr[p4.addr_type],
+                                 0xffffffff)]).add_vpp_config()
+
+        old_name = self.tun6_encrypt_node_name
+        self.tun6_encrypt_node_name = "esp4-encrypt"
+
+        self.verify_tun_46(p6, count=63)
+        self.tun6_encrypt_node_name = old_name
+
+    def test_tun_64(self):
+        """ ipsec 6o4 tunnel """
+        # add an SPD entry to direct 4444::4 to the v4 tunnel SA
+        p6 = self.ipv6_params
+        p4 = self.ipv4_params
+
+        p4.remote_tun_if_host6 = "4444::4"
+        e = VppEnum.vl_api_ipsec_spd_action_t
+
+        VppIpsecSpdEntry(self,
+                         self.tun_spd,
+                         p4.scapy_tun_sa_id,
+                         self.pg1.remote_addr[p6.addr_type],
+                         self.pg1.remote_addr[p6.addr_type],
+                         p4.remote_tun_if_host6,
+                         p4.remote_tun_if_host6,
+                         0,
+                         priority=10,
+                         policy=e.IPSEC_API_SPD_ACTION_PROTECT,
+                         is_outbound=1).add_vpp_config()
+        d = DpoProto.DPO_PROTO_IP6
+        VppIpRoute(self,  p4.remote_tun_if_host6, p6.addr_len,
+                   [VppRoutePath(self.tun_if.remote_addr[p6.addr_type],
+                                 0xffffffff,
+                                 proto=d)]).add_vpp_config()
+
+        old_name = self.tun4_encrypt_node_name
+        self.tun4_encrypt_node_name = "esp6-encrypt"
+        self.verify_tun_64(p4, count=63)
+        self.tun4_encrypt_node_name = old_name
 
 
 class TestIpsecEsp2(TemplateIpsecEsp, IpsecTcpTests):
     """ Ipsec ESP - TCP tests """
+    pass
+
+
+class TestIpsecEspHandoff(TemplateIpsecEsp,
+                          IpsecTun6HandoffTests,
+                          IpsecTun4HandoffTests):
+    """ Ipsec ESP - handoff tests """
     pass
 
 
@@ -367,7 +453,7 @@ class MyParameters():
                                 IPSEC_API_INTEG_ALG_NONE),
                   'scapy-crypto': "AES-GCM",
                   'scapy-integ': "NULL",
-                  'key': "JPjyOWBeVEQiMe7h",
+                  'key': b"JPjyOWBeVEQiMe7h",
                   'salt': 0},
             'AES-GCM-192/NONE': {
                   'vpp-crypto': (VppEnum.vl_api_ipsec_crypto_alg_t.
@@ -376,7 +462,7 @@ class MyParameters():
                                 IPSEC_API_INTEG_ALG_NONE),
                   'scapy-crypto': "AES-GCM",
                   'scapy-integ': "NULL",
-                  'key': "JPjyOWBeVEQiMe7h01234567",
+                  'key': b"JPjyOWBeVEQiMe7h01234567",
                   'salt': 1010},
             'AES-GCM-256/NONE': {
                   'vpp-crypto': (VppEnum.vl_api_ipsec_crypto_alg_t.
@@ -385,7 +471,7 @@ class MyParameters():
                                 IPSEC_API_INTEG_ALG_NONE),
                   'scapy-crypto': "AES-GCM",
                   'scapy-integ': "NULL",
-                  'key': "JPjyOWBeVEQiMe7h0123456787654321",
+                  'key': b"JPjyOWBeVEQiMe7h0123456787654321",
                   'salt': 2020},
             'AES-CBC-128/MD5-96': {
                   'vpp-crypto': (VppEnum.vl_api_ipsec_crypto_alg_t.
@@ -395,7 +481,7 @@ class MyParameters():
                   'scapy-crypto': "AES-CBC",
                   'scapy-integ': "HMAC-MD5-96",
                   'salt': 0,
-                  'key': "JPjyOWBeVEQiMe7h"},
+                  'key': b"JPjyOWBeVEQiMe7h"},
             'AES-CBC-192/SHA1-96': {
                   'vpp-crypto': (VppEnum.vl_api_ipsec_crypto_alg_t.
                                  IPSEC_API_CRYPTO_ALG_AES_CBC_192),
@@ -404,7 +490,7 @@ class MyParameters():
                   'scapy-crypto': "AES-CBC",
                   'scapy-integ': "HMAC-SHA1-96",
                   'salt': 0,
-                  'key': "JPjyOWBeVEQiMe7hJPjyOWBe"},
+                  'key': b"JPjyOWBeVEQiMe7hJPjyOWBe"},
             'AES-CBC-256/SHA1-96': {
                   'vpp-crypto': (VppEnum.vl_api_ipsec_crypto_alg_t.
                                  IPSEC_API_CRYPTO_ALG_AES_CBC_256),
@@ -413,7 +499,7 @@ class MyParameters():
                   'scapy-crypto': "AES-CBC",
                   'scapy-integ': "HMAC-SHA1-96",
                   'salt': 0,
-                  'key': "JPjyOWBeVEQiMe7hJPjyOWBeVEQiMe7h"},
+                  'key': b"JPjyOWBeVEQiMe7hJPjyOWBeVEQiMe7h"},
             '3DES-CBC/SHA1-96': {
                   'vpp-crypto': (VppEnum.vl_api_ipsec_crypto_alg_t.
                                  IPSEC_API_CRYPTO_ALG_3DES_CBC),
@@ -422,7 +508,7 @@ class MyParameters():
                   'scapy-crypto': "3DES",
                   'scapy-integ': "HMAC-SHA1-96",
                   'salt': 0,
-                  'key': "JPjyOWBeVEQiMe7h00112233"},
+                  'key': b"JPjyOWBeVEQiMe7h00112233"},
             'NONE/SHA1-96': {
                   'vpp-crypto': (VppEnum.vl_api_ipsec_crypto_alg_t.
                                  IPSEC_API_CRYPTO_ALG_NONE),
@@ -431,7 +517,7 @@ class MyParameters():
                   'scapy-crypto': "NULL",
                   'scapy-integ': "HMAC-SHA1-96",
                   'salt': 0,
-                  'key': "JPjyOWBeVEQiMe7h00112233"}}
+                  'key': b"JPjyOWBeVEQiMe7h00112233"}}
 
 
 class RunTestIpsecEspAll(ConfigIpsecESP,
@@ -457,7 +543,9 @@ class RunTestIpsecEspAll(ConfigIpsecESP,
     def run_test(self):
         self.run_a_test(self.engine, self.flag, self.algo)
 
-    def run_a_test(self, engine, flag, algo):
+    def run_a_test(self, engine, flag, algo, payload_size=None):
+        if engine == "ia32":
+            engine = "native"
         self.vapi.cli("set crypto handler all %s" % engine)
 
         self.ipv4_params = IPsecIPv4Params()
@@ -493,8 +581,33 @@ class RunTestIpsecEspAll(ConfigIpsecESP,
         self.verify_tra_basic4(count=NUM_PKTS)
         self.verify_tun_66(self.params[socket.AF_INET6],
                            count=NUM_PKTS)
+        #
+        # Use an odd-byte payload size to check for correct padding.
+        #
+        # 49 + 2 == 51 which should pad +1 to 52 for 4 byte alignment, +5
+        # to 56 for 8 byte alignment, and +13 to 64 for 64 byte alignment.
+        # This should catch bugs where the code is incorrectly over-padding
+        # for algorithms that don't require it
+        psz = 49 - len(IP()/ICMP()) if payload_size is None else payload_size
         self.verify_tun_44(self.params[socket.AF_INET],
-                           count=NUM_PKTS)
+                           count=NUM_PKTS, payload_size=psz)
+
+        LARGE_PKT_SZ = [
+            1970,  # results in 2 chained buffers entering decrypt node
+                   # but leaving as simple buffer due to ICV removal (tra4)
+            2004,  # footer+ICV will be added to 2nd buffer (tun4)
+            4010,  # ICV ends up splitted accross 2 buffers in esp_decrypt
+                   # for transport4; transport6 takes normal path
+            4020,  # same as above but tra4 and tra6 are switched
+        ]
+        if self.engine in engines_supporting_chain_bufs:
+            for sz in LARGE_PKT_SZ:
+                self.verify_tra_basic4(count=NUM_PKTS, payload_size=sz)
+                self.verify_tra_basic6(count=NUM_PKTS, payload_size=sz)
+                self.verify_tun_66(self.params[socket.AF_INET6],
+                                   count=NUM_PKTS, payload_size=sz)
+                self.verify_tun_44(self.params[socket.AF_INET],
+                                   count=NUM_PKTS, payload_size=sz)
 
         #
         # remove the SPDs, SAs, etc
@@ -518,6 +631,7 @@ class RunTestIpsecEspAll(ConfigIpsecESP,
 # GEN     AES-GCM-192/NONE AES-GCM-256/NONE AES-CBC-128/MD5-96 \
 # GEN     AES-CBC-192/SHA1-96 AES-CBC-256/SHA1-96 \
 # GEN     3DES-CBC/SHA1-96 NONE/SHA1-96; do \
+# GEN      [[ ${FLG} == "ESN" &&  ${ALG} == *"NONE" ]] && continue
 # GEN      echo -e "\n\nclass Test_${ENG}_${FLG}_${ALG}(RunTestIpsecEspAll):" |
 # GEN             sed -e 's/-/_/g' -e 's#/#_#g' ; \
 # GEN      echo '    """'$ENG $FLG $ALG IPSec test'"""' ;
@@ -570,24 +684,6 @@ class Test_ia32_noESN_3DES_CBC_SHA1_96(RunTestIpsecEspAll):
 
 class Test_ia32_noESN_NONE_SHA1_96(RunTestIpsecEspAll):
     """ia32 noESN NONE/SHA1-96 IPSec test"""
-    def test_ipsec(self):
-        self.run_test()
-
-
-class Test_ia32_ESN_AES_GCM_128_NONE(RunTestIpsecEspAll):
-    """ia32 ESN AES-GCM-128/NONE IPSec test"""
-    def test_ipsec(self):
-        self.run_test()
-
-
-class Test_ia32_ESN_AES_GCM_192_NONE(RunTestIpsecEspAll):
-    """ia32 ESN AES-GCM-192/NONE IPSec test"""
-    def test_ipsec(self):
-        self.run_test()
-
-
-class Test_ia32_ESN_AES_GCM_256_NONE(RunTestIpsecEspAll):
-    """ia32 ESN AES-GCM-256/NONE IPSec test"""
     def test_ipsec(self):
         self.run_test()
 
@@ -670,24 +766,6 @@ class Test_ipsecmb_noESN_NONE_SHA1_96(RunTestIpsecEspAll):
         self.run_test()
 
 
-class Test_ipsecmb_ESN_AES_GCM_128_NONE(RunTestIpsecEspAll):
-    """ipsecmb ESN AES-GCM-128/NONE IPSec test"""
-    def test_ipsec(self):
-        self.run_test()
-
-
-class Test_ipsecmb_ESN_AES_GCM_192_NONE(RunTestIpsecEspAll):
-    """ipsecmb ESN AES-GCM-192/NONE IPSec test"""
-    def test_ipsec(self):
-        self.run_test()
-
-
-class Test_ipsecmb_ESN_AES_GCM_256_NONE(RunTestIpsecEspAll):
-    """ipsecmb ESN AES-GCM-256/NONE IPSec test"""
-    def test_ipsec(self):
-        self.run_test()
-
-
 class Test_ipsecmb_ESN_AES_CBC_128_MD5_96(RunTestIpsecEspAll):
     """ipsecmb ESN AES-CBC-128/MD5-96 IPSec test"""
     def test_ipsec(self):
@@ -762,24 +840,6 @@ class Test_openssl_noESN_3DES_CBC_SHA1_96(RunTestIpsecEspAll):
 
 class Test_openssl_noESN_NONE_SHA1_96(RunTestIpsecEspAll):
     """openssl noESN NONE/SHA1-96 IPSec test"""
-    def test_ipsec(self):
-        self.run_test()
-
-
-class Test_openssl_ESN_AES_GCM_128_NONE(RunTestIpsecEspAll):
-    """openssl ESN AES-GCM-128/NONE IPSec test"""
-    def test_ipsec(self):
-        self.run_test()
-
-
-class Test_openssl_ESN_AES_GCM_192_NONE(RunTestIpsecEspAll):
-    """openssl ESN AES-GCM-192/NONE IPSec test"""
-    def test_ipsec(self):
-        self.run_test()
-
-
-class Test_openssl_ESN_AES_GCM_256_NONE(RunTestIpsecEspAll):
-    """openssl ESN AES-GCM-256/NONE IPSec test"""
     def test_ipsec(self):
         self.run_test()
 

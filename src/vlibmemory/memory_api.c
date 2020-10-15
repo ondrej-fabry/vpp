@@ -64,7 +64,7 @@ static void
 memclnt_queue_callback (vlib_main_t * vm)
 {
   int i;
-  api_main_t *am = &api_main;
+  api_main_t *am = vlibapi_get_main ();
 
   if (PREDICT_FALSE (vec_len (vl_api_queue_cursizes) !=
 		     1 + vec_len (am->vlib_private_rps)))
@@ -121,31 +121,27 @@ vl_api_memclnt_create_internal (char *name, svm_queue_t * q)
 {
   vl_api_registration_t **regpp;
   vl_api_registration_t *regp;
-  svm_region_t *svm;
   void *oldheap;
-  api_main_t *am = &api_main;
+  api_main_t *am = vlibapi_get_main ();
 
   ASSERT (vlib_get_thread_index () == 0);
   pool_get (am->vl_clients, regpp);
 
-  svm = am->vlib_rp;
 
-  pthread_mutex_lock (&svm->mutex);
-  oldheap = svm_push_data_heap (svm);
+  oldheap = vl_msg_push_heap ();
   *regpp = clib_mem_alloc (sizeof (vl_api_registration_t));
 
   regp = *regpp;
   clib_memset (regp, 0, sizeof (*regp));
   regp->registration_type = REGISTRATION_TYPE_SHMEM;
   regp->vl_api_registration_pool_index = regpp - am->vl_clients;
-  regp->vlib_rp = svm;
+  regp->vlib_rp = am->vlib_rp;
   regp->shmem_hdr = am->shmem_hdr;
 
   regp->vl_input_queue = q;
   regp->name = format (0, "%s%c", name, 0);
 
-  pthread_mutex_unlock (&svm->mutex);
-  svm_pop_heap (oldheap);
+  vl_msg_pop_heap (oldheap);
   return vl_msg_api_handle_from_index_and_epoch
     (regp->vl_api_registration_pool_index,
      am->shmem_hdr->application_restarts);
@@ -160,11 +156,10 @@ vl_api_memclnt_create_t_handler (vl_api_memclnt_create_t * mp)
   vl_api_registration_t **regpp;
   vl_api_registration_t *regp;
   vl_api_memclnt_create_reply_t *rp;
-  svm_region_t *svm;
   svm_queue_t *q;
   int rv = 0;
   void *oldheap;
-  api_main_t *am = &api_main;
+  api_main_t *am = vlibapi_get_main ();
   u8 *msg_table;
 
   /*
@@ -195,21 +190,19 @@ vl_api_memclnt_create_t_handler (vl_api_memclnt_create_t * mp)
 
   pool_get (am->vl_clients, regpp);
 
-  svm = am->vlib_rp;
-
-  pthread_mutex_lock (&svm->mutex);
-  oldheap = svm_push_data_heap (svm);
+  oldheap = vl_msg_push_heap ();
   *regpp = clib_mem_alloc (sizeof (vl_api_registration_t));
 
   regp = *regpp;
   clib_memset (regp, 0, sizeof (*regp));
   regp->registration_type = REGISTRATION_TYPE_SHMEM;
   regp->vl_api_registration_pool_index = regpp - am->vl_clients;
-  regp->vlib_rp = svm;
+  regp->vlib_rp = am->vlib_rp;
   regp->shmem_hdr = am->shmem_hdr;
   regp->clib_file_index = am->shmem_hdr->clib_file_index;
 
   q = regp->vl_input_queue = (svm_queue_t *) (uword) mp->input_queue;
+  VL_MSG_API_SVM_QUEUE_UNPOISON (q);
 
   regp->name = format (0, "%s", mp->name);
   vec_add1 (regp->name, 0);
@@ -223,8 +216,7 @@ vl_api_memclnt_create_t_handler (vl_api_memclnt_create_t * mp)
   else
     msg_table = am->serialized_message_table_in_shmem;
 
-  pthread_mutex_unlock (&svm->mutex);
-  svm_pop_heap (oldheap);
+  vl_msg_pop_heap (oldheap);
 
   rp = vl_msg_api_alloc (sizeof (*rp));
   rp->_vl_msg_id = ntohs (VL_API_MEMCLNT_CREATE_REPLY);
@@ -239,13 +231,13 @@ vl_api_memclnt_create_t_handler (vl_api_memclnt_create_t * mp)
   vl_msg_api_send_shmem (q, (u8 *) & rp);
 }
 
-int
+void
 vl_api_call_reaper_functions (u32 client_index)
 {
   clib_error_t *error = 0;
   _vl_msg_api_function_list_elt_t *i;
 
-  i = api_main.reaper_function_registrations;
+  i = vlibapi_get_main ()->reaper_function_registrations;
   while (i)
     {
       error = i->f (client_index);
@@ -253,7 +245,6 @@ vl_api_call_reaper_functions (u32 client_index)
 	clib_error_report (error);
       i = i->next_init_function;
     }
-  return 0;
 }
 
 /*
@@ -265,15 +256,13 @@ vl_api_memclnt_delete_t_handler (vl_api_memclnt_delete_t * mp)
   vl_api_registration_t **regpp;
   vl_api_registration_t *regp;
   vl_api_memclnt_delete_reply_t *rp;
-  svm_region_t *svm;
   void *oldheap;
-  api_main_t *am = &api_main;
+  api_main_t *am = vlibapi_get_main ();
   u32 handle, client_index, epoch;
 
   handle = mp->index;
 
-  if (vl_api_call_reaper_functions (handle))
-    return;
+  vl_api_call_reaper_functions (handle);
 
   epoch = vl_msg_api_handle_get_epoch (handle);
   client_index = vl_msg_api_handle_get_index (handle);
@@ -293,7 +282,6 @@ vl_api_memclnt_delete_t_handler (vl_api_memclnt_delete_t * mp)
     {
       int i;
       regp = *regpp;
-      svm = am->vlib_rp;
       int private_registration = 0;
 
       /* Send reply unless client asked us to do the cleanup */
@@ -319,15 +307,18 @@ vl_api_memclnt_delete_t_handler (vl_api_memclnt_delete_t * mp)
 	    }
 	}
 
+      /* No dangling references, please */
+      *regpp = 0;
+
       /* For horizontal scaling, add a hash table... */
       for (i = 0; i < vec_len (am->vlib_private_rps); i++)
 	{
 	  /* Is this a pairwise / private API segment? */
-	  if (am->vlib_private_rps[i] == svm)
+	  if (am->vlib_private_rps[i] == am->vlib_rp)
 	    {
 	      /* Note: account for the memfd header page */
-	      uword virtual_base = svm->virtual_base - MMAP_PAGESIZE;
-	      uword virtual_size = svm->virtual_size + MMAP_PAGESIZE;
+	      uword virtual_base = am->vlib_rp->virtual_base - MMAP_PAGESIZE;
+	      uword virtual_size = am->vlib_rp->virtual_size + MMAP_PAGESIZE;
 
 	      /*
 	       * Kill the registration pool element before we make
@@ -347,23 +338,18 @@ vl_api_memclnt_delete_t_handler (vl_api_memclnt_delete_t * mp)
 	    }
 	}
 
-      /* No dangling references, please */
-      *regpp = 0;
-
       if (private_registration == 0)
 	{
 	  pool_put_index (am->vl_clients,
 			  regp->vl_api_registration_pool_index);
-	  pthread_mutex_lock (&svm->mutex);
-	  oldheap = svm_push_data_heap (svm);
+	  oldheap = vl_msg_push_heap ();
 	  if (mp->do_cleanup)
 	    svm_queue_free (regp->vl_input_queue);
 	  vec_free (regp->name);
 	  /* Poison the old registration */
 	  clib_memset (regp, 0xF1, sizeof (*regp));
 	  clib_mem_free (regp);
-	  pthread_mutex_unlock (&svm->mutex);
-	  svm_pop_heap (oldheap);
+	  vl_msg_pop_heap (oldheap);
 	  /*
 	   * These messages must be freed manually, since they're set up
 	   * as "bounce" messages. In the private_registration == 1 case,
@@ -410,7 +396,7 @@ vl_api_memclnt_keepalive_t_handler (vl_api_memclnt_keepalive_t * mp)
   api_main_t *am;
   vl_shmem_hdr_t *shmem_hdr;
 
-  am = &api_main;
+  am = vlibapi_get_main ();
   shmem_hdr = am->shmem_hdr;
 
   rmp = vl_msg_api_alloc_as_if_client (sizeof (*rmp));
@@ -438,7 +424,7 @@ int
 vl_mem_api_init (const char *region_name)
 {
   int rv;
-  api_main_t *am = &api_main;
+  api_main_t *am = vlibapi_get_main ();
   vl_msg_api_msg_config_t cfg;
   vl_msg_api_msg_config_t *c = &cfg;
   vl_shmem_hdr_t *shm;
@@ -487,7 +473,7 @@ vl_mem_api_init (const char *region_name)
 clib_error_t *
 map_api_segment_init (vlib_main_t * vm)
 {
-  api_main_t *am = &api_main;
+  api_main_t *am = vlibapi_get_main ();
   int rv;
 
   if ((rv = vl_mem_api_init (am->region_name)) < 0)
@@ -503,9 +489,7 @@ send_memclnt_keepalive (vl_api_registration_t * regp, f64 now)
 {
   vl_api_memclnt_keepalive_t *mp;
   svm_queue_t *q;
-  api_main_t *am = &api_main;
-  svm_region_t *save_vlib_rp = am->vlib_rp;
-  vl_shmem_hdr_t *save_shmem_hdr = am->shmem_hdr;
+  api_main_t *am = vlibapi_get_main ();
 
   q = regp->vl_input_queue;
 
@@ -529,10 +513,7 @@ send_memclnt_keepalive (vl_api_registration_t * regp, f64 now)
    * memory clients..
    */
 
-  am->vlib_rp = regp->vlib_rp;
-  am->shmem_hdr = regp->shmem_hdr;
-
-  mp = vl_msg_api_alloc (sizeof (*mp));
+  mp = vl_mem_api_alloc_as_if_client_w_reg (regp, sizeof (*mp));
   clib_memset (mp, 0, sizeof (*mp));
   mp->_vl_msg_id = clib_host_to_net_u16 (VL_API_MEMCLNT_KEEPALIVE);
   mp->context = mp->client_index =
@@ -544,10 +525,7 @@ send_memclnt_keepalive (vl_api_registration_t * regp, f64 now)
 
   /* Failure-to-send due to a stuffed queue is absolutely expected */
   if (svm_queue_add (q, (u8 *) & mp, 1 /* nowait */ ))
-    vl_msg_api_free (mp);
-
-  am->vlib_rp = save_vlib_rp;
-  am->shmem_hdr = save_shmem_hdr;
+    vl_msg_api_free_w_region (regp->vlib_rp, mp);
 }
 
 static void
@@ -624,7 +602,6 @@ vl_mem_api_dead_client_scan (api_main_t * am, vl_shmem_hdr_t * shm, f64 now)
   if (PREDICT_FALSE (vec_len (dead_indices) > 0))
     {
       int i;
-      svm_region_t *svm;
       void *oldheap;
 
       /* Allow the application to clean up its registrations */
@@ -637,13 +614,11 @@ vl_mem_api_dead_client_scan (api_main_t * am, vl_shmem_hdr_t * shm, f64 now)
 
 	      handle = vl_msg_api_handle_from_index_and_epoch
 		(dead_indices[i], shm->application_restarts);
-	      (void) vl_api_call_reaper_functions (handle);
+	      vl_api_call_reaper_functions (handle);
 	    }
 	}
 
-      svm = am->vlib_rp;
-      pthread_mutex_lock (&svm->mutex);
-      oldheap = svm_push_data_heap (svm);
+      oldheap = vl_msg_push_heap ();
 
       for (i = 0; i < vec_len (dead_indices); i++)
 	{
@@ -651,7 +626,7 @@ vl_mem_api_dead_client_scan (api_main_t * am, vl_shmem_hdr_t * shm, f64 now)
 	  if (regpp)
 	    {
 	      /* Is this a pairwise SVM segment? */
-	      if ((*regpp)->vlib_rp != svm)
+	      if ((*regpp)->vlib_rp != am->vlib_rp)
 		{
 		  int i;
 		  svm_region_t *dead_rp = (*regpp)->vlib_rp;
@@ -666,14 +641,18 @@ vl_mem_api_dead_client_scan (api_main_t * am, vl_shmem_hdr_t * shm, f64 now)
 			vec_delete (am->vlib_private_rps, 1, i);
 			goto found;
 		      }
+		  svm_pop_heap (oldheap);
 		  clib_warning ("private rp %llx AWOL", dead_rp);
+		  oldheap = svm_push_data_heap (am->vlib_rp);
 
 		found:
 		  /* Kill it, accounting for the memfd header page */
+		  svm_pop_heap (oldheap);
 		  if (munmap ((void *) virtual_base, virtual_size) < 0)
 		    clib_unix_warning ("munmap");
 		  /* Reset the queue-length-address cache */
 		  vec_reset_length (vl_api_queue_cursizes);
+		  oldheap = svm_push_data_heap (am->vlib_rp);
 		}
 	      else
 		{
@@ -689,27 +668,33 @@ vl_mem_api_dead_client_scan (api_main_t * am, vl_shmem_hdr_t * shm, f64 now)
 	      svm_pop_heap (oldheap);
 	      clib_warning ("Duplicate free, client index %d",
 			    regpp - am->vl_clients);
-	      oldheap = svm_push_data_heap (svm);
+	      oldheap = svm_push_data_heap (am->vlib_rp);
 	    }
 	}
 
       svm_client_scan_this_region_nolock (am->vlib_rp);
 
-      pthread_mutex_unlock (&svm->mutex);
-      svm_pop_heap (oldheap);
+      vl_msg_pop_heap (oldheap);
       for (i = 0; i < vec_len (dead_indices); i++)
 	pool_put_index (am->vl_clients, dead_indices[i]);
     }
 }
 
 static inline int
-void_mem_api_handle_msg_i (api_main_t * am, vlib_main_t * vm,
-			   vlib_node_runtime_t * node, svm_queue_t * q)
+void_mem_api_handle_msg_i (api_main_t * am, svm_region_t * vlib_rp,
+			   vlib_main_t * vm, vlib_node_runtime_t * node,
+			   u8 is_private)
 {
+  svm_queue_t *q;
   uword mp;
+
+  q = ((vl_shmem_hdr_t *) (void *) vlib_rp->user_ctx)->vl_input_queue;
+
   if (!svm_queue_sub2 (q, (u8 *) & mp))
     {
-      vl_msg_api_handler_with_vm_node (am, (void *) mp, vm, node);
+      VL_MSG_API_UNPOISON ((void *) mp);
+      vl_msg_api_handler_with_vm_node (am, vlib_rp, (void *) mp, vm, node,
+				       is_private);
       return 0;
     }
   return -1;
@@ -718,15 +703,15 @@ void_mem_api_handle_msg_i (api_main_t * am, vlib_main_t * vm,
 int
 vl_mem_api_handle_msg_main (vlib_main_t * vm, vlib_node_runtime_t * node)
 {
-  api_main_t *am = &api_main;
-  return void_mem_api_handle_msg_i (am, vm, node,
-				    am->shmem_hdr->vl_input_queue);
+  api_main_t *am = vlibapi_get_main ();
+  return void_mem_api_handle_msg_i (am, am->vlib_rp, vm, node,
+				    0 /* is_private */ );
 }
 
 int
 vl_mem_api_handle_rpc (vlib_main_t * vm, vlib_node_runtime_t * node)
 {
-  api_main_t *am = &api_main;
+  api_main_t *am = vlibapi_get_main ();
   int i;
   uword *tmp, mp;
 
@@ -758,7 +743,8 @@ vl_mem_api_handle_rpc (vlib_main_t * vm, vlib_node_runtime_t * node)
       for (i = 0; i < vec_len (vm->processing_rpc_requests); i++)
 	{
 	  mp = vm->processing_rpc_requests[i];
-	  vl_msg_api_handler_with_vm_node (am, (void *) mp, vm, node);
+	  vl_msg_api_handler_with_vm_node (am, am->vlib_rp, (void *) mp, vm,
+					   node, 0 /* is_private */ );
 	}
       vl_msg_api_barrier_release ();
     }
@@ -770,23 +756,9 @@ int
 vl_mem_api_handle_msg_private (vlib_main_t * vm, vlib_node_runtime_t * node,
 			       u32 reg_index)
 {
-  api_main_t *am = &api_main;
-  vl_shmem_hdr_t *save_shmem_hdr = am->shmem_hdr;
-  svm_region_t *vlib_rp, *save_vlib_rp = am->vlib_rp;
-  svm_queue_t *q;
-  int rv;
-
-  vlib_rp = am->vlib_rp = am->vlib_private_rps[reg_index];
-
-  am->shmem_hdr = (void *) vlib_rp->user_ctx;
-  q = am->shmem_hdr->vl_input_queue;
-
-  rv = void_mem_api_handle_msg_i (am, vm, node, q);
-
-  am->shmem_hdr = save_shmem_hdr;
-  am->vlib_rp = save_vlib_rp;
-
-  return rv;
+  api_main_t *am = vlibapi_get_main ();
+  return void_mem_api_handle_msg_i (am, am->vlib_private_rps[reg_index], vm,
+				    node, 1 /* is_private */ );
 }
 
 vl_api_registration_t *
@@ -794,7 +766,7 @@ vl_mem_api_client_index_to_registration (u32 handle)
 {
   vl_api_registration_t **regpp;
   vl_api_registration_t *regp;
-  api_main_t *am = &api_main;
+  api_main_t *am = vlibapi_get_main ();
   vl_shmem_hdr_t *shmem_hdr;
   u32 index;
 
@@ -822,7 +794,7 @@ svm_queue_t *
 vl_api_client_index_to_input_queue (u32 index)
 {
   vl_api_registration_t *regp;
-  api_main_t *am = &api_main;
+  api_main_t *am = vlibapi_get_main ();
 
   /* Special case: vlib trying to send itself a message */
   if (index == (u32) ~ 0)
@@ -892,7 +864,7 @@ vl_api_ring_command (vlib_main_t * vm,
 {
   int i;
   vl_shmem_hdr_t *shmem_hdr;
-  api_main_t *am = &api_main;
+  api_main_t *am = vlibapi_get_main ();
 
   /* First, dump the primary region rings.. */
 
@@ -958,7 +930,7 @@ VLIB_CLI_COMMAND (cli_show_api_ring_command, static) =
 clib_error_t *
 vlibmemory_init (vlib_main_t * vm)
 {
-  api_main_t *am = &api_main;
+  api_main_t *am = vlibapi_get_main ();
   svm_map_region_args_t _a, *a = &_a;
   u8 *remove_path1, *remove_path2;
   void vlibsocket_reference (void);
@@ -1007,7 +979,7 @@ vlibmemory_init (vlib_main_t * vm)
 void
 vl_set_memory_region_name (const char *name)
 {
-  api_main_t *am = &api_main;
+  api_main_t *am = vlibapi_get_main ();
   am->region_name = name;
 }
 

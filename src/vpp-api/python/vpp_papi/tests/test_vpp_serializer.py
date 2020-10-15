@@ -1,9 +1,10 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import unittest
 from vpp_papi.vpp_serializer import VPPType, VPPEnumType
 from vpp_papi.vpp_serializer import VPPUnionType, VPPMessage
 from vpp_papi.vpp_serializer import VPPTypeAlias, VPPSerializerValueError
+from vpp_papi import MACAddress
 from socket import inet_pton, AF_INET, AF_INET6
 import logging
 import sys
@@ -66,14 +67,43 @@ class TestDefaults(unittest.TestCase):
     def test_defaults(self):
         default_type = VPPType('default_type_t',
                                [['u16', 'mtu', {'default': 1500, 'limit': 0}]])
+        without_default_type = VPPType('without_default_type_t',
+                                       [['u16', 'mtu']])
 
         b = default_type.pack({})
         self.assertEqual(len(b), 2)
-
         nt, size = default_type.unpack(b)
         self.assertEqual(len(b), size)
         self.assertEqual(nt.mtu, 1500)
 
+        # distinguish between parameter 0 and parameter not passed
+        b = default_type.pack({'mtu': 0})
+        self.assertEqual(len(b), 2)
+        nt, size = default_type.unpack(b)
+        self.assertEqual(len(b), size)
+        self.assertEqual(nt.mtu, 0)
+
+        # Ensure that basetypes does not inherit default
+        b = without_default_type.pack({})
+        self.assertEqual(len(b), 2)
+        nt, size = default_type.unpack(b)
+        self.assertEqual(len(b), size)
+        self.assertEqual(nt.mtu, 0)
+
+        # default enum type
+        VPPEnumType('vl_api_enum_t', [["ADDRESS_IP4", 0],
+                                      ["ADDRESS_IP6", 1],
+                                      {"enumtype": "u32"}])
+
+        default_with_enum = VPPType('default_enum_type_t',
+                                    [['u16', 'mtu'], ['vl_api_enum_t',
+                                                      'e', {'default': 1}]])
+
+        b = default_with_enum.pack({})
+        self.assertEqual(len(b), 6)
+        nt, size = default_with_enum.unpack(b)
+        self.assertEqual(len(b), size)
+        self.assertEqual(nt.e, 1)
 
 class TestAddType(unittest.TestCase):
 
@@ -526,6 +556,57 @@ class TestAddType(unittest.TestCase):
                                'bi_bytes': bibytes})
 
         self.assertEqual(len(b), 20)
+
+
+    def test_lisp(self):
+        VPPEnumType('vl_api_eid_type_t',
+                    [["EID_TYPE_API_PREFIX", 0],
+                     ["EID_TYPE_API_MAC", 1],
+                     ["EID_TYPE_API_NSH", 2],
+                     {"enumtype": "u32"}])
+
+        VPPTypeAlias('vl_api_mac_address_t', {'type': 'u8',
+                                              'length': 6})
+
+        VPPType('vl_api_nsh_t',
+                [["u32", "spi"],
+                 ["u8", "si"]])
+
+        VPPEnumType('vl_api_address_family_t', [["ADDRESS_IP4", 0],
+                                                ["ADDRESS_IP6", 1],
+                                                {"enumtype": "u32"}])
+        VPPTypeAlias('vl_api_ip4_address_t', {'type': 'u8',
+                                              'length': 4})
+        VPPTypeAlias('vl_api_ip6_address_t', {'type': 'u8',
+                                              'length': 16})
+        VPPUnionType('vl_api_address_union_t',
+                     [["vl_api_ip4_address_t", "ip4"],
+                      ["vl_api_ip6_address_t", "ip6"]])
+
+        VPPType('vl_api_address_t',
+                [['vl_api_address_family_t', 'af'],
+                 ['vl_api_address_union_t', 'un']])
+
+        VPPType('vl_api_prefix_t',
+                [['vl_api_address_t', 'address'],
+                 ['u8', 'len']])
+
+        VPPUnionType('vl_api_eid_address_t',
+                     [["vl_api_prefix_t", "prefix"],
+                      ["vl_api_mac_address_t", "mac"],
+                      ["vl_api_nsh_t", "nsh"]])
+
+        eid = VPPType('vl_api_eid_t',
+                      [["vl_api_eid_type_t", "type"],
+                       ["vl_api_eid_address_t", "address"]])
+
+        b = eid.pack({'type':1,
+                      'address': {
+                          'mac': MACAddress('aa:bb:cc:dd:ee:ff')}})
+        self.assertEqual(len(b), 25)
+        nt, size = eid.unpack(b)
+        self.assertEqual(str(nt.address.mac), 'aa:bb:cc:dd:ee:ff')
+        self.assertIsNone(nt.address.prefix)
 
 
 if __name__ == '__main__':

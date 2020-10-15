@@ -24,7 +24,6 @@
 
 #include <vnet/ip/ip.h>
 #include <vlib/vlib.h>
-#include <vnet/pg/pg.h>
 #include <vnet/udp/udp.h>
 #include <vnet/tcp/tcp.h>
 #include <vnet/ip/punt.h>
@@ -351,10 +350,10 @@ vnet_punt_socket_del (vlib_main_t * vm, const punt_reg_t * pr)
 }
 
 /**
- * @brief Request IP traffic punt to the local TCP/IP stack.
+ * @brief Request IP L4 traffic punt to the local TCP/IP stack.
  *
  * @em Note
- * - UDP and TCP are the only protocols supported in the current implementation
+ * - UDP is the only protocol supported in the current implementation
  *
  * @param vm       vlib_main_t corresponding to the current thread
  * @param af       IP address family.
@@ -424,8 +423,9 @@ vnet_punt_add_del (vlib_main_t * vm, const punt_reg_t * pr, bool is_add)
 
 static clib_error_t *
 punt_cli (vlib_main_t * vm,
-	  unformat_input_t * input, vlib_cli_command_t * cmd)
+	  unformat_input_t * input__, vlib_cli_command_t * cmd)
 {
+  unformat_input_t line_input, *input = &line_input;
   clib_error_t *error = NULL;
   bool is_add = true;
   /* *INDENT-OFF* */
@@ -434,7 +434,7 @@ punt_cli (vlib_main_t * vm,
       .l4 = {
         .af = AF_IP4,
         .port = ~0,
-        .protocol = ~0,
+        .protocol = IP_PROTOCOL_UDP,
       },
     },
     .type = PUNT_TYPE_L4,
@@ -442,16 +442,23 @@ punt_cli (vlib_main_t * vm,
   u32 port;
   /* *INDENT-ON* */
 
+  if (!unformat_user (input__, unformat_line_input, input))
+    return 0;
+
   while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
     {
       if (unformat (input, "del"))
 	is_add = false;
+      else if (unformat (input, "ipv4"))
+	pr.punt.l4.af = AF_IP4;
       else if (unformat (input, "ipv6"))
 	pr.punt.l4.af = AF_IP6;
       else if (unformat (input, "ip6"))
 	pr.punt.l4.af = AF_IP6;
       else if (unformat (input, "%d", &port))
 	pr.punt.l4.port = port;
+      else if (unformat (input, "all"))
+	pr.punt.l4.port = ~0;
       else if (unformat (input, "udp"))
 	pr.punt.l4.protocol = IP_PROTOCOL_UDP;
       else if (unformat (input, "tcp"))
@@ -472,6 +479,7 @@ punt_cli (vlib_main_t * vm,
     }
 
 done:
+  unformat_free (input);
   return error;
 }
 
@@ -498,15 +506,17 @@ done:
 /* *INDENT-OFF* */
 VLIB_CLI_COMMAND (punt_command, static) = {
   .path = "set punt",
-  .short_help = "set punt [udp|tcp] [del] <all | port-num1 [port-num2 ...]>",
+  .short_help = "set punt [IPV4|ip6|ipv6] [UDP|tcp] [del] [ALL|<port-num>]",
   .function = punt_cli,
 };
 /* *INDENT-ON* */
 
 static clib_error_t *
 punt_socket_register_cmd (vlib_main_t * vm,
-			  unformat_input_t * input, vlib_cli_command_t * cmd)
+			  unformat_input_t * input__,
+			  vlib_cli_command_t * cmd)
 {
+  unformat_input_t line_input, *input = &line_input;
   u8 *socket_name = 0;
   clib_error_t *error = NULL;
   /* *INDENT-OFF* */
@@ -515,17 +525,20 @@ punt_socket_register_cmd (vlib_main_t * vm,
       .l4 = {
         .af = AF_IP4,
         .port = ~0,
-        .protocol = ~0,
+        .protocol = IP_PROTOCOL_UDP,
       },
     },
     .type = PUNT_TYPE_L4,
   };
   /* *INDENT-ON* */
 
+  if (!unformat_user (input__, unformat_line_input, input))
+    return 0;
+
   while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
     {
       if (unformat (input, "ipv4"))
-	;
+	pr.punt.l4.af = AF_IP4;
       else if (unformat (input, "ipv6"))
 	pr.punt.l4.af = AF_IP6;
       else if (unformat (input, "udp"))
@@ -534,6 +547,8 @@ punt_socket_register_cmd (vlib_main_t * vm,
 	pr.punt.l4.protocol = IP_PROTOCOL_TCP;
       else if (unformat (input, "%d", &pr.punt.l4.port))
 	;
+      else if (unformat (input, "all"))
+	pr.punt.l4.port = ~0;
       else if (unformat (input, "socket %s", &socket_name))
 	;
       else
@@ -550,29 +565,32 @@ punt_socket_register_cmd (vlib_main_t * vm,
     error = vnet_punt_socket_add (vm, 1, &pr, (char *) socket_name);
 
 done:
+  unformat_free (input);
   return error;
 }
 
 /*?
  *
  * @cliexpar
- * @cliexcmd{punt socket register}
+ * @cliexcmd{punt socket register socket punt_l4_foo.sock}
+
  ?*/
 /* *INDENT-OFF* */
 VLIB_CLI_COMMAND (punt_socket_register_command, static) =
 {
   .path = "punt socket register",
   .function = punt_socket_register_cmd,
-  .short_help = "punt socket register [ipv4|ipv6] [udp|tcp]> <all | port-num1 [port-num2 ...]> <socket>",
+  .short_help = "punt socket register [IPV4|ipv6] [UDP|tcp] [ALL|<port-num>] socket <socket>",
   .is_mp_safe = 1,
 };
 /* *INDENT-ON* */
 
 static clib_error_t *
 punt_socket_deregister_cmd (vlib_main_t * vm,
-			    unformat_input_t * input,
+			    unformat_input_t * input__,
 			    vlib_cli_command_t * cmd)
 {
+  unformat_input_t line_input, *input = &line_input;
   clib_error_t *error = NULL;
   /* *INDENT-OFF* */
   punt_reg_t pr = {
@@ -580,17 +598,20 @@ punt_socket_deregister_cmd (vlib_main_t * vm,
       .l4 = {
         .af = AF_IP4,
         .port = ~0,
-        .protocol = ~0,
+        .protocol = IP_PROTOCOL_UDP,
       },
     },
     .type = PUNT_TYPE_L4,
   };
   /* *INDENT-ON* */
 
+  if (!unformat_user (input__, unformat_line_input, input))
+    return 0;
+
   while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
     {
       if (unformat (input, "ipv4"))
-	;
+	pr.punt.l4.af = AF_IP4;
       else if (unformat (input, "ipv6"))
 	pr.punt.l4.af = AF_IP6;
       else if (unformat (input, "udp"))
@@ -599,6 +620,8 @@ punt_socket_deregister_cmd (vlib_main_t * vm,
 	pr.punt.l4.protocol = IP_PROTOCOL_TCP;
       else if (unformat (input, "%d", &pr.punt.l4.port))
 	;
+      else if (unformat (input, "all"))
+	pr.punt.l4.port = ~0;
       else
 	{
 	  error = clib_error_return (0, "parse error: '%U'",
@@ -609,6 +632,7 @@ punt_socket_deregister_cmd (vlib_main_t * vm,
 
   error = vnet_punt_socket_del (vm, &pr);
 done:
+  unformat_free (input);
   return error;
 }
 
@@ -622,7 +646,7 @@ VLIB_CLI_COMMAND (punt_socket_deregister_command, static) =
 {
   .path = "punt socket deregister",
   .function = punt_socket_deregister_cmd,
-  .short_help = "punt socket deregister [ipv4|ipv6] [udp|tcp]> <all | port-num1 [port-num2 ...]>",
+  .short_help = "punt socket deregister [IPV4|ipv6] [UDP|tcp] [ALL|<port-num>]",
   .is_mp_safe = 1,
 };
 /* *INDENT-ON* */
@@ -714,12 +738,16 @@ punt_client_show_one (const punt_client_t * pc, void *ctx)
 
 static clib_error_t *
 punt_socket_show_cmd (vlib_main_t * vm,
-		      unformat_input_t * input, vlib_cli_command_t * cmd)
+		      unformat_input_t * input__, vlib_cli_command_t * cmd)
 {
+  unformat_input_t line_input, *input = &line_input;
   clib_error_t *error = NULL;
   punt_type_t pt;
 
   pt = PUNT_TYPE_L4;
+
+  if (!unformat_user (input__, unformat_line_input, input))
+    return 0;
 
   while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
     {
@@ -740,6 +768,7 @@ punt_socket_show_cmd (vlib_main_t * vm,
   punt_client_walk (pt, punt_client_show_one, vm);
 
 done:
+  unformat_free (input);
   return (error);
 }
 

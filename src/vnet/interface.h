@@ -52,13 +52,13 @@ union ip46_address_t_;
 
 typedef enum
 {
-  VNET_HW_INTERFACE_RX_MODE_UNKNOWN,
-  VNET_HW_INTERFACE_RX_MODE_POLLING,
-  VNET_HW_INTERFACE_RX_MODE_INTERRUPT,
-  VNET_HW_INTERFACE_RX_MODE_ADAPTIVE,
-  VNET_HW_INTERFACE_RX_MODE_DEFAULT,
-  VNET_HW_INTERFACE_NUM_RX_MODES,
-} vnet_hw_interface_rx_mode;
+  VNET_HW_IF_RX_MODE_UNKNOWN,
+  VNET_HW_IF_RX_MODE_POLLING,
+  VNET_HW_IF_RX_MODE_INTERRUPT,
+  VNET_HW_IF_RX_MODE_ADAPTIVE,
+  VNET_HW_IF_RX_MODE_DEFAULT,
+  VNET_HW_IF_NUM_RX_MODES,
+} vnet_hw_if_rx_mode;
 
 /* Interface up/down callback. */
 typedef clib_error_t *(vnet_interface_function_t)
@@ -74,15 +74,24 @@ typedef clib_error_t *(vnet_interface_set_mac_address_function_t)
   (struct vnet_hw_interface_t * hi,
    const u8 * old_address, const u8 * new_address);
 
+/* Interface add/del additional mac address callback */
+typedef clib_error_t *(vnet_interface_add_del_mac_address_function_t)
+  (struct vnet_hw_interface_t * hi, const u8 * address, u8 is_add);
+
 /* Interface set rx mode callback. */
 typedef clib_error_t *(vnet_interface_set_rx_mode_function_t)
   (struct vnet_main_t * vnm, u32 if_index, u32 queue_id,
-   vnet_hw_interface_rx_mode mode);
+   vnet_hw_if_rx_mode mode);
 
 /* Interface set l2 mode callback. */
 typedef clib_error_t *(vnet_interface_set_l2_mode_function_t)
   (struct vnet_main_t * vnm, struct vnet_hw_interface_t * hi,
    i32 l2_if_adjust);
+
+/* Interface to set rss queues of the interface */
+typedef clib_error_t *(vnet_interface_rss_queues_set_t)
+  (struct vnet_main_t * vnm, struct vnet_hw_interface_t * hi,
+   clib_bitmap_t * bitmap);
 
 typedef enum
 {
@@ -266,6 +275,13 @@ typedef struct _vnet_device_class
 
   /* Function to set mac address. */
   vnet_interface_set_mac_address_function_t *mac_addr_change_function;
+
+  /* Function to add/delete additional MAC addresses */
+  vnet_interface_add_del_mac_address_function_t *mac_addr_add_del_function;
+
+  /* Interface to set rss queues of the interface */
+  vnet_interface_rss_queues_set_t *set_rss_queues_function;
+
 } vnet_device_class_t;
 
 #ifndef CLIB_MARCH_VARIANT
@@ -366,6 +382,10 @@ typedef enum vnet_hw_interface_class_flags_t_
    * @brief a point 2 point interface
    */
   VNET_HW_INTERFACE_CLASS_FLAG_P2P = (1 << 0),
+  /**
+   * @brief a non-broadcast multiple access interface
+   */
+  VNET_HW_INTERFACE_CLASS_FLAG_NBMA = (1 << 1),
 } vnet_hw_interface_class_flags_t;
 
 /* Layer-2 (e.g. Ethernet) interface class. */
@@ -391,6 +411,9 @@ typedef struct _vnet_hw_interface_class
 
   /* Function to call when link MAC changes. */
   vnet_interface_set_mac_address_function_t *mac_addr_change_function;
+
+  /* Function to add/delete additional MAC addresses */
+  vnet_interface_add_del_mac_address_function_t *mac_addr_add_del_function;
 
   /* Format function to display interface name. */
   format_function_t *format_interface_name;
@@ -436,7 +459,7 @@ typedef struct _vnet_hw_interface_class
 } vnet_hw_interface_class_t;
 
 /**
- * @brief Return a complete, zero-length (aka dummy) rewrite
+ * @brief Return a complete, zero-length (aka placeholder) rewrite
  */
 extern u8 *default_build_rewrite (struct vnet_main_t *vnm,
 				  u32 sw_if_index,
@@ -486,6 +509,12 @@ typedef enum vnet_hw_interface_flags_t_
 
   /* gso */
   VNET_HW_INTERFACE_FLAG_SUPPORTS_GSO = (1 << 18),
+
+  /* non-broadcast multiple access */
+  VNET_HW_INTERFACE_FLAG_NBMA = (1 << 19),
+
+  /* hw/driver can switch between l2-promisc and l3-dmac-filter modes */
+  VNET_HW_INTERFACE_FLAG_SUPPORTS_MAC_FILTER = (1 << 20),
 } vnet_hw_interface_flags_t;
 
 #define VNET_HW_INTERFACE_FLAG_DUPLEX_SHIFT 1
@@ -498,6 +527,7 @@ typedef enum vnet_hw_interface_flags_t_
    that packets flow over. */
 typedef struct vnet_hw_interface_t
 {
+  CLIB_CACHE_LINE_ALIGN_MARK (cacheline0);
   /* Interface name. */
   u8 *name;
 
@@ -552,8 +582,9 @@ typedef struct vnet_hw_interface_t
   /* Hash table mapping sub interface id to sw_if_index. */
   uword *sub_interface_sw_if_index_by_id;
 
-  /* Count of number of L2 subinterfaces */
+  /* Count of number of L2 and L3 subinterfaces */
   u32 l2_if_count;
+  u32 l3_if_count;
 
   /* Bonded interface info -
      0       - not a bonded interface nor a slave
@@ -569,9 +600,9 @@ typedef struct vnet_hw_interface_t
   /* input node cpu index by queue */
   u32 *input_node_thread_index_by_queue;
 
-  /* vnet_hw_interface_rx_mode by queue */
+  /* vnet_hw_if_rx_mode by queue */
   u8 *rx_mode_by_queue;
-  vnet_hw_interface_rx_mode default_rx_mode;
+  vnet_hw_if_rx_mode default_rx_mode;
 
   /* device input device_and_queue runtime index */
   uword *dq_runtime_index_by_queue;
@@ -579,7 +610,13 @@ typedef struct vnet_hw_interface_t
   /* numa node that hardware device connects to */
   u8 numa_node;
 
-  u8 padding[3];
+  /* rss queues bitmap */
+  clib_bitmap_t *rss_queues;
+
+  /* trace */
+  i32 n_trace;
+
+  u32 trace_classify_table_index;
 } vnet_hw_interface_t;
 
 extern vnet_device_class_t vnet_local_interface_device_class;
@@ -857,9 +894,6 @@ typedef struct
   /* per-thread data */
   vnet_interface_per_thread_data_t *per_thread_data;
 
-  /* enable GSO processing in packet path if this count is > 0 */
-  u32 gso_interface_count;
-
   /* feature_arc_index */
   u8 output_feature_arc_index;
 } vnet_interface_main_t;
@@ -902,6 +936,8 @@ typedef struct
   u8 rx_enable;
   u8 tx_enable;
   u8 drop_enable;
+  u8 preallocate_data;
+  u8 free_data;
   u32 sw_if_index;
   int filter;
 } vnet_pcap_dispatch_trace_args_t;

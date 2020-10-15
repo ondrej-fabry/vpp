@@ -31,8 +31,11 @@ typedef struct
   svm_fifo_t *server_rx_fifo;
   svm_fifo_t *server_tx_fifo;
 
-  u64 vpp_server_handle;
-  u64 vpp_active_open_handle;
+  session_handle_t vpp_server_handle;
+  session_handle_t vpp_active_open_handle;
+  volatile int active_open_establishing;
+  volatile int po_disconnected;
+  volatile int ao_disconnected;
 } proxy_session_t;
 
 typedef struct
@@ -57,7 +60,10 @@ typedef struct
    */
   u8 *connect_uri;			/**< URI for slave's connect */
   u32 configured_segment_size;
-  u32 fifo_size;
+  u32 fifo_size;			/**< initial fifo size */
+  u32 max_fifo_size;			/**< max fifo size */
+  u8 high_watermark;			/**< high watermark (%) */
+  u8 low_watermark;			/**< low watermark (%) */
   u32 private_segment_count;		/**< Number of private fifo segs */
   u32 private_segment_size;		/**< size of private fifo segs */
   int rcv_buffer_size;

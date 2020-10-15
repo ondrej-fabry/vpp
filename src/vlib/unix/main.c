@@ -91,10 +91,10 @@ unsetup_signal_handlers (int sig)
 
 /* allocate this buffer from mheap when setting up the signal handler.
     dangerous to vec_resize it when crashing, mheap itself might have been
-    corruptted already */
+    corrupted already */
 static u8 *syslog_msg = 0;
-static int last_signum = 0;
-static uword last_faulting_address = 0;
+int vlib_last_signum = 0;
+uword vlib_last_faulting_address = 0;
 
 static void
 unix_signal_handler (int signum, siginfo_t * si, ucontext_t * uc)
@@ -102,8 +102,8 @@ unix_signal_handler (int signum, siginfo_t * si, ucontext_t * uc)
   uword fatal = 0;
 
   /* These come in handy when looking at core files from optimized images */
-  last_signum = signum;
-  last_faulting_address = (uword) si->si_addr;
+  vlib_last_signum = signum;
+  vlib_last_faulting_address = (uword) si->si_addr;
 
   syslog_msg = format (syslog_msg, "received signal %U, PC %U",
 		       format_signal, signum, format_ucontext_pc, uc);
@@ -177,10 +177,14 @@ unix_signal_handler (int signum, siginfo_t * si, ucontext_t * uc)
 	  syslog (LOG_ERR | LOG_DAEMON, "%s", syslog_msg);
 	}
 
-      /* have to remove SIGABRT to avoid recusive - os_exit calling abort() */
+      /* have to remove SIGABRT to avoid recursive - os_exit calling abort() */
       unsetup_signal_handlers (SIGABRT);
 
-      os_exit (1);
+      /* os_exit(1) causes core generation, skip that for SIGINT, SIGHUP */
+      if (signum == SIGINT || signum == SIGHUP)
+	os_exit (0);
+      else
+	os_exit (1);
     }
   else
     clib_warning ("%s", syslog_msg);
@@ -209,6 +213,7 @@ setup_signal_handlers (unix_main_t * um)
 	case SIGSTOP:
 	case SIGUSR1:
 	case SIGUSR2:
+	case SIGPROF:
 	  continue;
 
 	  /* ignore SIGPIPE, SIGCHLD */
@@ -234,8 +239,8 @@ unix_error_handler (void *arg, u8 * msg, int msg_len)
 {
   unix_main_t *um = arg;
 
-  /* Echo to stderr when interactive. */
-  if (um->flags & UNIX_FLAG_INTERACTIVE)
+  /* Echo to stderr when interactive or syslog is disabled. */
+  if (um->flags & (UNIX_FLAG_INTERACTIVE | UNIX_FLAG_NOSYSLOG))
     {
       CLIB_UNUSED (int r) = write (2, msg, msg_len);
     }
@@ -372,6 +377,7 @@ VLIB_REGISTER_NODE (startup_config_node,static) = {
     .function = startup_config_process,
     .type = VLIB_NODE_TYPE_PROCESS,
     .name = "startup-config-process",
+    .process_log2_n_stack_bytes = 18,
 };
 /* *INDENT-ON* */
 
@@ -394,6 +400,8 @@ unix_config (vlib_main_t * vm, unformat_input_t * input)
 	um->flags |= UNIX_FLAG_INTERACTIVE;
       else if (unformat (input, "nodaemon"))
 	um->flags |= UNIX_FLAG_NODAEMON;
+      else if (unformat (input, "nosyslog"))
+	um->flags |= UNIX_FLAG_NOSYSLOG;
       else if (unformat (input, "cli-prompt %s", &cli_prompt))
 	vlib_unix_cli_set_prompt (cli_prompt);
       else
@@ -523,7 +531,7 @@ unix_config (vlib_main_t * vm, unformat_input_t * input)
 	}
     }
 
-  if (!(um->flags & UNIX_FLAG_INTERACTIVE))
+  if (!(um->flags & (UNIX_FLAG_INTERACTIVE | UNIX_FLAG_NOSYSLOG)))
     {
       openlog (vm->name, LOG_CONS | LOG_PERROR | LOG_PID, LOG_DAEMON);
       clib_error_register_handler (unix_error_handler, um);
@@ -562,6 +570,11 @@ unix_config (vlib_main_t * vm, unformat_input_t * input)
  * @cfgcmd{nodaemon}
  * Do not fork or background the VPP process. Typically used when invoking
  * VPP applications from a process monitor.
+ *
+ * @cfgcmd{nosyslog}
+ * Do not send e.g. clib_warning(...) output to syslog. Used
+ * when invoking VPP applications from a process monitor which
+ * pipe stdout/stderr to a dedicated logger service.
  *
  * @cfgcmd{exec, &lt;filename&gt;}
  * @par <code>startup-config &lt;filename&gt;</code>
@@ -641,6 +654,8 @@ thread0 (uword arg)
   unformat_input_t input;
   int i;
 
+  vlib_process_finish_switch_stack (vm);
+
   unformat_init_command_line (&input, (char **) vm->argv);
   i = vlib_main (vm, &input);
   unformat_free (&input);
@@ -651,18 +666,17 @@ thread0 (uword arg)
 u8 *
 vlib_thread_stack_init (uword thread_index)
 {
+  void *stack;
   ASSERT (thread_index < vec_len (vlib_thread_stacks));
-  vlib_thread_stacks[thread_index] = clib_mem_alloc_aligned
-    (VLIB_THREAD_STACK_SIZE, clib_mem_get_page_size ());
+  stack = clib_mem_vm_map_stack (VLIB_THREAD_STACK_SIZE,
+				 CLIB_MEM_PAGE_SZ_DEFAULT,
+				 "thread stack: thread %u", thread_index);
 
-  /*
-   * Disallow writes to the bottom page of the stack, to
-   * catch stack overflows.
-   */
-  if (mprotect (vlib_thread_stacks[thread_index],
-		clib_mem_get_page_size (), PROT_READ) < 0)
-    clib_unix_warning ("thread stack");
-  return vlib_thread_stacks[thread_index];
+  if (stack == CLIB_MEM_VM_MAP_FAILED)
+    clib_panic ("failed to allocate thread %u stack", thread_index);
+
+  vlib_thread_stacks[thread_index] = stack;
+  return stack;
 }
 
 int
@@ -679,6 +693,8 @@ vlib_unix_main (int argc, char *argv[])
   vm->heap_aligned_base = (void *)
     (((uword) vm->heap_base) & ~(VLIB_FRAME_ALIGN - 1));
   ASSERT (vm->heap_base);
+
+  clib_time_init (&vm->clib_time);
 
   unformat_init_command_line (&input, (char **) vm->argv);
   if ((e = vlib_plugin_config (vm, &input)))
@@ -712,6 +728,7 @@ vlib_unix_main (int argc, char *argv[])
   __os_thread_index = 0;
   vm->thread_index = 0;
 
+  vlib_process_start_switch_stack (vm, 0);
   i = clib_calljmp (thread0, (uword) vm,
 		    (void *) (vlib_thread_stacks[0] +
 			      VLIB_THREAD_STACK_SIZE));

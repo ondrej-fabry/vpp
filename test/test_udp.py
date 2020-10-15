@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 import unittest
 from framework import VppTestCase, VppTestRunner
 
@@ -60,7 +60,6 @@ class TestUdpEncap(VppTestCase):
         for i in self.pg_interfaces:
             i.unconfig_ip4()
             i.unconfig_ip6()
-            i.ip6_disable()
             i.set_table_ip4(0)
             i.set_table_ip6(0)
             i.admin_down()
@@ -169,7 +168,7 @@ class TestUdpEncap(VppTestCase):
                        dst=self.pg0.local_mac) /
                  IP(src="2.2.2.2", dst="1.1.0.1") /
                  UDP(sport=1234, dport=1234) /
-                 Raw('\xa5' * 100))
+                 Raw(b'\xa5' * 100))
         rx = self.send_and_expect(self.pg0, p_4o4*NUM_PKTS, self.pg0)
         for p in rx:
             self.validate_outer4(p, udp_encap_0)
@@ -184,7 +183,7 @@ class TestUdpEncap(VppTestCase):
                        dst=self.pg0.local_mac) /
                  IP(src="2.2.2.2", dst="1.1.2.1") /
                  UDP(sport=1234, dport=1234) /
-                 Raw('\xa5' * 100))
+                 Raw(b'\xa5' * 100))
         rx = self.send_and_expect(self.pg0, p_4o6*NUM_PKTS, self.pg2)
         for p in rx:
             self.validate_outer6(p, udp_encap_2)
@@ -199,7 +198,7 @@ class TestUdpEncap(VppTestCase):
                        dst=self.pg0.local_mac) /
                  IPv6(src="2001::100", dst="2001::1") /
                  UDP(sport=1234, dport=1234) /
-                 Raw('\xa5' * 100))
+                 Raw(b'\xa5' * 100))
         rx = self.send_and_expect(self.pg0, p_6o4*NUM_PKTS, self.pg1)
         for p in rx:
             self.validate_outer4(p, udp_encap_1)
@@ -214,7 +213,7 @@ class TestUdpEncap(VppTestCase):
                        dst=self.pg0.local_mac) /
                  IPv6(src="2001::100", dst="2001::3") /
                  UDP(sport=1234, dport=1234) /
-                 Raw('\xa5' * 100))
+                 Raw(b'\xa5' * 100))
         rx = self.send_and_expect(self.pg0, p_6o6*NUM_PKTS, self.pg3)
         for p in rx:
             self.validate_outer6(p, udp_encap_3)
@@ -239,7 +238,7 @@ class TestUdpEncap(VppTestCase):
                          dst=self.pg0.local_mac) /
                    IP(src="2.2.2.2", dst="1.1.2.22") /
                    UDP(sport=1234, dport=1234) /
-                   Raw('\xa5' * 100))
+                   Raw(b'\xa5' * 100))
         rx = self.send_and_expect(self.pg0, p_4omo4*NUM_PKTS, self.pg1)
         for p in rx:
             self.validate_outer4(p, udp_encap_1)
@@ -320,6 +319,8 @@ class TestUDP(VppTestCase):
         if error:
             self.logger.critical(error)
             self.assertNotIn("failed", error)
+
+        self.logger.debug(self.vapi.cli("show session verbose 2"))
 
         # Delete inter-table routes
         ip_t01.remove_vpp_config()

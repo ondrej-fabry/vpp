@@ -44,8 +44,8 @@ typedef enum
  _(DECRYPTION_FAILED, "ESP decryption failed")   \
  _(REPLAY, "SA replayed packet")	         \
  _(NOT_IP, "Not IP packet (dropped)")	         \
- _(ENQ_FAIL, "Enqueue failed (buffer full)")     \
- _(DISCARD, "Not enough crypto operations, discarding frame")  \
+ _(ENQ_FAIL, "Enqueue decrypt failed (queue full)")     \
+ _(DISCARD, "Not enough crypto operations")      \
  _(BAD_LEN, "Invalid ciphertext length")         \
  _(SESSION, "Failed to get crypto session")      \
  _(NOSUP, "Cipher/Auth not supported")
@@ -121,11 +121,12 @@ dpdk_esp_decrypt_inline (vlib_main_t * vm,
     {
       if (is_ip6)
 	vlib_node_increment_counter (vm, dpdk_esp6_decrypt_node.index,
-				     ESP_DECRYPT_ERROR_DISCARD, 1);
+				     ESP_DECRYPT_ERROR_DISCARD, n_left_from);
       else
 	vlib_node_increment_counter (vm, dpdk_esp4_decrypt_node.index,
-				     ESP_DECRYPT_ERROR_DISCARD, 1);
+				     ESP_DECRYPT_ERROR_DISCARD, n_left_from);
       /* Discard whole frame */
+      vlib_buffer_free (vm, from, n_left_from);
       return n_left_from;
     }
 
@@ -194,8 +195,6 @@ dpdk_esp_decrypt_inline (vlib_main_t * vm,
 
 	      if (PREDICT_FALSE (res_idx == (u16) ~ 0))
 		{
-		  clib_warning ("unsupported SA by thread index %u",
-				thread_idx);
 		  if (is_ip6)
 		    vlib_node_increment_counter (vm,
 						 dpdk_esp6_decrypt_node.index,
@@ -214,7 +213,6 @@ dpdk_esp_decrypt_inline (vlib_main_t * vm,
 	      error = crypto_get_session (&session, sa_index0, res, cwm, 0);
 	      if (PREDICT_FALSE (error || !session))
 		{
-		  clib_warning ("failed to get crypto session");
 		  if (is_ip6)
 		    vlib_node_increment_counter (vm,
 						 dpdk_esp6_decrypt_node.index,
@@ -238,7 +236,6 @@ dpdk_esp_decrypt_inline (vlib_main_t * vm,
 	  if (ipsec_sa_anti_replay_check
 	      (sa0, clib_host_to_net_u32 (esp0->seq)))
 	    {
-	      clib_warning ("failed anti-replay check");
 	      if (is_ip6)
 		vlib_node_increment_counter (vm,
 					     dpdk_esp6_decrypt_node.index,
@@ -256,7 +253,10 @@ dpdk_esp_decrypt_inline (vlib_main_t * vm,
 	  if (is_ip6)
 	    priv->next = DPDK_CRYPTO_INPUT_NEXT_DECRYPT6_POST;
 	  else
-	    priv->next = DPDK_CRYPTO_INPUT_NEXT_DECRYPT4_POST;
+	    {
+	      priv->next = DPDK_CRYPTO_INPUT_NEXT_DECRYPT4_POST;
+	      b0->flags |= VNET_BUFFER_F_IS_IP4;
+	    }
 
 	  /* FIXME multi-seg */
 	  vlib_increment_combined_counter
@@ -283,8 +283,6 @@ dpdk_esp_decrypt_inline (vlib_main_t * vm,
 
 	  if (payload_len & (cipher_alg->boundary - 1))
 	    {
-	      clib_warning ("payload %u not multiple of %d\n",
-			    payload_len, cipher_alg->boundary);
 	      if (is_ip6)
 		vlib_node_increment_counter (vm, dpdk_esp6_decrypt_node.index,
 					     ESP_DECRYPT_ERROR_BAD_LEN, 1);
@@ -330,7 +328,10 @@ dpdk_esp_decrypt_inline (vlib_main_t * vm,
 
 	      /* _aad[3] should always be 0 */
 	      if (PREDICT_FALSE (ipsec_sa_is_set_USE_ESN (sa0)))
-		_aad[2] = clib_host_to_net_u32 (sa0->seq_hi);
+		{
+		  _aad[2] = _aad[1];
+		  _aad[1] = clib_host_to_net_u32 (sa0->seq_hi);
+		}
 	      else
 		_aad[2] = 0;
 	    }
@@ -610,16 +611,14 @@ dpdk_esp_decrypt_post_inline (vlib_main_t * vm,
 	      if ((ih4->ip_version_and_header_length & 0xF0) == 0x40)
 		{
 		  u16 ih4_len = ip4_header_bytes (ih4);
-		  vlib_buffer_advance (b0, -ih4_len - udp_encap_adv);
+		  vlib_buffer_advance (b0, -ih4_len);
 		  next0 = ESP_DECRYPT_NEXT_IP4_INPUT;
-		  if (!ipsec_sa_is_set_UDP_ENCAP (sa0))
-		    {
-		      oh4 = vlib_buffer_get_current (b0);
-		      memmove (oh4, ih4, ih4_len);
-		      oh4->protocol = f0->next_header;
-		      oh4->length = clib_host_to_net_u16 (b0->current_length);
-		      oh4->checksum = ip4_header_checksum (oh4);
-		    }
+
+		  oh4 = vlib_buffer_get_current (b0);
+		  memmove (oh4, ih4, ih4_len);
+		  oh4->protocol = f0->next_header;
+		  oh4->length = clib_host_to_net_u16 (b0->current_length);
+		  oh4->checksum = ip4_header_checksum (oh4);
 		}
 	      else if ((ih4->ip_version_and_header_length & 0xF0) == 0x60)
 		{

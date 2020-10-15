@@ -12,6 +12,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stddef.h>
@@ -78,39 +79,8 @@ u16 read_timeout = 0;
 bool rx_is_running = false;
 bool timeout_thread_cancelled = false;
 
-/* Set to true to enable memory tracing */
-bool mem_trace = false;
-
-__attribute__((constructor))
-static void
-vac_client_constructor (void)
-{
-  clib_mem_init (0, 1 << 30);
-#if USE_DLMALLOC == 0
-  {
-      u8 *heap;
-      mheap_t *h;
-
-      heap = clib_mem_get_per_cpu_heap ();
-      h = mheap_header (heap);
-      /* make the main heap thread-safe */
-      h->flags |= MHEAP_FLAG_THREAD_SAFE;
-  }
-#endif
-  if (mem_trace)
-    clib_mem_trace (1);
-}
-
-__attribute__((destructor))
-static void
-vac_client_destructor (void)
-{
-  if (mem_trace)
-    fformat(stderr, "TRACE: %s",
-	    format (0, "%U\n",
-		    format_mheap, clib_mem_get_heap (), 1));
-}
-
+/* Only ever allocate one heap */
+bool mem_initialized = false;
 
 static void
 init (void)
@@ -177,7 +147,7 @@ vac_rx_thread_fn (void *arg)
   vl_api_memclnt_keepalive_t *mp;
   vl_api_memclnt_keepalive_reply_t *rmp;
   vac_main_t *pm = &vac_main;
-  api_main_t *am = &api_main;
+  api_main_t *am = vlibapi_get_main();
   vl_shmem_hdr_t *shmem_hdr;
   uword msg;
 
@@ -186,6 +156,7 @@ vac_rx_thread_fn (void *arg)
   while (1)
     while (!svm_queue_sub(q, (u8 *)&msg, SVM_Q_WAIT, 0))
       {
+        VL_MSG_API_UNPOISON((void *)msg);
 	u16 id = ntohs(*((u16 *)msg));
 	switch (id) {
 	case VL_API_RX_THREAD_EXIT:
@@ -236,7 +207,7 @@ vac_timeout_thread_fn (void *arg)
 {
   vl_api_memclnt_read_timeout_t *ep;
   vac_main_t *pm = &vac_main;
-  api_main_t *am = &api_main;
+  api_main_t *am = vlibapi_get_main();
   struct timespec ts;
   struct timeval tv;
   int rv;
@@ -271,7 +242,7 @@ vac_timeout_thread_fn (void *arg)
 void
 vac_rx_suspend (void)
 {
-  api_main_t *am = &api_main;
+  api_main_t *am = vlibapi_get_main();
   vac_main_t *pm = &vac_main;
   vl_api_memclnt_rx_thread_suspend_t *ep;
 
@@ -305,25 +276,26 @@ vac_rx_resume (void)
 static uword *
 vac_msg_table_get_hash (void)
 {
-  api_main_t *am = &api_main;
+  api_main_t *am = vlibapi_get_main();
   return (am->msg_index_by_name_and_crc);
 }
 
 int
 vac_msg_table_size(void)
 {
-  api_main_t *am = &api_main;
+  api_main_t *am = vlibapi_get_main();
   return hash_elts(am->msg_index_by_name_and_crc);
 }
 
 int
 vac_connect (char * name, char * chroot_prefix, vac_callback_t cb,
-               int rx_qlen)
+             int rx_qlen)
 {
   rx_thread_done = false;
   int rv = 0;
   vac_main_t *pm = &vac_main;
 
+  assert (clib_mem_get_heap ());
   init();
   if (chroot_prefix != NULL)
     vl_set_memory_root_path (chroot_prefix);
@@ -389,7 +361,7 @@ unset_timeout (void)
 int
 vac_disconnect (void)
 {
-  api_main_t *am = &api_main;
+  api_main_t *am = vlibapi_get_main();
   vac_main_t *pm = &vac_main;
   uword junk;
   int rv = 0;
@@ -441,7 +413,7 @@ int
 vac_read (char **p, int *l, u16 timeout)
 {
   svm_queue_t *q;
-  api_main_t *am = &api_main;
+  api_main_t *am = vlibapi_get_main();
   vac_main_t *pm = &vac_main;
   vl_api_memclnt_keepalive_t *mp;
   vl_api_memclnt_keepalive_reply_t *rmp;
@@ -468,6 +440,7 @@ vac_read (char **p, int *l, u16 timeout)
   rv = svm_queue_sub(q, (u8 *)&msg, SVM_Q_WAIT, 0);
 
   if (rv == 0) {
+    VL_MSG_API_UNPOISON((void *)msg);
     u16 msg_id = ntohs(*((u16 *)msg));
     switch (msg_id) {
     case VL_API_RX_THREAD_EXIT:
@@ -487,7 +460,7 @@ vac_read (char **p, int *l, u16 timeout)
       shmem_hdr = am->shmem_hdr;
       vl_msg_api_send_shmem(shmem_hdr->vl_input_queue, (u8 *)&rmp);
       vl_msg_api_free((void *) msg);
-      /* 
+      /*
        * Python code is blissfully unaware of these pings, so
        * act as if it never happened...
        */
@@ -533,14 +506,14 @@ typedef VL_API_PACKED(struct _vl_api_header {
 static u32
 vac_client_index (void)
 {
-  return (api_main.my_client_index);
+  return (vlibapi_get_main()->my_client_index);
 }
 
 int
 vac_write (char *p, int l)
 {
   int rv = -1;
-  api_main_t *am = &api_main;
+  api_main_t *am = vlibapi_get_main();
   vl_api_header_t *mp = vl_msg_api_alloc(l);
   svm_queue_t *q;
   vac_main_t *pm = &vac_main;
@@ -584,5 +557,21 @@ vac_msg_table_max_index(void)
 void
 vac_set_error_handler (vac_error_callback_t cb)
 {
+  assert (clib_mem_get_heap ());
   if (cb) clib_error_register_handler (cb, 0);
+}
+
+/*
+ * Required if application doesn't use a VPP heap.
+ */
+void
+vac_mem_init (size_t size)
+{
+  if (mem_initialized)
+    return;
+  if (size == 0)
+    clib_mem_init (0, 1 << 30);  // default
+  else
+    clib_mem_init (0, size);
+  mem_initialized = true;
 }

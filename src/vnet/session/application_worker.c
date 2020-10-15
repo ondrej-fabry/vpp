@@ -33,6 +33,7 @@ app_worker_alloc (application_t * app)
   app_wrk->wrk_map_index = ~0;
   app_wrk->connects_seg_manager = APP_INVALID_SEGMENT_MANAGER_INDEX;
   app_wrk->first_segment_manager = APP_INVALID_SEGMENT_MANAGER_INDEX;
+  clib_spinlock_init (&app_wrk->detached_seg_managers_lock);
   APP_DBG ("New app %v worker %u", app->name, app_wrk->wrk_index);
   return app_wrk;
 }
@@ -56,11 +57,11 @@ app_worker_free (app_worker_t * app_wrk)
 {
   application_t *app = application_get (app_wrk->app_index);
   vnet_unlisten_args_t _a, *a = &_a;
-  u64 handle, *handles = 0;
+  u64 handle, *handles = 0, *sm_indices = 0;
   segment_manager_t *sm;
   session_t *ls;
   u32 sm_index;
-  int i;
+  int i, j;
 
   /*
    *  Listener cleanup
@@ -70,19 +71,29 @@ app_worker_free (app_worker_t * app_wrk)
   hash_foreach (handle, sm_index, app_wrk->listeners_table, ({
     ls = listen_session_get_from_handle (handle);
     vec_add1 (handles, app_listen_session_handle (ls));
+    vec_add1 (sm_indices, sm_index);
     sm = segment_manager_get (sm_index);
-    sm->app_wrk_index = SEGMENT_MANAGER_INVALID_APP_INDEX;
   }));
   /* *INDENT-ON* */
 
   for (i = 0; i < vec_len (handles); i++)
     {
+      /* Cleanup listener */
       a->app_index = app->app_index;
       a->wrk_map_index = app_wrk->wrk_map_index;
       a->handle = handles[i];
-      /* seg manager is removed when unbind completes */
       (void) vnet_unlisten (a);
+
+      sm = segment_manager_get_if_valid (sm_indices[i]);
+      if (sm && !segment_manager_app_detached (sm))
+	{
+	  sm->first_is_protected = 0;
+	  segment_manager_init_free (sm);
+	}
     }
+  vec_reset_length (handles);
+  vec_free (sm_indices);
+  hash_free (app_wrk->listeners_table);
 
   /*
    * Connects segment manager cleanup
@@ -96,22 +107,56 @@ app_worker_free (app_worker_t * app_wrk)
       segment_manager_init_free (sm);
     }
 
-  /* If first segment manager is used by a listener */
-  if (app_wrk->first_segment_manager != APP_INVALID_SEGMENT_MANAGER_INDEX
-      && app_wrk->first_segment_manager != app_wrk->connects_seg_manager)
+  /*
+   * Half-open cleanup
+   */
+
+  for (i = 0; i < vec_len (app_wrk->half_open_table); i++)
     {
-      sm = segment_manager_get (app_wrk->first_segment_manager);
-      sm->first_is_protected = 0;
-      sm->app_wrk_index = SEGMENT_MANAGER_INVALID_APP_INDEX;
-      /* .. and has no fifos, e.g. it might be used for redirected sessions,
-       * remove it */
-      if (!segment_manager_has_fifos (sm))
-	segment_manager_free (sm);
+      if (!app_wrk->half_open_table[i])
+	continue;
+
+      /* *INDENT-OFF* */
+      hash_foreach (handle, sm_index, app_wrk->half_open_table[i], ({
+	vec_add1 (handles, handle);
+      }));
+      /* *INDENT-ON* */
+
+      for (j = 0; j < vec_len (handles); j++)
+	session_cleanup_half_open (i, handles[j]);
+
+      hash_free (app_wrk->half_open_table[i]);
+      vec_reset_length (handles);
     }
 
-  pool_put (app_workers, app_wrk);
+  vec_free (app_wrk->half_open_table);
+  vec_free (handles);
+
+  /*
+   * Detached listener segment managers cleanup
+   */
+  for (i = 0; i < vec_len (app_wrk->detached_seg_managers); i++)
+    {
+      sm = segment_manager_get (app_wrk->detached_seg_managers[i]);
+      segment_manager_init_free (sm);
+    }
+  vec_free (app_wrk->detached_seg_managers);
+  clib_spinlock_free (&app_wrk->detached_seg_managers_lock);
+
+  /* If first segment manager is used by a listener that recently
+   * stopped listening, mark it as detached */
+  if (app_wrk->first_segment_manager != app_wrk->connects_seg_manager
+      && (sm = segment_manager_get_if_valid (app_wrk->first_segment_manager))
+      && !segment_manager_app_detached (sm))
+    {
+      sm->first_is_protected = 0;
+      sm->app_wrk_index = SEGMENT_MANAGER_INVALID_APP_INDEX;
+      segment_manager_init_free (sm);
+    }
+
   if (CLIB_DEBUG)
     clib_memset (app_wrk, 0xfe, sizeof (*app_wrk));
+  pool_put (app_workers, app_wrk);
 }
 
 application_t *
@@ -135,12 +180,13 @@ app_worker_alloc_segment_manager (app_worker_t * app_wrk)
     {
       sm = segment_manager_get (app_wrk->first_segment_manager);
       app_wrk->first_segment_manager_in_use = 1;
-      return sm;
     }
-
-  sm = segment_manager_alloc ();
+  else
+    {
+      sm = segment_manager_alloc ();
+    }
   sm->app_wrk_index = app_wrk->wrk_index;
-
+  segment_manager_init (sm);
   return sm;
 }
 
@@ -150,7 +196,8 @@ app_worker_alloc_session_fifos (segment_manager_t * sm, session_t * s)
   svm_fifo_t *rx_fifo = 0, *tx_fifo = 0;
   int rv;
 
-  if ((rv = segment_manager_alloc_session_fifos (sm, &rx_fifo, &tx_fifo)))
+  if ((rv = segment_manager_alloc_session_fifos (sm, s->thread_index,
+						 &rx_fifo, &tx_fifo)))
     return rv;
 
   rx_fifo->master_session_index = s->session_index;
@@ -172,16 +219,17 @@ app_worker_init_listener (app_worker_t * app_wrk, session_t * ls)
   /* Allocate segment manager. All sessions derived out of a listen session
    * have fifos allocated by the same segment manager. */
   if (!(sm = app_worker_alloc_segment_manager (app_wrk)))
-    return -1;
+    return SESSION_E_ALLOC;
 
   /* Keep track of the segment manager for the listener or this worker */
   hash_set (app_wrk->listeners_table, listen_session_get_handle (ls),
 	    segment_manager_index (sm));
 
-  if (session_transport_service_type (ls) == TRANSPORT_SERVICE_CL)
+  if (transport_connection_is_cless (session_get_transport (ls)))
     {
-      if (!ls->rx_fifo && app_worker_alloc_session_fifos (sm, ls))
-	return -1;
+      if (ls->rx_fifo)
+	return SESSION_E_NOSUPPORT;
+      return app_worker_alloc_session_fifos (sm, ls);
     }
   return 0;
 }
@@ -191,9 +239,10 @@ app_worker_start_listen (app_worker_t * app_wrk,
 			 app_listener_t * app_listener)
 {
   session_t *ls;
+  int rv;
 
   if (clib_bitmap_get (app_listener->workers, app_wrk->wrk_map_index))
-    return VNET_API_ERROR_ADDRESS_IN_USE;
+    return SESSION_E_ALREADY_LISTENING;
 
   app_listener->workers = clib_bitmap_set (app_listener->workers,
 					   app_wrk->wrk_map_index, 1);
@@ -201,18 +250,41 @@ app_worker_start_listen (app_worker_t * app_wrk,
   if (app_listener->session_index != SESSION_INVALID_INDEX)
     {
       ls = session_get (app_listener->session_index, 0);
-      if (app_worker_init_listener (app_wrk, ls))
-	return -1;
+      if ((rv = app_worker_init_listener (app_wrk, ls)))
+	return rv;
     }
 
   if (app_listener->local_index != SESSION_INVALID_INDEX)
     {
       ls = session_get (app_listener->local_index, 0);
-      if (app_worker_init_listener (app_wrk, ls))
-	return -1;
+      if ((rv = app_worker_init_listener (app_wrk, ls)))
+	return rv;
     }
 
   return 0;
+}
+
+static void
+app_worker_add_detached_sm (app_worker_t * app_wrk, u32 sm_index)
+{
+  vec_add1 (app_wrk->detached_seg_managers, sm_index);
+}
+
+void
+app_worker_del_detached_sm (app_worker_t * app_wrk, u32 sm_index)
+{
+  u32 i;
+
+  clib_spinlock_lock (&app_wrk->detached_seg_managers_lock);
+  for (i = 0; i < vec_len (app_wrk->detached_seg_managers); i++)
+    {
+      if (app_wrk->detached_seg_managers[i] == sm_index)
+	{
+	  vec_del1 (app_wrk->detached_seg_managers, i);
+	  break;
+	}
+    }
+  clib_spinlock_unlock (&app_wrk->detached_seg_managers_lock);
 }
 
 static void
@@ -227,17 +299,29 @@ app_worker_stop_listen_session (app_worker_t * app_wrk, session_t * ls)
   if (PREDICT_FALSE (!sm_indexp))
     return;
 
+  /* Dealloc fifos, if any (dgram listeners) */
+  if (ls->rx_fifo)
+    {
+      segment_manager_dealloc_fifos (ls->rx_fifo, ls->tx_fifo);
+      ls->tx_fifo = ls->rx_fifo = 0;
+    }
+
+  /* Try to cleanup segment manager */
   sm = segment_manager_get (*sm_indexp);
-  if (app_wrk->first_segment_manager == *sm_indexp)
+  if (sm && app_wrk->first_segment_manager != *sm_indexp)
     {
-      /* Delete sessions but don't remove segment manager */
-      app_wrk->first_segment_manager_in_use = 0;
-      segment_manager_del_sessions (sm);
+      segment_manager_app_detach (sm);
+      if (!segment_manager_has_fifos (sm))
+	segment_manager_free (sm);
+      else
+	{
+	  /* Track segment manager in case app detaches and all the
+	   * outstanding sessions need to be closed */
+	  app_worker_add_detached_sm (app_wrk, *sm_indexp);
+	  sm->flags |= SEG_MANAGER_F_DETACHED_LISTENER;
+	}
     }
-  else
-    {
-      segment_manager_init_free (sm);
-    }
+
   hash_unset (app_wrk->listeners_table, handle);
 }
 
@@ -274,10 +358,15 @@ app_worker_init_accepted (session_t * s)
   app_worker_t *app_wrk;
   segment_manager_t *sm;
   session_t *listener;
+  application_t *app;
 
   listener = listen_session_get_from_handle (s->listener_handle);
   app_wrk = application_listener_select_worker (listener);
   s->app_wrk_index = app_wrk->wrk_index;
+
+  app = application_get (app_wrk->app_index);
+  if (app->cb_fns.fifo_tuning_callback)
+    s->flags |= SESSION_F_CUSTOM_FIFO_TUNING;
 
   sm = app_worker_get_listen_segment_manager (app_wrk, listener);
   if (app_worker_alloc_session_fifos (sm, s))
@@ -303,18 +392,56 @@ app_worker_init_connected (app_worker_t * app_wrk, session_t * s)
   if (!application_is_builtin_proxy (app))
     {
       sm = app_worker_get_connect_segment_manager (app_wrk);
-      if (app_worker_alloc_session_fifos (sm, s))
-	return -1;
+      return app_worker_alloc_session_fifos (sm, s);
     }
+
+  if (app->cb_fns.fifo_tuning_callback)
+    s->flags |= SESSION_F_CUSTOM_FIFO_TUNING;
+
   return 0;
 }
 
 int
-app_worker_connect_notify (app_worker_t * app_wrk, session_t * s, u32 opaque)
+app_worker_connect_notify (app_worker_t * app_wrk, session_t * s,
+			   session_error_t err, u32 opaque)
 {
   application_t *app = application_get (app_wrk->app_index);
   return app->cb_fns.session_connected_callback (app_wrk->wrk_index, opaque,
-						 s, s == 0 /* is_fail */ );
+						 s, err);
+}
+
+int
+app_worker_add_half_open (app_worker_t * app_wrk, transport_proto_t tp,
+			  session_handle_t ho_handle,
+			  session_handle_t wrk_handle)
+{
+  ASSERT (vlib_get_thread_index () == 0);
+  vec_validate (app_wrk->half_open_table, tp);
+  hash_set (app_wrk->half_open_table[tp], ho_handle, wrk_handle);
+  return 0;
+}
+
+int
+app_worker_del_half_open (app_worker_t * app_wrk, transport_proto_t tp,
+			  session_handle_t ho_handle)
+{
+  ASSERT (vlib_get_thread_index () == 0);
+  hash_unset (app_wrk->half_open_table[tp], ho_handle);
+  return 0;
+}
+
+u64
+app_worker_lookup_half_open (app_worker_t * app_wrk, transport_proto_t tp,
+			     session_handle_t ho_handle)
+{
+  u64 *ho_wrk_handlep;
+
+  /* No locking because all updates are done from main thread */
+  ho_wrk_handlep = hash_get (app_wrk->half_open_table[tp], ho_handle);
+  if (!ho_wrk_handlep)
+    return SESSION_INVALID_HANDLE;
+
+  return *ho_wrk_handlep;
 }
 
 int
@@ -417,18 +544,28 @@ app_worker_own_session (app_worker_t * app_wrk, session_t * s)
 }
 
 int
-app_worker_connect_session (app_worker_t * app, session_endpoint_t * sep,
+app_worker_connect_session (app_worker_t * app_wrk, session_endpoint_t * sep,
 			    u32 api_context)
 {
   int rv;
 
   /* Make sure we have a segment manager for connects */
-  app_worker_alloc_connects_segment_manager (app);
+  if (app_worker_alloc_connects_segment_manager (app_wrk))
+    return SESSION_E_ALLOC;
 
-  if ((rv = session_open (app->wrk_index, sep, api_context)))
+  if ((rv = session_open (app_wrk->wrk_index, sep, api_context)))
     return rv;
 
   return 0;
+}
+
+int
+app_worker_session_fifo_tuning (app_worker_t * app_wrk, session_t * s,
+				svm_fifo_t * f,
+				session_ft_action_t act, u32 len)
+{
+  application_t *app = application_get (app_wrk->app_index);
+  return app->cb_fns.fifo_tuning_callback (s, f, act, len);
 }
 
 int
@@ -467,7 +604,7 @@ app_worker_get_listen_segment_manager (app_worker_t * app,
 {
   uword *smp;
   smp = hash_get (app->listeners_table, listen_session_get_handle (listener));
-  ASSERT (smp != 0);
+  ALWAYS_ASSERT (smp != 0);
   return segment_manager_get (*smp);
 }
 
@@ -525,7 +662,8 @@ int
 app_worker_add_segment_notify (app_worker_t * app_wrk, u64 segment_handle)
 {
   application_t *app = application_get (app_wrk->app_index);
-  return app->cb_fns.add_segment_callback (app_wrk->api_client_index,
+
+  return app->cb_fns.add_segment_callback (app_wrk->wrk_index,
 					   segment_handle);
 }
 
@@ -533,7 +671,7 @@ int
 app_worker_del_segment_notify (app_worker_t * app_wrk, u64 segment_handle)
 {
   application_t *app = application_get (app_wrk->app_index);
-  return app->cb_fns.del_segment_callback (app_wrk->api_client_index,
+  return app->cb_fns.del_segment_callback (app_wrk->wrk_index,
 					   segment_handle);
 }
 
@@ -552,12 +690,6 @@ app_send_io_evt_rx (app_worker_t * app_wrk, session_t * s)
 
   if (app_worker_application_is_builtin (app_wrk))
     return app_worker_builtin_rx (app_wrk, s);
-
-  /* Make sure the session is in established state within external apps.
-   * Should be removed once we confirm closes to apps */
-  if (PREDICT_FALSE (s->session_state != SESSION_STATE_READY
-		     && s->session_state != SESSION_STATE_LISTENING))
-    return 0;
 
   if (svm_fifo_has_event (s->rx_fifo))
     return 0;
@@ -662,10 +794,10 @@ format_app_worker_listener (u8 * s, va_list * args)
   if (!app_wrk)
     {
       if (verbose)
-	s = format (s, "%-40s%-25s%=10s%-15s%-15s%-10s", "Connection", "App",
+	s = format (s, "%-40s%-25s%-10s%-15s%-15s%-10s", "Connection", "App",
 		    "Wrk", "API Client", "ListenerID", "SegManager");
       else
-	s = format (s, "%-40s%-25s%=10s", "Connection", "App", "Wrk");
+	s = format (s, "%-40s%-25s%-10s", "Connection", "App", "Wrk");
 
       return s;
     }
@@ -676,13 +808,16 @@ format_app_worker_listener (u8 * s, va_list * args)
 
   if (verbose)
     {
-      char buf[32];
-      sprintf (buf, "%u(%u)", app_wrk->wrk_map_index, app_wrk->wrk_index);
-      s = format (s, "%-40s%-25s%=10s%-15u%-15u%-10u", str, app_name,
+      u8 *buf;
+      buf = format (0, "%u(%u)", app_wrk->wrk_map_index, app_wrk->wrk_index);
+      s = format (s, "%-40v%-25v%-10v%-15u%-15u%-10u", str, app_name,
 		  buf, app_wrk->api_client_index, handle, sm_index);
+      vec_free (buf);
     }
   else
-    s = format (s, "%-40s%-25s%=10u", str, app_name, app_wrk->wrk_map_index);
+    s = format (s, "%-40v%-25v%=10u", str, app_name, app_wrk->wrk_map_index);
+
+  vec_free (str);
 
   return s;
 }

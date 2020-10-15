@@ -1,16 +1,19 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import socket
-from util import ip4n_range, ip4_range, reassemble4
+from util import ip4_range, reassemble4
 import unittest
 from framework import VppTestCase, VppTestRunner
 from template_bd import BridgeDomain
 
-from scapy.layers.l2 import Ether, Raw
+from scapy.layers.l2 import Ether
+from scapy.packet import Raw
 from scapy.layers.inet import IP, UDP
 from scapy.layers.vxlan import VXLAN
-from scapy.utils import atol
+
+import util
 from vpp_ip_route import VppIpRoute, VppRoutePath
+from vpp_vxlan_tunnel import VppVxlanTunnel
 from vpp_ip import INVALID_INDEX
 
 
@@ -77,7 +80,8 @@ class TestVxlan(BridgeDomain, VppTestCase):
         # Verify UDP destination port is VXLAN 4789, source UDP port could be
         #  arbitrary.
         self.assertEqual(pkt[UDP].dport, type(self).dport)
-        # TODO: checksum check
+        # Verify UDP checksum
+        self.assert_udp_checksum_valid(pkt)
         # Verify VNI
         self.assertEqual(pkt[VXLAN].vni, vni)
 
@@ -89,16 +93,16 @@ class TestVxlan(BridgeDomain, VppTestCase):
         next_hop_address = cls.pg0.remote_ip4
         for dest_ip4 in ip4_range(next_hop_address, ip_range_start,
                                   ip_range_end):
-            # add host route so dest_ip4n will not be resolved
+            # add host route so dest_ip4 will not be resolved
             rip = VppIpRoute(cls, dest_ip4, 32,
                              [VppRoutePath(next_hop_address,
                                            INVALID_INDEX)],
                              register=False)
             rip.add_vpp_config()
-            dest_ip4n = socket.inet_pton(socket.AF_INET, dest_ip4)
 
-            r = cls.vapi.vxlan_add_del_tunnel(src_address=cls.pg0.local_ip4n,
-                                              dst_address=dest_ip4n, vni=vni)
+            r = VppVxlanTunnel(cls, src=cls.pg0.local_ip4,
+                               dst=dest_ip4, vni=vni)
+            r.add_vpp_config()
             cls.vapi.sw_interface_set_l2_bridge(r.sw_if_index, bd_id=vni)
 
     @classmethod
@@ -111,12 +115,14 @@ class TestVxlan(BridgeDomain, VppTestCase):
         vni_start = 10000
         vni_end = vni_start + n_shared_dst_tunnels
         for vni in range(vni_start, vni_end):
-            r = cls.vapi.vxlan_add_del_tunnel(src_address=cls.pg0.local_ip4n,
-                                              dst_address=cls.mcast_ip4n,
-                                              mcast_sw_if_index=1,
-                                              is_add=is_add, vni=vni)
-            if r.sw_if_index == 0xffffffff:
-                raise ValueError("bad sw_if_index: ~0")
+            r = VppVxlanTunnel(cls, src=cls.pg0.local_ip4,
+                               dst=cls.mcast_ip4, mcast_sw_if_index=1, vni=vni)
+            if is_add:
+                r.add_vpp_config()
+                if r.sw_if_index == 0xffffffff:
+                    raise ValueError("bad sw_if_index: ~0")
+            else:
+                r.remove_vpp_config()
 
     @classmethod
     def add_shared_mcast_dst_load(cls):
@@ -134,13 +140,15 @@ class TestVxlan(BridgeDomain, VppTestCase):
         n_distinct_dst_tunnels = 200
         ip_range_start = 10
         ip_range_end = ip_range_start + n_distinct_dst_tunnels
-        for dest_ip4n in ip4n_range(cls.mcast_ip4n, ip_range_start,
-                                    ip_range_end):
-            vni = bytearray(dest_ip4n)[3]
-            cls.vapi.vxlan_add_del_tunnel(src_address=cls.pg0.local_ip4n,
-                                          dst_address=dest_ip4n,
-                                          mcast_sw_if_index=1, is_add=is_add,
-                                          vni=vni)
+        for dest_ip4 in ip4_range(cls.mcast_ip4, ip_range_start,
+                                  ip_range_end):
+            vni = bytearray(socket.inet_pton(socket.AF_INET, dest_ip4))[3]
+            r = VppVxlanTunnel(cls, src=cls.pg0.local_ip4,
+                               dst=dest_ip4, mcast_sw_if_index=1, vni=vni)
+            if is_add:
+                r.add_vpp_config()
+            else:
+                r.remove_vpp_config()
 
     @classmethod
     def add_mcast_tunnels_load(cls):
@@ -176,55 +184,61 @@ class TestVxlan(BridgeDomain, VppTestCase):
 
             # Our Multicast address
             cls.mcast_ip4 = '239.1.1.1'
-            cls.mcast_ip4n = socket.inet_pton(socket.AF_INET, cls.mcast_ip4)
-            iplong = atol(cls.mcast_ip4)
-            cls.mcast_mac = "01:00:5e:%02x:%02x:%02x" % (
-                (iplong >> 16) & 0x7F, (iplong >> 8) & 0xFF, iplong & 0xFF)
-
-            # Create VXLAN VTEP on VPP pg0, and put vxlan_tunnel0 and pg1
-            #  into BD.
-            cls.single_tunnel_bd = 1
-            r = cls.vapi.vxlan_add_del_tunnel(src_address=cls.pg0.local_ip4n,
-                                              dst_address=cls.pg0.remote_ip4n,
-                                              vni=cls.single_tunnel_bd)
-            cls.vapi.sw_interface_set_l2_bridge(rx_sw_if_index=r.sw_if_index,
-                                                bd_id=cls.single_tunnel_bd)
-            cls.vapi.sw_interface_set_l2_bridge(
-                rx_sw_if_index=cls.pg1.sw_if_index, bd_id=cls.single_tunnel_bd)
-
-            # Setup vni 2 to test multicast flooding
-            cls.n_ucast_tunnels = 10
-            cls.mcast_flood_bd = 2
-            cls.create_vxlan_flood_test_bd(cls.mcast_flood_bd,
-                                           cls.n_ucast_tunnels)
-            r = cls.vapi.vxlan_add_del_tunnel(src_address=cls.pg0.local_ip4n,
-                                              dst_address=cls.mcast_ip4n,
-                                              mcast_sw_if_index=1,
-                                              vni=cls.mcast_flood_bd)
-            cls.vapi.sw_interface_set_l2_bridge(rx_sw_if_index=r.sw_if_index,
-                                                bd_id=cls.mcast_flood_bd)
-            cls.vapi.sw_interface_set_l2_bridge(
-                rx_sw_if_index=cls.pg2.sw_if_index, bd_id=cls.mcast_flood_bd)
-
-            # Add and delete mcast tunnels to check stability
-            cls.add_shared_mcast_dst_load()
-            cls.add_mcast_tunnels_load()
-            cls.del_shared_mcast_dst_load()
-            cls.del_mcast_tunnels_load()
-
-            # Setup vni 3 to test unicast flooding
-            cls.ucast_flood_bd = 3
-            cls.create_vxlan_flood_test_bd(cls.ucast_flood_bd,
-                                           cls.n_ucast_tunnels)
-            cls.vapi.sw_interface_set_l2_bridge(
-                rx_sw_if_index=cls.pg3.sw_if_index, bd_id=cls.ucast_flood_bd)
+            cls.mcast_mac = util.mcast_ip_to_mac(cls.mcast_ip4)
         except Exception:
-            super(TestVxlan, cls).tearDownClass()
+            cls.tearDownClass()
             raise
 
     @classmethod
     def tearDownClass(cls):
         super(TestVxlan, cls).tearDownClass()
+
+    def setUp(self):
+        super(TestVxlan, self).setUp()
+        # Create VXLAN VTEP on VPP pg0, and put vxlan_tunnel0 and pg1
+        #  into BD.
+        self.single_tunnel_vni = 0x12345
+        self.single_tunnel_bd = 1
+        r = VppVxlanTunnel(self, src=self.pg0.local_ip4,
+                           dst=self.pg0.remote_ip4,
+                           vni=self.single_tunnel_vni)
+        r.add_vpp_config()
+        self.vapi.sw_interface_set_l2_bridge(rx_sw_if_index=r.sw_if_index,
+                                             bd_id=self.single_tunnel_bd)
+        self.vapi.sw_interface_set_l2_bridge(
+            rx_sw_if_index=self.pg1.sw_if_index, bd_id=self.single_tunnel_bd)
+
+        # Setup vni 2 to test multicast flooding
+        self.n_ucast_tunnels = 10
+        self.mcast_flood_bd = 2
+        self.create_vxlan_flood_test_bd(self.mcast_flood_bd,
+                                        self.n_ucast_tunnels)
+        r = VppVxlanTunnel(self, src=self.pg0.local_ip4, dst=self.mcast_ip4,
+                           mcast_sw_if_index=1, vni=self.mcast_flood_bd)
+        r.add_vpp_config()
+        self.vapi.sw_interface_set_l2_bridge(rx_sw_if_index=r.sw_if_index,
+                                             bd_id=self.mcast_flood_bd)
+        self.vapi.sw_interface_set_l2_bridge(
+            rx_sw_if_index=self.pg2.sw_if_index, bd_id=self.mcast_flood_bd)
+
+        # Add and delete mcast tunnels to check stability
+        self.add_shared_mcast_dst_load()
+        self.add_mcast_tunnels_load()
+        self.del_shared_mcast_dst_load()
+        self.del_mcast_tunnels_load()
+
+        # Setup vni 3 to test unicast flooding
+        self.ucast_flood_bd = 3
+        self.create_vxlan_flood_test_bd(self.ucast_flood_bd,
+                                        self.n_ucast_tunnels)
+        self.vapi.sw_interface_set_l2_bridge(
+            rx_sw_if_index=self.pg3.sw_if_index, bd_id=self.ucast_flood_bd)
+
+    def test_decap(self):
+        """ Decapsulation test
+        from BridgeDoman
+        """
+        super(TestVxlan, self).test_decap()
 
     def test_encap_big_packet(self):
         """ Encapsulation test send big frame from pg1
@@ -236,7 +250,7 @@ class TestVxlan(BridgeDomain, VppTestCase):
         frame = (Ether(src='00:00:00:00:00:02', dst='00:00:00:00:00:01') /
                  IP(src='4.3.2.1', dst='1.2.3.4') /
                  UDP(sport=20000, dport=10000) /
-                 Raw('\xa5' * 1450))
+                 Raw(b'\xa5' * 1450))
 
         self.pg1.add_stream([frame])
 
@@ -249,7 +263,7 @@ class TestVxlan(BridgeDomain, VppTestCase):
         ether = out[0]
         pkt = reassemble4(out)
         pkt = ether / pkt
-        self.check_encapsulation(pkt, self.single_tunnel_bd)
+        self.check_encapsulation(pkt, self.single_tunnel_vni)
 
         payload = self.decapsulate(pkt)
         # TODO: Scapy bug?

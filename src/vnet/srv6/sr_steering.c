@@ -135,21 +135,22 @@ sr_steering_policy (int is_del, ip6_address_t * bsid, u32 sr_policy_index,
 	  else if (steer_pl->classify.traffic_type == SR_STEER_L2)
 	    {
 	      /* Remove HW redirection */
-	      vnet_feature_enable_disable ("device-input",
-					   "sr-policy-rewrite-encaps-l2",
-					   sw_if_index, 0, 0, 0);
+	      int ret = vnet_feature_enable_disable ("device-input",
+						     "sr-pl-rewrite-encaps-l2",
+						     sw_if_index, 0, 0, 0);
+
+	      if (ret != 0)
+		return -1;
+
 	      sm->sw_iface_sr_policies[sw_if_index] = ~(u32) 0;
 
 	      /* Remove promiscous mode from interface */
 	      vnet_main_t *vnm = vnet_get_main ();
-	      ethernet_main_t *em = &ethernet_main;
-	      ethernet_interface_t *eif =
-		ethernet_get_interface (em, sw_if_index);
-
-	      if (!eif)
-		goto cleanup_error_redirection;
-
-	      ethernet_set_flags (vnm, sw_if_index, 0);
+	      vnet_hw_interface_t *hi =
+		vnet_get_sup_hw_interface (vnm, sw_if_index);
+	      /* Make sure it is main interface */
+	      if (hi->sw_if_index == sw_if_index)
+		ethernet_set_flags (vnm, hi->hw_if_index, 0);
 	    }
 
 	  /* Delete SR steering policy entry */
@@ -285,14 +286,11 @@ sr_steering_policy (int is_del, ip6_address_t * bsid, u32 sr_policy_index,
 
       /* Set promiscous mode on interface */
       vnet_main_t *vnm = vnet_get_main ();
-      ethernet_main_t *em = &ethernet_main;
-      ethernet_interface_t *eif = ethernet_get_interface (em, sw_if_index);
-
-      if (!eif)
-	goto cleanup_error_redirection;
-
-      ethernet_set_flags (vnm, sw_if_index,
-			  ETHERNET_INTERFACE_FLAG_ACCEPT_ALL);
+      vnet_hw_interface_t *hi = vnet_get_sup_hw_interface (vnm, sw_if_index);
+      /* Make sure it is main interface */
+      if (hi->sw_if_index == sw_if_index)
+	ethernet_set_flags (vnm, hi->hw_if_index,
+			    ETHERNET_INTERFACE_FLAG_ACCEPT_ALL);
     }
   else if (traffic_type == SR_STEER_IPV4)
     if (!sr_policy->is_encap)

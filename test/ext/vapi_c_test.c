@@ -29,6 +29,9 @@
 #include <vapi/l2.api.vapi.h>
 #include <fake.api.vapi.h>
 
+#include <vppinfra/vec.h>
+#include <vppinfra/mem.h>
+
 DEFINE_VAPI_MSG_IDS_VPE_API_JSON;
 DEFINE_VAPI_MSG_IDS_INTERFACE_API_JSON;
 DEFINE_VAPI_MSG_IDS_L2_API_JSON;
@@ -128,11 +131,6 @@ START_TEST (test_hton_4)
   d->header._vl_msg_id = cnt++;
   d->header.context = cnt++;
   d->payload.bd_id = cnt++;
-  d->payload.flood = cnt++;
-  d->payload.uu_flood = cnt++;
-  d->payload.forward = cnt++;
-  d->payload.learn = cnt++;
-  d->payload.arp_term = cnt++;
   d->payload.mac_age = cnt++;
   d->payload.bvi_sw_if_index = cnt++;
   d->payload.n_sw_ifs = vla_count;
@@ -152,16 +150,6 @@ START_TEST (test_hton_4)
   ck_assert_int_eq (d->header.context, tmp);
   ++tmp;
   verify_hton_swap (d->payload.bd_id, tmp);
-  ++tmp;
-  verify_hton_swap (d->payload.flood, tmp);
-  ++tmp;
-  verify_hton_swap (d->payload.uu_flood, tmp);
-  ++tmp;
-  verify_hton_swap (d->payload.forward, tmp);
-  ++tmp;
-  verify_hton_swap (d->payload.learn, tmp);
-  ++tmp;
-  verify_hton_swap (d->payload.arp_term, tmp);
   ++tmp;
   verify_hton_swap (d->payload.mac_age, tmp);
   ++tmp;
@@ -185,16 +173,6 @@ START_TEST (test_hton_4)
   ck_assert_int_eq (d->header.context, tmp);
   ++tmp;
   ck_assert_int_eq (d->payload.bd_id, tmp);
-  ++tmp;
-  ck_assert_int_eq (d->payload.flood, tmp);
-  ++tmp;
-  ck_assert_int_eq (d->payload.uu_flood, tmp);
-  ++tmp;
-  ck_assert_int_eq (d->payload.forward, tmp);
-  ++tmp;
-  ck_assert_int_eq (d->payload.learn, tmp);
-  ++tmp;
-  ck_assert_int_eq (d->payload.arp_term, tmp);
   ++tmp;
   ck_assert_int_eq (d->payload.mac_age, tmp);
   ++tmp;
@@ -265,11 +243,6 @@ START_TEST (test_ntoh_4)
   d->header._vl_msg_id = cnt++;
   d->header.context = cnt++;
   d->payload.bd_id = cnt++;
-  d->payload.flood = cnt++;
-  d->payload.uu_flood = cnt++;
-  d->payload.forward = cnt++;
-  d->payload.learn = cnt++;
-  d->payload.arp_term = cnt++;
   d->payload.mac_age = cnt++;
   d->payload.bvi_sw_if_index = cnt++;
   d->payload.n_sw_ifs = htobe32 (vla_count);
@@ -289,16 +262,6 @@ START_TEST (test_ntoh_4)
   ck_assert_int_eq (d->header.context, tmp);
   ++tmp;
   verify_ntoh_swap (d->payload.bd_id, tmp);
-  ++tmp;
-  verify_ntoh_swap (d->payload.flood, tmp);
-  ++tmp;
-  verify_ntoh_swap (d->payload.uu_flood, tmp);
-  ++tmp;
-  verify_ntoh_swap (d->payload.forward, tmp);
-  ++tmp;
-  verify_ntoh_swap (d->payload.learn, tmp);
-  ++tmp;
-  verify_ntoh_swap (d->payload.arp_term, tmp);
   ++tmp;
   verify_ntoh_swap (d->payload.mac_age, tmp);
   ++tmp;
@@ -322,16 +285,6 @@ START_TEST (test_ntoh_4)
   ck_assert_int_eq (d->header.context, tmp);
   ++tmp;
   ck_assert_int_eq (d->payload.bd_id, tmp);
-  ++tmp;
-  ck_assert_int_eq (d->payload.flood, tmp);
-  ++tmp;
-  ck_assert_int_eq (d->payload.uu_flood, tmp);
-  ++tmp;
-  ck_assert_int_eq (d->payload.forward, tmp);
-  ++tmp;
-  ck_assert_int_eq (d->payload.learn, tmp);
-  ++tmp;
-  ck_assert_int_eq (d->payload.arp_term, tmp);
   ++tmp;
   ck_assert_int_eq (d->payload.mac_age, tmp);
   ++tmp;
@@ -461,8 +414,8 @@ START_TEST (test_show_version_1)
   size_t size;
   rv = vapi_recv (ctx, (void *) &resp, &size, 0, 0);
   ck_assert_int_eq (VAPI_OK, rv);
-  int dummy;
-  show_version_cb (NULL, &dummy, VAPI_OK, true, &resp->payload);
+  int placeholder;
+  show_version_cb (NULL, &placeholder, VAPI_OK, true, &resp->payload);
   vapi_msg_free (ctx, resp);
 }
 
@@ -573,9 +526,6 @@ START_TEST (test_loopbacks_1)
       dctx.last_called = false;
       clib_memset (&seen, 0, sizeof (seen));
       dump = vapi_alloc_sw_interface_dump (ctx);
-      dump->payload.name_filter_valid = 0;
-      clib_memset (dump->payload.name_filter.buf, 0,
-		   dump->payload.name_filter.length);
       while (VAPI_EAGAIN ==
 	     (rv =
 	      vapi_sw_interface_dump (ctx, dump, sw_interface_dump_cb,
@@ -605,9 +555,6 @@ START_TEST (test_loopbacks_1)
   dctx.last_called = false;
   clib_memset (&seen, 0, sizeof (seen));
   dump = vapi_alloc_sw_interface_dump (ctx);
-  dump->payload.name_filter_valid = 0;
-  clib_memset (dump->payload.name_filter.buf, 0,
-	       dump->payload.name_filter.length);
   while (VAPI_EAGAIN ==
 	 (rv =
 	  vapi_sw_interface_dump (ctx, dump, sw_interface_dump_cb, &dctx)))
@@ -730,9 +677,6 @@ START_TEST (test_loopbacks_2)
   clib_memset (&seen, 0, sizeof (seen));
   sw_interface_dump_ctx dctx = { false, num_ifs, sw_if_indexes, seen, 0 };
   vapi_msg_sw_interface_dump *dump = vapi_alloc_sw_interface_dump (ctx);
-  dump->payload.name_filter_valid = 0;
-  clib_memset (dump->payload.name_filter.buf, 0,
-	       dump->payload.name_filter.length);
   while (VAPI_EAGAIN ==
 	 (rv =
 	  vapi_sw_interface_dump (ctx, dump, sw_interface_dump_cb, &dctx)))
@@ -771,9 +715,6 @@ START_TEST (test_loopbacks_2)
   clib_memset (&seen, 0, sizeof (seen));
   dctx.last_called = false;
   dump = vapi_alloc_sw_interface_dump (ctx);
-  dump->payload.name_filter_valid = 0;
-  clib_memset (dump->payload.name_filter.buf, 0,
-	       dump->payload.name_filter.length);
   while (VAPI_EAGAIN ==
 	 (rv =
 	  vapi_sw_interface_dump (ctx, dump, sw_interface_dump_cb, &dctx)))
@@ -911,6 +852,68 @@ START_TEST (test_unsupported)
 
 END_TEST;
 
+START_TEST (test_api_strings)
+{
+  printf ("--- Invalid api strings ---\n");
+
+  /* test string 'TEST'
+   * size = 5
+   * length = 4
+   */
+  const char str[] = "TEST";
+  u8 *vec_str = 0, *vstr = 0;
+  char *cstr;
+
+  vapi_msg_sw_interface_dump *dump =
+    malloc (sizeof (vapi_msg_sw_interface_dump) + strlen (str));
+  clib_mem_init (0, 1 << 20);
+
+  vl_api_c_string_to_api_string (str, &dump->payload.name_filter);
+  /* Assert nul terminator NOT present */
+  ck_assert_int_eq (vl_api_string_len (&dump->payload.name_filter),
+		    strlen (str));
+
+  cstr = vl_api_from_api_to_new_c_string (&dump->payload.name_filter);
+  ck_assert_ptr_ne (cstr, NULL);
+  /* Assert nul terminator present */
+  ck_assert_int_eq (vec_len (cstr), sizeof (str));
+  ck_assert_int_eq (strlen (str), strlen (cstr));
+  vec_free (cstr);
+
+  vstr = vl_api_from_api_to_new_vec (0 /* not really an API message */ ,
+				     &dump->payload.name_filter);
+  ck_assert_ptr_ne (vstr, NULL);
+  /* Assert nul terminator NOT present */
+  ck_assert_int_eq (vec_len (vstr), strlen (str));
+  vec_free (vstr);
+
+  /* vector conaining NON nul terminated string 'TEST' */
+  vec_add (vec_str, str, strlen (str));
+  clib_memset (dump->payload.name_filter.buf, 0, strlen (str));
+  dump->payload.name_filter.length = 0;
+
+  vl_api_vec_to_api_string (vec_str, &dump->payload.name_filter);
+  /* Assert nul terminator NOT present */
+  ck_assert_int_eq (vl_api_string_len (&dump->payload.name_filter),
+		    vec_len (vec_str));
+
+  cstr = vl_api_from_api_to_new_c_string (&dump->payload.name_filter);
+  ck_assert_ptr_ne (cstr, NULL);
+  /* Assert nul terminator present */
+  ck_assert_int_eq (vec_len (cstr), sizeof (str));
+  ck_assert_int_eq (strlen (str), strlen (cstr));
+  vec_free (cstr);
+
+  vstr = vl_api_from_api_to_new_vec (0 /* not a real api msg */ ,
+				     &dump->payload.name_filter);
+  ck_assert_ptr_ne (vstr, NULL);
+  /* Assert nul terminator NOT present */
+  ck_assert_int_eq (vec_len (vstr), strlen (str));
+  vec_free (vstr);
+}
+
+END_TEST;
+
 Suite *
 test_suite (void)
 {
@@ -956,6 +959,10 @@ test_suite (void)
   tcase_add_checked_fixture (tc_unsupported, setup_blocking, teardown);
   tcase_add_test (tc_unsupported, test_unsupported);
   suite_add_tcase (s, tc_unsupported);
+
+  TCase *tc_dynamic = tcase_create ("Dynamic message size");
+  tcase_add_test (tc_dynamic, test_api_strings);
+  suite_add_tcase (s, tc_dynamic);
 
   return s;
 }

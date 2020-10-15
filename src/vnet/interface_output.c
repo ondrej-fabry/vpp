@@ -39,19 +39,19 @@
 
 #include <vnet/vnet.h>
 #include <vnet/ip/icmp46_packet.h>
+#include <vnet/ethernet/packet.h>
 #include <vnet/ip/ip4.h>
 #include <vnet/ip/ip6.h>
 #include <vnet/udp/udp_packet.h>
 #include <vnet/feature/feature.h>
 #include <vnet/classify/trace_classify.h>
+#include <vnet/interface_output.h>
 
 typedef struct
 {
   u32 sw_if_index;
   u32 flags;
-  u16 gso_size;
-  u8 gso_l4_hdr_sz;
-  u8 data[128 - 3 * sizeof (u32)];
+  u8 data[128 - 2 * sizeof (u32)];
 }
 interface_output_trace_t;
 
@@ -82,17 +82,6 @@ format_vnet_interface_output_trace (u8 * s, va_list * va)
 	  s =
 	    format (s, "%U ", format_vnet_sw_interface_name, vnm, si,
 		    t->flags);
-	}
-#define _(bit, name, v, x) \
-          if (v && (t->flags & VNET_BUFFER_F_##name)) \
-            s = format (s, "%s ", v);
-      foreach_vnet_buffer_flag
-#undef _
-	if (t->flags & VNET_BUFFER_F_GSO)
-	{
-	  s = format (s, "\n%Ugso_sz %d gso_l4_hdr_sz %d",
-		      format_white_space, indent + 2, t->gso_size,
-		      t->gso_l4_hdr_sz);
 	}
       s =
 	format (s, "\n%U%U", format_white_space, indent,
@@ -133,8 +122,6 @@ vnet_interface_output_trace (vlib_main_t * vm,
 	  t0 = vlib_add_trace (vm, node, b0, sizeof (t0[0]));
 	  t0->sw_if_index = vnet_buffer (b0)->sw_if_index[VLIB_TX];
 	  t0->flags = b0->flags;
-	  t0->gso_size = vnet_buffer2 (b0)->gso_size;
-	  t0->gso_l4_hdr_sz = vnet_buffer2 (b0)->gso_l4_hdr_sz;
 	  clib_memcpy_fast (t0->data, vlib_buffer_get_current (b0),
 			    sizeof (t0->data));
 	}
@@ -143,8 +130,6 @@ vnet_interface_output_trace (vlib_main_t * vm,
 	  t1 = vlib_add_trace (vm, node, b1, sizeof (t1[0]));
 	  t1->sw_if_index = vnet_buffer (b1)->sw_if_index[VLIB_TX];
 	  t1->flags = b1->flags;
-	  t1->gso_size = vnet_buffer2 (b1)->gso_size;
-	  t1->gso_l4_hdr_sz = vnet_buffer2 (b1)->gso_l4_hdr_sz;
 	  clib_memcpy_fast (t1->data, vlib_buffer_get_current (b1),
 			    sizeof (t1->data));
 	}
@@ -167,8 +152,6 @@ vnet_interface_output_trace (vlib_main_t * vm,
 	  t0 = vlib_add_trace (vm, node, b0, sizeof (t0[0]));
 	  t0->sw_if_index = vnet_buffer (b0)->sw_if_index[VLIB_TX];
 	  t0->flags = b0->flags;
-	  t0->gso_size = vnet_buffer2 (b0)->gso_size;
-	  t0->gso_l4_hdr_sz = vnet_buffer2 (b0)->gso_l4_hdr_sz;
 	  clib_memcpy_fast (t0->data, vlib_buffer_get_current (b0),
 			    sizeof (t0->data));
 	}
@@ -177,303 +160,13 @@ vnet_interface_output_trace (vlib_main_t * vm,
     }
 }
 
-static_always_inline void
-calc_checksums (vlib_main_t * vm, vlib_buffer_t * b)
-{
-  tcp_header_t *th;
-  udp_header_t *uh;
-
-  int is_ip4 = (b->flags & VNET_BUFFER_F_IS_IP4) != 0;
-  int is_ip6 = (b->flags & VNET_BUFFER_F_IS_IP6) != 0;
-
-  ASSERT (!(is_ip4 && is_ip6));
-
-  th = (tcp_header_t *) (b->data + vnet_buffer (b)->l4_hdr_offset);
-  uh = (udp_header_t *) (b->data + vnet_buffer (b)->l4_hdr_offset);
-
-  if (is_ip4)
-    {
-      ip4_header_t *ip4;
-
-      ip4 = (ip4_header_t *) (b->data + vnet_buffer (b)->l3_hdr_offset);
-      if (b->flags & VNET_BUFFER_F_OFFLOAD_IP_CKSUM)
-	ip4->checksum = ip4_header_checksum (ip4);
-      if (b->flags & VNET_BUFFER_F_OFFLOAD_TCP_CKSUM)
-	{
-	  th->checksum = 0;
-	  th->checksum = ip4_tcp_udp_compute_checksum (vm, b, ip4);
-	}
-      else if (b->flags & VNET_BUFFER_F_OFFLOAD_UDP_CKSUM)
-	uh->checksum = ip4_tcp_udp_compute_checksum (vm, b, ip4);
-    }
-  else if (is_ip6)
-    {
-      int bogus;
-      ip6_header_t *ip6;
-
-      ip6 = (ip6_header_t *) (b->data + vnet_buffer (b)->l3_hdr_offset);
-      if (b->flags & VNET_BUFFER_F_OFFLOAD_TCP_CKSUM)
-	{
-	  th->checksum = 0;
-	  th->checksum =
-	    ip6_tcp_udp_icmp_compute_checksum (vm, b, ip6, &bogus);
-	}
-      else if (b->flags & VNET_BUFFER_F_OFFLOAD_UDP_CKSUM)
-	{
-	  uh->checksum = 0;
-	  uh->checksum =
-	    ip6_tcp_udp_icmp_compute_checksum (vm, b, ip6, &bogus);
-	}
-    }
-  b->flags &= ~VNET_BUFFER_F_OFFLOAD_TCP_CKSUM;
-  b->flags &= ~VNET_BUFFER_F_OFFLOAD_UDP_CKSUM;
-  b->flags &= ~VNET_BUFFER_F_OFFLOAD_IP_CKSUM;
-}
-
-static_always_inline u16
-tso_alloc_tx_bufs (vlib_main_t * vm,
-		   vnet_interface_per_thread_data_t * ptd,
-		   vlib_buffer_t * b0, u32 n_bytes_b0, u16 l234_sz,
-		   u16 gso_size)
-{
-  u16 size =
-    clib_min (gso_size, vlib_buffer_get_default_data_size (vm) - l234_sz);
-
-  /* rounded-up division */
-  u16 n_bufs = (n_bytes_b0 - l234_sz + (size - 1)) / size;
-  u16 n_alloc;
-
-  ASSERT (n_bufs > 0);
-  vec_validate (ptd->split_buffers, n_bufs - 1);
-
-  n_alloc = vlib_buffer_alloc (vm, ptd->split_buffers, n_bufs);
-  if (n_alloc < n_bufs)
-    {
-      vlib_buffer_free (vm, ptd->split_buffers, n_alloc);
-      return 0;
-    }
-  return n_alloc;
-}
-
-static_always_inline void
-tso_init_buf_from_template_base (vlib_buffer_t * nb0, vlib_buffer_t * b0,
-				 u32 flags, u16 length)
-{
-  nb0->current_data = b0->current_data;
-  nb0->total_length_not_including_first_buffer = 0;
-  nb0->flags = VLIB_BUFFER_TOTAL_LENGTH_VALID | flags;
-  clib_memcpy_fast (&nb0->opaque, &b0->opaque, sizeof (nb0->opaque));
-  clib_memcpy_fast (vlib_buffer_get_current (nb0),
-		    vlib_buffer_get_current (b0), length);
-  nb0->current_length = length;
-}
-
-static_always_inline void
-tso_init_buf_from_template (vlib_main_t * vm, vlib_buffer_t * nb0,
-			    vlib_buffer_t * b0, u16 template_data_sz,
-			    u16 gso_size, u8 ** p_dst_ptr, u16 * p_dst_left,
-			    u32 next_tcp_seq, u32 flags)
-{
-  tso_init_buf_from_template_base (nb0, b0, flags, template_data_sz);
-
-  *p_dst_left =
-    clib_min (gso_size,
-	      vlib_buffer_get_default_data_size (vm) - (template_data_sz +
-							nb0->current_data));
-  *p_dst_ptr = vlib_buffer_get_current (nb0) + template_data_sz;
-
-  tcp_header_t *tcp =
-    (tcp_header_t *) (nb0->data + vnet_buffer (nb0)->l4_hdr_offset);
-  tcp->seq_number = clib_host_to_net_u32 (next_tcp_seq);
-}
-
-static_always_inline void
-tso_fixup_segmented_buf (vlib_buffer_t * b0, u8 tcp_flags, int is_ip6)
-{
-  u16 l3_hdr_offset = vnet_buffer (b0)->l3_hdr_offset;
-  u16 l4_hdr_offset = vnet_buffer (b0)->l4_hdr_offset;
-  ip4_header_t *ip4 = (ip4_header_t *) (b0->data + l3_hdr_offset);
-  ip6_header_t *ip6 = (ip6_header_t *) (b0->data + l3_hdr_offset);
-  tcp_header_t *tcp = (tcp_header_t *) (b0->data + l4_hdr_offset);
-
-  tcp->flags = tcp_flags;
-
-  if (is_ip6)
-    ip6->payload_length =
-      clib_host_to_net_u16 (b0->current_length -
-			    (l4_hdr_offset - b0->current_data));
-  else
-    ip4->length =
-      clib_host_to_net_u16 (b0->current_length -
-			    (l3_hdr_offset - b0->current_data));
-}
-
-/**
- * Allocate the necessary number of ptd->split_buffers,
- * and segment the possibly chained buffer(s) from b0 into
- * there.
- *
- * Return the cumulative number of bytes sent or zero
- * if allocation failed.
- */
-
-static_always_inline u32
-tso_segment_buffer (vlib_main_t * vm, vnet_interface_per_thread_data_t * ptd,
-		    int do_tx_offloads, u32 sbi0, vlib_buffer_t * sb0,
-		    u32 n_bytes_b0)
-{
-  u32 n_tx_bytes = 0;
-  int is_ip4 = sb0->flags & VNET_BUFFER_F_IS_IP4;
-  int is_ip6 = sb0->flags & VNET_BUFFER_F_IS_IP6;
-  ASSERT (is_ip4 || is_ip6);
-  ASSERT (sb0->flags & VNET_BUFFER_F_L2_HDR_OFFSET_VALID);
-  ASSERT (sb0->flags & VNET_BUFFER_F_L3_HDR_OFFSET_VALID);
-  ASSERT (sb0->flags & VNET_BUFFER_F_L4_HDR_OFFSET_VALID);
-  u16 gso_size = vnet_buffer2 (sb0)->gso_size;
-
-  int l4_hdr_sz = vnet_buffer2 (sb0)->gso_l4_hdr_sz;
-  u8 save_tcp_flags = 0;
-  u8 tcp_flags_no_fin_psh = 0;
-  u32 next_tcp_seq = 0;
-
-  tcp_header_t *tcp =
-    (tcp_header_t *) (sb0->data + vnet_buffer (sb0)->l4_hdr_offset);
-  next_tcp_seq = clib_net_to_host_u32 (tcp->seq_number);
-  /* store original flags for last packet and reset FIN and PSH */
-  save_tcp_flags = tcp->flags;
-  tcp_flags_no_fin_psh = tcp->flags & ~(TCP_FLAG_FIN | TCP_FLAG_PSH);
-  tcp->checksum = 0;
-
-  u32 default_bflags =
-    sb0->flags & ~(VNET_BUFFER_F_GSO | VLIB_BUFFER_NEXT_PRESENT);
-  u16 l234_sz = vnet_buffer (sb0)->l4_hdr_offset + l4_hdr_sz
-    - sb0->current_data;
-  int first_data_size = clib_min (gso_size, sb0->current_length - l234_sz);
-  next_tcp_seq += first_data_size;
-
-  if (PREDICT_FALSE
-      (!tso_alloc_tx_bufs (vm, ptd, sb0, n_bytes_b0, l234_sz, gso_size)))
-    return 0;
-
-  vlib_buffer_t *b0 = vlib_get_buffer (vm, ptd->split_buffers[0]);
-  tso_init_buf_from_template_base (b0, sb0, default_bflags,
-				   l234_sz + first_data_size);
-
-  u32 total_src_left = n_bytes_b0 - l234_sz - first_data_size;
-  if (total_src_left)
-    {
-      /* Need to copy more segments */
-      u8 *src_ptr, *dst_ptr;
-      u16 src_left, dst_left;
-      /* current source buffer */
-      vlib_buffer_t *csb0 = sb0;
-      u32 csbi0 = sbi0;
-      /* current dest buffer */
-      vlib_buffer_t *cdb0;
-      u16 dbi = 1;		/* the buffer [0] is b0 */
-
-      src_ptr = vlib_buffer_get_current (sb0) + l234_sz + first_data_size;
-      src_left = sb0->current_length - l234_sz - first_data_size;
-
-      tso_fixup_segmented_buf (b0, tcp_flags_no_fin_psh, is_ip6);
-      if (do_tx_offloads)
-	calc_checksums (vm, b0);
-
-      /* grab a second buffer and prepare the loop */
-      ASSERT (dbi < vec_len (ptd->split_buffers));
-      cdb0 = vlib_get_buffer (vm, ptd->split_buffers[dbi++]);
-      tso_init_buf_from_template (vm, cdb0, b0, l234_sz, gso_size, &dst_ptr,
-				  &dst_left, next_tcp_seq, default_bflags);
-
-      /* an arbitrary large number to catch the runaway loops */
-      int nloops = 2000;
-      while (total_src_left)
-	{
-	  if (nloops-- <= 0)
-	    clib_panic ("infinite loop detected");
-	  u16 bytes_to_copy = clib_min (src_left, dst_left);
-
-	  clib_memcpy_fast (dst_ptr, src_ptr, bytes_to_copy);
-
-	  src_left -= bytes_to_copy;
-	  src_ptr += bytes_to_copy;
-	  total_src_left -= bytes_to_copy;
-	  dst_left -= bytes_to_copy;
-	  dst_ptr += bytes_to_copy;
-	  next_tcp_seq += bytes_to_copy;
-	  cdb0->current_length += bytes_to_copy;
-
-	  if (0 == src_left)
-	    {
-	      int has_next = (csb0->flags & VLIB_BUFFER_NEXT_PRESENT);
-	      u32 next_bi = csb0->next_buffer;
-
-	      /* init src to the next buffer in chain */
-	      if (has_next)
-		{
-		  csbi0 = next_bi;
-		  csb0 = vlib_get_buffer (vm, csbi0);
-		  src_left = csb0->current_length;
-		  src_ptr = vlib_buffer_get_current (csb0);
-		}
-	      else
-		{
-		  ASSERT (total_src_left == 0);
-		  break;
-		}
-	    }
-	  if (0 == dst_left && total_src_left)
-	    {
-	      if (do_tx_offloads)
-		calc_checksums (vm, cdb0);
-	      n_tx_bytes += cdb0->current_length;
-	      ASSERT (dbi < vec_len (ptd->split_buffers));
-	      cdb0 = vlib_get_buffer (vm, ptd->split_buffers[dbi++]);
-	      tso_init_buf_from_template (vm, cdb0, b0, l234_sz,
-					  gso_size, &dst_ptr, &dst_left,
-					  next_tcp_seq, default_bflags);
-	    }
-	}
-
-      tso_fixup_segmented_buf (cdb0, save_tcp_flags, is_ip6);
-      if (do_tx_offloads)
-	calc_checksums (vm, cdb0);
-
-      n_tx_bytes += cdb0->current_length;
-    }
-  n_tx_bytes += b0->current_length;
-  return n_tx_bytes;
-}
-
-static_always_inline void
-drop_one_buffer_and_count (vlib_main_t * vm, vnet_main_t * vnm,
-			   vlib_node_runtime_t * node, u32 * pbi0,
-			   u32 drop_error_code)
-{
-  u32 thread_index = vm->thread_index;
-  vnet_interface_output_runtime_t *rt = (void *) node->runtime_data;
-
-  vlib_simple_counter_main_t *cm;
-  cm =
-    vec_elt_at_index (vnm->interface_main.sw_if_counters,
-		      VNET_INTERFACE_COUNTER_TX_ERROR);
-  vlib_increment_simple_counter (cm, thread_index, rt->sw_if_index, 1);
-
-  vlib_error_drop_buffers (vm, node, pbi0,
-			   /* buffer stride */ 1,
-			   /* n_buffers */ 1,
-			   VNET_INTERFACE_OUTPUT_NEXT_DROP,
-			   node->node_index, drop_error_code);
-}
-
 static_always_inline uword
-vnet_interface_output_node_inline_gso (vlib_main_t * vm,
-				       vlib_node_runtime_t * node,
-				       vlib_frame_t * frame,
-				       vnet_main_t * vnm,
-				       vnet_hw_interface_t * hi,
-				       int do_tx_offloads,
-				       int do_segmentation)
+vnet_interface_output_node_inline (vlib_main_t * vm,
+				   vlib_node_runtime_t * node,
+				   vlib_frame_t * frame,
+				   vnet_main_t * vnm,
+				   vnet_hw_interface_t * hi,
+				   int do_tx_offloads)
 {
   vnet_interface_output_runtime_t *rt = (void *) node->runtime_data;
   vnet_sw_interface_t *si;
@@ -485,8 +178,6 @@ vnet_interface_output_node_inline_gso (vlib_main_t * vm,
   u32 next_index = VNET_INTERFACE_OUTPUT_NEXT_TX;
   u32 current_config_index = ~0;
   u8 arc = im->output_feature_arc_index;
-  vnet_interface_per_thread_data_t *ptd =
-    vec_elt_at_index (im->per_thread_data, thread_index);
   vlib_buffer_t *bufs[VLIB_FRAME_SIZE], **b = bufs;
 
   n_buffers = frame->n_vectors;
@@ -571,12 +262,6 @@ vnet_interface_output_node_inline_gso (vlib_main_t * vm,
 
 	  or_flags = b[0]->flags | b[1]->flags | b[2]->flags | b[3]->flags;
 
-	  if (do_segmentation)
-	    {
-	      /* go to single loop if we need TSO segmentation */
-	      if (PREDICT_FALSE (or_flags & VNET_BUFFER_F_GSO))
-		break;
-	    }
 	  from += 4;
 	  to_tx += 4;
 	  n_left_to_tx -= 4;
@@ -650,15 +335,32 @@ vnet_interface_output_node_inline_gso (vlib_main_t * vm,
 
 	  if (do_tx_offloads)
 	    {
-	      if (or_flags &
-		  (VNET_BUFFER_F_OFFLOAD_TCP_CKSUM |
-		   VNET_BUFFER_F_OFFLOAD_UDP_CKSUM |
-		   VNET_BUFFER_F_OFFLOAD_IP_CKSUM))
+	      u32 vnet_buffer_offload_flags =
+		(VNET_BUFFER_F_OFFLOAD_TCP_CKSUM |
+		 VNET_BUFFER_F_OFFLOAD_UDP_CKSUM |
+		 VNET_BUFFER_F_OFFLOAD_IP_CKSUM);
+	      if (or_flags & vnet_buffer_offload_flags)
 		{
-		  calc_checksums (vm, b[0]);
-		  calc_checksums (vm, b[1]);
-		  calc_checksums (vm, b[2]);
-		  calc_checksums (vm, b[3]);
+		  if (b[0]->flags & vnet_buffer_offload_flags)
+		    vnet_calc_checksums_inline
+		      (vm, b[0],
+		       b[0]->flags & VNET_BUFFER_F_IS_IP4,
+		       b[0]->flags & VNET_BUFFER_F_IS_IP6);
+		  if (b[1]->flags & vnet_buffer_offload_flags)
+		    vnet_calc_checksums_inline
+		      (vm, b[1],
+		       b[1]->flags & VNET_BUFFER_F_IS_IP4,
+		       b[1]->flags & VNET_BUFFER_F_IS_IP6);
+		  if (b[2]->flags & vnet_buffer_offload_flags)
+		    vnet_calc_checksums_inline
+		      (vm, b[2],
+		       b[2]->flags & VNET_BUFFER_F_IS_IP4,
+		       b[2]->flags & VNET_BUFFER_F_IS_IP6);
+		  if (b[3]->flags & vnet_buffer_offload_flags)
+		    vnet_calc_checksums_inline
+		      (vm, b[3],
+		       b[3]->flags & VNET_BUFFER_F_IS_IP4,
+		       b[3]->flags & VNET_BUFFER_F_IS_IP6);
 		}
 	    }
 	  b += 4;
@@ -691,84 +393,6 @@ vnet_interface_output_node_inline_gso (vlib_main_t * vm,
 	      b[0]->current_config_index = current_config_index;
 	    }
 
-	  if (do_segmentation)
-	    {
-	      if (PREDICT_FALSE (b[0]->flags & VNET_BUFFER_F_GSO))
-		{
-		  /*
-		   * Undo the enqueue of the b0 - it is not going anywhere,
-		   * and will be freed either after it's segmented or
-		   * when dropped, if there is no buffers to segment into.
-		   */
-		  to_tx -= 1;
-		  n_left_to_tx += 1;
-		  /* undo the counting. */
-		  n_bytes -= n_bytes_b0;
-		  n_packets -= 1;
-
-		  u32 n_tx_bytes = 0;
-
-		  n_tx_bytes =
-		    tso_segment_buffer (vm, ptd, do_tx_offloads, bi0, b[0],
-					n_bytes_b0);
-
-		  if (PREDICT_FALSE (n_tx_bytes == 0))
-		    {
-		      drop_one_buffer_and_count (vm, vnm, node, from - 1,
-						 VNET_INTERFACE_OUTPUT_ERROR_NO_BUFFERS_FOR_GSO);
-		      b += 1;
-		      continue;
-		    }
-
-		  u16 n_tx_bufs = vec_len (ptd->split_buffers);
-		  u32 *from_tx_seg = ptd->split_buffers;
-
-		  while (n_tx_bufs > 0)
-		    {
-		      if (n_tx_bufs >= n_left_to_tx)
-			{
-			  while (n_left_to_tx > 0)
-			    {
-			      to_tx[0] = from_tx_seg[0];
-			      to_tx += 1;
-			      from_tx_seg += 1;
-			      n_left_to_tx -= 1;
-			      n_tx_bufs -= 1;
-			      n_packets += 1;
-			    }
-			  vlib_put_next_frame (vm, node, next_index,
-					       n_left_to_tx);
-			  vlib_get_new_next_frame (vm, node, next_index,
-						   to_tx, n_left_to_tx);
-			}
-		      while (n_tx_bufs > 0)
-			{
-			  to_tx[0] = from_tx_seg[0];
-			  to_tx += 1;
-			  from_tx_seg += 1;
-			  n_left_to_tx -= 1;
-			  n_tx_bufs -= 1;
-			  n_packets += 1;
-			}
-		    }
-		  n_bytes += n_tx_bytes;
-		  if (PREDICT_FALSE (tx_swif0 != rt->sw_if_index))
-		    {
-
-		      vlib_increment_combined_counter
-			(im->combined_sw_if_counters +
-			 VNET_INTERFACE_COUNTER_TX, thread_index, tx_swif0,
-			 _vec_len (ptd->split_buffers), n_tx_bytes);
-		    }
-		  /* The buffers were enqueued. Reset the length */
-		  _vec_len (ptd->split_buffers) = 0;
-		  /* Free the now segmented buffer */
-		  vlib_buffer_free_one (vm, bi0);
-		  b += 1;
-		  continue;
-		}
-	    }
-
 	  if (PREDICT_FALSE (tx_swif0 != rt->sw_if_index))
 	    {
 
@@ -779,8 +403,16 @@ vnet_interface_output_node_inline_gso (vlib_main_t * vm,
 	    }
 
 	  if (do_tx_offloads)
-	    calc_checksums (vm, b[0]);
-
+	    {
+	      if (b[0]->flags &
+		  (VNET_BUFFER_F_OFFLOAD_TCP_CKSUM |
+		   VNET_BUFFER_F_OFFLOAD_UDP_CKSUM |
+		   VNET_BUFFER_F_OFFLOAD_IP_CKSUM))
+		vnet_calc_checksums_inline
+		  (vm, b[0],
+		   b[0]->flags & VNET_BUFFER_F_IS_IP4,
+		   b[0]->flags & VNET_BUFFER_F_IS_IP6);
+	    }
 	  b += 1;
 	}
 
@@ -802,7 +434,6 @@ static_always_inline void vnet_interface_pcap_tx_trace
 {
   u32 n_left_from, *from;
   u32 sw_if_index;
-  vnet_main_t *vnm;
   vnet_pcap_t *pp = &vlib_global_main.pcap;
 
   if (PREDICT_TRUE (pp->pcap_tx_enable == 0))
@@ -816,7 +447,6 @@ static_always_inline void vnet_interface_pcap_tx_trace
   else
     sw_if_index = ~0;
 
-  vnm = vnet_get_main ();
   n_left_from = frame->n_vectors;
   from = vlib_frame_vector_args (frame);
 
@@ -828,12 +458,11 @@ static_always_inline void vnet_interface_pcap_tx_trace
       from++;
       n_left_from--;
 
-      if (vec_len (vnm->classify_filter_table_indices))
+      if (pp->filter_classify_table_index != ~0)
 	{
 	  classify_filter_result =
 	    vnet_is_packet_traced_inline
-	    (b0, vnm->classify_filter_table_indices[0],
-	     0 /* full classify */ );
+	    (b0, pp->filter_classify_table_index, 0 /* full classify */ );
 	  if (classify_filter_result)
 	    pcap_add_buffer (&pp->pcap_main, vm, bi0, pp->max_bytes_per_pkt);
 	  continue;
@@ -843,37 +472,20 @@ static_always_inline void vnet_interface_pcap_tx_trace
 	sw_if_index = vnet_buffer (b0)->sw_if_index[VLIB_TX];
 
       if (pp->pcap_sw_if_index == 0 || pp->pcap_sw_if_index == sw_if_index)
-	pcap_add_buffer (&pp->pcap_main, vm, bi0, pp->max_bytes_per_pkt);
+	{
+	  vnet_main_t *vnm = vnet_get_main ();
+	  vnet_hw_interface_t *hi =
+	    vnet_get_sup_hw_interface (vnm, sw_if_index);
+	  /* Capture pkt if not filtered, or if filter hits */
+	  if (hi->trace_classify_table_index == ~0 ||
+	      vnet_is_packet_traced_inline
+	      (b0, hi->trace_classify_table_index, 0 /* full classify */ ))
+	    pcap_add_buffer (&pp->pcap_main, vm, bi0, pp->max_bytes_per_pkt);
+	}
     }
 }
 
 #ifndef CLIB_MARCH_VARIANT
-static_always_inline uword
-vnet_interface_output_node_inline (vlib_main_t * vm,
-				   vlib_node_runtime_t * node,
-				   vlib_frame_t * frame, vnet_main_t * vnm,
-				   vnet_hw_interface_t * hi,
-				   int do_tx_offloads)
-{
-  /*
-   * The 3-headed "if" is here because we want to err on the side
-   * of not impacting the non-GSO performance - so for the more
-   * common case of no GSO interfaces we want to prevent the
-   * segmentation codepath from being there altogether.
-   */
-  if (PREDICT_TRUE (vnm->interface_main.gso_interface_count == 0))
-    return vnet_interface_output_node_inline_gso (vm, node, frame, vnm, hi,
-						  do_tx_offloads,
-						  /* do_segmentation */ 0);
-  else if (hi->flags & VNET_HW_INTERFACE_FLAG_SUPPORTS_GSO)
-    return vnet_interface_output_node_inline_gso (vm, node, frame, vnm, hi,
-						  do_tx_offloads,
-						  /* do_segmentation */ 0);
-  else
-    return vnet_interface_output_node_inline_gso (vm, node, frame, vnm, hi,
-						  do_tx_offloads,
-						  /* do_segmentation */ 1);
-}
 
 uword
 vnet_interface_output_node (vlib_main_t * vm, vlib_node_runtime_t * node,
@@ -992,8 +604,12 @@ VLIB_NODE_FN (vnet_per_buffer_interface_output_node) (vlib_main_t * vm,
 typedef struct vnet_error_trace_t_
 {
   u32 sw_if_index;
+  i8 details_valid;
+  u8 is_ip6;
+  u8 pad[2];
+  u16 mactype;
+  ip46_address_t src, dst;
 } vnet_error_trace_t;
-
 
 static u8 *
 format_vnet_error_trace (u8 * s, va_list * va)
@@ -1002,9 +618,29 @@ format_vnet_error_trace (u8 * s, va_list * va)
   CLIB_UNUSED (vlib_node_t * node) = va_arg (*va, vlib_node_t *);
   vnet_error_trace_t *t = va_arg (*va, vnet_error_trace_t *);
 
-  s = format (s, "rx:%U", format_vnet_sw_if_index_name,
-	      vnet_get_main (), t->sw_if_index);
-
+  /* Normal, non-catchup trace */
+  if (t->details_valid == 0)
+    {
+      s = format (s, "rx:%U", format_vnet_sw_if_index_name,
+		  vnet_get_main (), t->sw_if_index);
+    }
+  else if (t->details_valid == 1)
+    {
+      /* The trace capture code didn't understant the mactype */
+      s = format (s, "mactype 0x%4x (not decoded)", t->mactype);
+    }
+  else if (t->details_valid == 2)
+    {
+      /* Dump the src/dst addresses */
+      if (t->is_ip6 == 0)
+	s = format (s, "IP4: %U -> %U",
+		    format_ip4_address, &t->src.ip4,
+		    format_ip4_address, &t->dst.ip4);
+      else
+	s = format (s, "IP6: %U -> %U",
+		    format_ip6_address, &t->src.ip6,
+		    format_ip6_address, &t->dst.ip6);
+    }
   return s;
 }
 
@@ -1035,13 +671,17 @@ interface_trace_buffers (vlib_main_t * vm,
 
       if (b0->flags & VLIB_BUFFER_IS_TRACED)
 	{
-	  t0 = vlib_add_trace (vm, node, b0, sizeof (t0[0]));
+	  t0 = vlib_add_trace (vm, node, b0,
+			       STRUCT_OFFSET_OF (vnet_error_trace_t, pad));
 	  t0->sw_if_index = vnet_buffer (b0)->sw_if_index[VLIB_RX];
+	  t0->details_valid = 0;
 	}
       if (b1->flags & VLIB_BUFFER_IS_TRACED)
 	{
-	  t1 = vlib_add_trace (vm, node, b1, sizeof (t1[0]));
+	  t1 = vlib_add_trace (vm, node, b1,
+			       STRUCT_OFFSET_OF (vnet_error_trace_t, pad));
 	  t1->sw_if_index = vnet_buffer (b1)->sw_if_index[VLIB_RX];
+	  t1->details_valid = 0;
 	}
       buffers += 2;
       n_left -= 2;
@@ -1059,8 +699,10 @@ interface_trace_buffers (vlib_main_t * vm,
 
       if (b0->flags & VLIB_BUFFER_IS_TRACED)
 	{
-	  t0 = vlib_add_trace (vm, node, b0, sizeof (t0[0]));
+	  t0 = vlib_add_trace (vm, node, b0,
+			       STRUCT_OFFSET_OF (vnet_error_trace_t, pad));
 	  t0->sw_if_index = vnet_buffer (b0)->sw_if_index[VLIB_RX];
+	  t0->details_valid = 0;
 	}
       buffers += 1;
       n_left -= 1;
@@ -1074,6 +716,56 @@ typedef enum
   VNET_ERROR_N_DISPOSITION,
 } vnet_error_disposition_t;
 
+static void
+drop_catchup_trace (vlib_main_t * vm,
+		    vlib_node_runtime_t * node, vlib_buffer_t * b)
+{
+  /* Can we safely rewind the buffer? If not, fagedaboudit */
+  if (b->flags & VNET_BUFFER_F_L2_HDR_OFFSET_VALID)
+    {
+      vnet_error_trace_t *t;
+      ip4_header_t *ip4;
+      ip6_header_t *ip6;
+      ethernet_header_t *eh;
+      i16 delta;
+
+      t = vlib_add_trace (vm, node, b, sizeof (*t));
+      delta = vnet_buffer (b)->l2_hdr_offset - b->current_data;
+      vlib_buffer_advance (b, delta);
+
+      eh = vlib_buffer_get_current (b);
+      /* Save mactype */
+      t->mactype = clib_net_to_host_u16 (eh->type);
+      t->details_valid = 1;
+      switch (t->mactype)
+	{
+	case ETHERNET_TYPE_IP4:
+	  ip4 = (void *) (eh + 1);
+	  t->details_valid = 2;
+	  t->is_ip6 = 0;
+	  t->src.ip4.as_u32 = ip4->src_address.as_u32;
+	  t->dst.ip4.as_u32 = ip4->dst_address.as_u32;
+	  break;
+
+	case ETHERNET_TYPE_IP6:
+	  ip6 = (void *) (eh + 1);
+	  t->details_valid = 2;
+	  t->is_ip6 = 1;
+	  clib_memcpy_fast (t->src.as_u8, ip6->src_address.as_u8,
+			    sizeof (ip6_address_t));
+	  clib_memcpy_fast (t->dst.as_u8, ip6->dst_address.as_u8,
+			    sizeof (ip6_address_t));
+	  break;
+
+	default:
+	  /* Dunno, do nothing, leave details_valid alone */
+	  break;
+	}
+      /* Restore current data (probably unnecessary) */
+      vlib_buffer_advance (b, -delta);
+    }
+}
+
 static_always_inline uword
 interface_drop_punt (vlib_main_t * vm,
 		     vlib_node_runtime_t * node,
@@ -1085,6 +777,7 @@ interface_drop_punt (vlib_main_t * vm,
   u32 sw_if_indices[VLIB_FRAME_SIZE];
   vlib_simple_counter_main_t *cm;
   u16 nexts[VLIB_FRAME_SIZE];
+  u32 n_trace;
   vnet_main_t *vnm;
 
   vnm = vnet_get_main ();
@@ -1095,6 +788,39 @@ interface_drop_punt (vlib_main_t * vm,
   sw_if_index = sw_if_indices;
 
   vlib_get_buffers (vm, from, bufs, n_left);
+
+  /* "trace add error-drop NNN?" */
+  if (PREDICT_FALSE ((n_trace = vlib_get_trace_count (vm, node))))
+    {
+      /* If pkts aren't otherwise traced... */
+      if ((node->flags & VLIB_NODE_FLAG_TRACE) == 0)
+	{
+	  /* Trace them from here */
+	  node->flags |= VLIB_NODE_FLAG_TRACE;
+	  while (n_trace && n_left)
+	    {
+	      vlib_trace_buffer (vm, node, 0 /* next_index */ ,
+				 b[0], 0 /* follow chain */ );
+	      /*
+	       * Here we have a wireshark dissector problem.
+	       * Packets may be well-formed, or not. We
+	       * must not blow chunks in any case.
+	       *
+	       * Try to produce trace records which will help
+	       * folks understand what's going on.
+	       */
+	      drop_catchup_trace (vm, node, b[0]);
+
+	      n_trace--;
+	      n_left--;
+	      b++;
+	    }
+	}
+
+      vlib_set_trace_count (vm, node, n_trace);
+      b = bufs;
+      n_left = frame->n_vectors;
+    }
 
   if (node->flags & VLIB_NODE_FLAG_TRACE)
     interface_trace_buffers (vm, node, frame);
@@ -1178,6 +904,8 @@ pcap_drop_trace (vlib_main_t * vm,
   i16 save_current_data;
   u16 save_current_length;
   vlib_error_main_t *em = &vm->error_main;
+  int do_trace = 0;
+
 
   from = vlib_frame_vector_args (f);
 
@@ -1199,9 +927,18 @@ pcap_drop_trace (vlib_main_t * vm,
 	  && hash_get (im->pcap_drop_filter_hash, b0->error))
 	continue;
 
+      do_trace = (pp->pcap_sw_if_index == 0) ||
+	pp->pcap_sw_if_index == vnet_buffer (b0)->sw_if_index[VLIB_RX];
+
+      if (PREDICT_FALSE
+	  (do_trace == 0 && pp->filter_classify_table_index != ~0))
+	{
+	  do_trace = vnet_is_packet_traced_inline
+	    (b0, pp->filter_classify_table_index, 0 /* full classify */ );
+	}
+
       /* Trace all drops, or drops received on a specific interface */
-      if (pp->pcap_sw_if_index == 0 ||
-	  pp->pcap_sw_if_index == vnet_buffer (b0)->sw_if_index[VLIB_RX])
+      if (do_trace)
 	{
 	  save_current_data = b0->current_data;
 	  save_current_length = b0->current_length;
@@ -1230,7 +967,7 @@ pcap_drop_trace (vlib_main_t * vm,
 	    vlib_node_t *n;
 	    /* Length of the error string */
 	    int error_string_len =
-	      clib_strnlen (em->error_strings_heap[b0->error], 128);
+	      clib_strnlen (em->counters_heap[b0->error].name, 128);
 
 	    /* Dig up the drop node */
 	    error_node_index = vm->node_main.node_by_error[b0->error];
@@ -1259,7 +996,7 @@ pcap_drop_trace (vlib_main_t * vm,
 				  ": ", 2);
 		clib_memcpy_fast (last->data + last->current_data +
 				  last->current_length + vec_len (n->name) +
-				  2, em->error_strings_heap[b0->error],
+				  2, em->counters_heap[b0->error].name,
 				  error_string_len);
 		last->current_length += drop_string_len;
 		b0->flags &= ~(VLIB_BUFFER_TOTAL_LENGTH_VALID);
@@ -1325,6 +1062,7 @@ VLIB_REGISTER_NODE (interface_drop) = {
   .name = "error-drop",
   .vector_size = sizeof (u32),
   .format_trace = format_vnet_error_trace,
+  .flags = VLIB_NODE_FLAG_TRACE_SUPPORTED,
   .n_next_nodes = 1,
   .next_nodes = {
     [0] = "drop",
@@ -1337,6 +1075,7 @@ VLIB_REGISTER_NODE (interface_punt) = {
   .name = "error-punt",
   .vector_size = sizeof (u32),
   .format_trace = format_vnet_error_trace,
+  .flags = VLIB_NODE_FLAG_TRACE_SUPPORTED,
   .n_next_nodes = 1,
   .next_nodes = {
     [0] = "punt",

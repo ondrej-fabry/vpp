@@ -176,12 +176,9 @@ ply_create (ip4_fib_mtrie_t * m,
 	    u32 leaf_prefix_len, u32 ply_base_len)
 {
   ip4_fib_mtrie_8_ply_t *p;
-  void *old_heap;
   /* Get cache aligned ply. */
 
-  old_heap = clib_mem_set_heap (ip4_main.mtrie_mheap);
   pool_get_aligned (ip4_ply_pool, p, CLIB_CACHE_LINE_BYTES);
-  clib_mem_set_heap (old_heap);
 
   ply_8_init (p, init_leaf, leaf_prefix_len, ply_base_len);
   return ip4_fib_mtrie_leaf_set_next_ply_index (p - ip4_ply_pool);
@@ -254,8 +251,7 @@ set_ply_with_more_specific_leaf (ip4_fib_mtrie_t * m,
       else if (new_leaf_dst_address_bits >=
 	       ply->dst_address_bits_of_leaves[i])
 	{
-	  clib_atomic_cmp_and_swap (&ply->leaves[i], old_leaf, new_leaf);
-	  ASSERT (ply->leaves[i] == new_leaf);
+	  clib_atomic_store_rel_n (&ply->leaves[i], new_leaf);
 	  ply->dst_address_bits_of_leaves[i] = new_leaf_dst_address_bits;
 	  ply->n_non_empty_leafs += ip4_fib_mtrie_leaf_is_non_empty (ply, i);
 	}
@@ -319,9 +315,7 @@ set_leaf (ip4_fib_mtrie_t * m,
 
 		  old_ply->dst_address_bits_of_leaves[i] =
 		    a->dst_address_length;
-		  clib_atomic_cmp_and_swap (&old_ply->leaves[i], old_leaf,
-					    new_leaf);
-		  ASSERT (old_ply->leaves[i] == new_leaf);
+		  clib_atomic_store_rel_n (&old_ply->leaves[i], new_leaf);
 
 		  old_ply->n_non_empty_leafs +=
 		    ip4_fib_mtrie_leaf_is_non_empty (old_ply, i);
@@ -378,9 +372,7 @@ set_leaf (ip4_fib_mtrie_t * m,
 	  /* Refetch since ply_create may move pool. */
 	  old_ply = pool_elt_at_index (ip4_ply_pool, old_ply_index);
 
-	  clib_atomic_cmp_and_swap (&old_ply->leaves[dst_byte], old_leaf,
-				    new_leaf);
-	  ASSERT (old_ply->leaves[dst_byte] == new_leaf);
+	  clib_atomic_store_rel_n (&old_ply->leaves[dst_byte], new_leaf);
 	  old_ply->dst_address_bits_of_leaves[dst_byte] = ply_base_len;
 
 	  old_ply->n_non_empty_leafs +=
@@ -451,9 +443,7 @@ set_root_leaf (ip4_fib_mtrie_t * m,
 		   * the new one */
 		  old_ply->dst_address_bits_of_leaves[slot] =
 		    a->dst_address_length;
-		  clib_atomic_cmp_and_swap (&old_ply->leaves[slot],
-					    old_leaf, new_leaf);
-		  ASSERT (old_ply->leaves[slot] == new_leaf);
+		  clib_atomic_store_rel_n (&old_ply->leaves[slot], new_leaf);
 		}
 	      else
 		{
@@ -498,9 +488,7 @@ set_root_leaf (ip4_fib_mtrie_t * m,
 			ply_base_len);
 	  new_ply = get_next_ply_for_leaf (m, new_leaf);
 
-	  clib_atomic_cmp_and_swap (&old_ply->leaves[dst_byte], old_leaf,
-				    new_leaf);
-	  ASSERT (old_ply->leaves[dst_byte] == new_leaf);
+	  clib_atomic_store_rel_n (&old_ply->leaves[dst_byte], new_leaf);
 	  old_ply->dst_address_bits_of_leaves[dst_byte] = ply_base_len;
 	}
       else
@@ -549,8 +537,9 @@ unset_leaf (ip4_fib_mtrie_t * m,
 	  old_ply->n_non_empty_leafs -=
 	    ip4_fib_mtrie_leaf_is_non_empty (old_ply, i);
 
-	  old_ply->leaves[i] =
-	    ip4_fib_mtrie_leaf_set_adj_index (a->cover_adj_index);
+	  clib_atomic_store_rel_n (&old_ply->leaves[i],
+				   ip4_fib_mtrie_leaf_set_adj_index
+				   (a->cover_adj_index));
 	  old_ply->dst_address_bits_of_leaves[i] = a->cover_address_length;
 
 	  old_ply->n_non_empty_leafs +=
@@ -620,8 +609,9 @@ unset_root_leaf (ip4_fib_mtrie_t * m,
 	  || (!old_leaf_is_terminal
 	      && unset_leaf (m, a, get_next_ply_for_leaf (m, old_leaf), 2)))
 	{
-	  old_ply->leaves[slot] =
-	    ip4_fib_mtrie_leaf_set_adj_index (a->cover_adj_index);
+	  clib_atomic_store_rel_n (&old_ply->leaves[slot],
+				   ip4_fib_mtrie_leaf_set_adj_index
+				   (a->cover_adj_index));
 	  old_ply->dst_address_bits_of_leaves[slot] = a->cover_address_length;
 	}
     }
@@ -797,27 +787,18 @@ format_ip4_fib_mtrie (u8 * s, va_list * va)
 
 /** Default heap size for the IPv4 mtries */
 #define IP4_FIB_DEFAULT_MTRIE_HEAP_SIZE (32<<20)
+#ifndef MAP_HUGE_SHIFT
+#define MAP_HUGE_SHIFT 26
+#endif
 
 static clib_error_t *
 ip4_mtrie_module_init (vlib_main_t * vm)
 {
   CLIB_UNUSED (ip4_fib_mtrie_8_ply_t * p);
-  ip4_main_t *im = &ip4_main;
   clib_error_t *error = NULL;
-  uword *old_heap;
-
-  if (0 == im->mtrie_heap_size)
-    im->mtrie_heap_size = IP4_FIB_DEFAULT_MTRIE_HEAP_SIZE;
-#if USE_DLMALLOC == 0
-  im->mtrie_mheap = mheap_alloc (0, im->mtrie_heap_size);
-#else
-  im->mtrie_mheap = create_mspace (im->mtrie_heap_size, 1 /* locked */ );
-#endif
 
   /* Burn one ply so index 0 is taken */
-  old_heap = clib_mem_set_heap (ip4_main.mtrie_mheap);
   pool_get (ip4_ply_pool, p);
-  clib_mem_set_heap (old_heap);
 
   return (error);
 }

@@ -106,14 +106,11 @@ ip4_create_fib_with_table_id (u32 table_id,
 {
     fib_table_t *fib_table;
     ip4_fib_t *v4_fib;
-    void *old_heap;
 
     pool_get(ip4_main.fibs, fib_table);
     clib_memset(fib_table, 0, sizeof(*fib_table));
 
-    old_heap = clib_mem_set_heap (ip4_main.mtrie_mheap);
     pool_get_aligned(ip4_main.v4_fibs, v4_fib, CLIB_CACHE_LINE_BYTES);
-    clib_mem_set_heap (old_heap);
 
     ASSERT((fib_table - ip4_main.fibs) ==
            (v4_fib - ip4_main.v4_fibs));
@@ -129,7 +126,7 @@ ip4_create_fib_with_table_id (u32 table_id,
 	v4_fib->table_id =
 	    table_id;
     fib_table->ft_flow_hash_config = IP_FLOW_HASH_DEFAULT;
-    
+
     fib_table_lock(fib_table->ft_index, FIB_PROTOCOL_IP4, src);
 
     ip4_mtrie_init(&v4_fib->mtrie);
@@ -160,6 +157,7 @@ ip4_fib_table_destroy (u32 fib_index)
 {
     fib_table_t *fib_table = pool_elt_at_index(ip4_main.fibs, fib_index);
     ip4_fib_t *v4_fib = pool_elt_at_index(ip4_main.v4_fibs, fib_index);
+    u32 *n_locks;
     int ii;
 
     /*
@@ -181,10 +179,14 @@ ip4_fib_table_destroy (u32 fib_index)
     /*
      * validate no more routes.
      */
-    ASSERT(0 == fib_table->ft_total_route_counts);
-    FOR_EACH_FIB_SOURCE(ii)
+#if CLIB_DEBUG > 0
+    if (0 != fib_table->ft_total_route_counts)
+        fib_table_assert_empty(fib_table);
+#endif
+
+    vec_foreach(n_locks, fib_table->ft_src_route_counts)
     {
-	ASSERT(0 == fib_table->ft_src_route_counts[ii]);
+	ASSERT(0 == *n_locks);
     }
 
     if (~0 != fib_table->ft_table_id)
@@ -192,6 +194,7 @@ ip4_fib_table_destroy (u32 fib_index)
 	hash_unset (ip4_main.fib_index_by_table_id, fib_table->ft_table_id);
     }
 
+    vec_free(fib_table->ft_src_route_counts);
     ip4_mtrie_free(&v4_fib->mtrie);
 
     pool_put(ip4_main.v4_fibs, v4_fib);
@@ -327,8 +330,6 @@ ip4_fib_table_entry_insert (ip4_fib_t *fib,
 	/*
 	 * adding a new entry
 	 */
-        uword *old_heap;
-        old_heap = clib_mem_set_heap (ip4_main.mtrie_mheap);
 
 	if (NULL == hash) {
 	    hash = hash_create (32 /* elts */, sizeof (uword));
@@ -337,7 +338,6 @@ ip4_fib_table_entry_insert (ip4_fib_t *fib,
 	}
 	hash = hash_set(hash, key, fib_entry_index);
 	fib->fib_entry_by_dst_address[len] = hash;
-        clib_mem_set_heap (old_heap);
     }
     else
     {
@@ -363,13 +363,9 @@ ip4_fib_table_entry_remove (ip4_fib_t *fib,
 	 * removing a non-existent entry. i'll allow it.
 	 */
     }
-    else 
+    else
     {
-        uword *old_heap;
-
-        old_heap = clib_mem_set_heap (ip4_main.mtrie_mheap);
 	hash_unset(hash, key);
-        clib_mem_set_heap (old_heap);
     }
 
     fib->fib_entry_by_dst_address[len] = hash;
@@ -553,7 +549,7 @@ ip4_fib_table_show_one (ip4_fib_t *fib,
 			ip4_address_t *address,
 			u32 mask_len,
                         int detail)
-{    
+{
     vlib_cli_output(vm, "%U",
                     format_fib_entry,
                     ip4_fib_table_lookup(fib, address, mask_len),
@@ -565,19 +561,9 @@ ip4_fib_table_show_one (ip4_fib_t *fib,
 u8 *
 format_ip4_fib_table_memory (u8 * s, va_list * args)
 {
-#if USE_DLMALLOC == 0
-    s = format(s, "%=30s %=6d %=12ld\n",
+    s = format(s, "%=30s %=6d\n",
                "IPv4 unicast",
-               pool_elts(ip4_main.fibs),
-               mheap_bytes(ip4_main.mtrie_mheap));
-#else
-    s = format(s, "%=30s %=6d %=12ld\n",
-               "IPv4 unicast",
-               pool_elts(ip4_main.fibs),
-               mspace_footprint(ip4_main.mtrie_mheap));
-#endif
-    
-
+               pool_elts(ip4_main.fibs));
     return (s);
 }
 
@@ -643,13 +629,12 @@ ip4_show_fib (vlib_main_t * vm,
 
         if (memory)
         {
-            uword mtrie_size, hash_size, *old_heap;
+            uword mtrie_size, hash_size;
 
 
             mtrie_size = ip4_fib_mtrie_memory_usage(&fib->mtrie);
             hash_size = 0;
 
-            old_heap = clib_mem_set_heap (ip4_main.mtrie_mheap);
 	    for (i = 0; i < ARRAY_LEN (fib->fib_entry_by_dst_address); i++)
 	    {
 		uword * hash = fib->fib_entry_by_dst_address[i];
@@ -658,7 +643,6 @@ ip4_show_fib (vlib_main_t * vm,
                     hash_size += hash_bytes(hash);
                 }
             }
-            clib_mem_set_heap (old_heap);
 
             if (verbose)
                 vlib_cli_output (vm, "%U mtrie:%d hash:%d",
@@ -671,13 +655,15 @@ ip4_show_fib (vlib_main_t * vm,
             continue;
         }
 
-	s = format(s, "%U, fib_index:%d, flow hash:[%U] locks:[",
+	s = format(s, "%U, fib_index:%d, flow hash:[%U] epoch:%d flags:%U locks:[",
                    format_fib_table_name, fib->index,
                    FIB_PROTOCOL_IP4,
                    fib->index,
                    format_ip_flow_hash_config,
-                   fib_table->ft_flow_hash_config);
-	FOR_EACH_FIB_SOURCE(source)
+                   fib_table->ft_flow_hash_config,
+                   fib_table->ft_epoch,
+                   format_fib_table_flags, fib_table->ft_flags);
+        vec_foreach_index(source, fib_table->ft_locks)
         {
             if (0 != fib_table->ft_locks[source])
             {
@@ -726,8 +712,6 @@ ip4_show_fib (vlib_main_t * vm,
                          total_mtrie_memory,
                          total_hash_memory,
                          total_mtrie_memory + total_hash_memory);
-        vlib_cli_output (vm, "\nMtrie Mheap Usage: %U\n",
-                         format_mheap, ip4_main.mtrie_mheap, 1);
     }
     return 0;
 }

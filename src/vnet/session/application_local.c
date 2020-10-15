@@ -86,6 +86,7 @@ ct_session_endpoint (session_t * ll, session_endpoint_t * sep)
   sep->transport_proto = ct->actual_tp;
   sep->port = ct->c_lcl_port;
   sep->is_ip4 = ct->c_is_ip4;
+  ip_copy (&sep->ip, &ct->c_lcl_ip, ct->c_is_ip4);
 }
 
 int
@@ -94,27 +95,28 @@ ct_session_connect_notify (session_t * ss)
   ct_connection_t *sct, *cct;
   app_worker_t *client_wrk;
   segment_manager_t *sm;
+  u32 ss_index, opaque;
   fifo_segment_t *seg;
   u64 segment_handle;
-  int is_fail = 0;
+  int err = 0;
   session_t *cs;
-  u32 ss_index;
 
   ss_index = ss->session_index;
   sct = (ct_connection_t *) session_get_transport (ss);
   client_wrk = app_worker_get (sct->client_wrk);
+  opaque = sct->client_opaque;
 
   sm = segment_manager_get (ss->rx_fifo->segment_manager);
   seg = segment_manager_get_segment_w_lock (sm, ss->rx_fifo->segment_index);
   segment_handle = segment_manager_segment_handle (sm, seg);
 
-  if (app_worker_add_segment_notify (client_wrk, segment_handle))
+  if ((err = app_worker_add_segment_notify (client_wrk, segment_handle)))
     {
       clib_warning ("failed to notify client %u of new segment",
 		    sct->client_wrk);
       segment_manager_segment_reader_unlock (sm);
       session_close (ss);
-      is_fail = 1;
+      goto error;
     }
   else
     {
@@ -143,16 +145,20 @@ ct_session_connect_notify (session_t * ss)
   /* This will allocate fifos for the session. They won't be used for
    * exchanging data but they will be used to close the connection if
    * the segment manager/worker is freed */
-  if (app_worker_init_connected (client_wrk, cs))
+  if ((err = app_worker_init_connected (client_wrk, cs)))
     {
       session_close (ss);
-      return -1;
+      session_free (cs);
+      goto error;
     }
 
-  if (app_worker_connect_notify (client_wrk, is_fail ? 0 : cs,
-				 sct->client_opaque))
+  cs->session_state = SESSION_STATE_CONNECTING;
+
+  if (app_worker_connect_notify (client_wrk, cs, err, opaque))
     {
       session_close (ss);
+      segment_manager_dealloc_fifos (cs->rx_fifo, cs->tx_fifo);
+      session_free (cs);
       return -1;
     }
 
@@ -160,6 +166,10 @@ ct_session_connect_notify (session_t * ss)
   cs->session_state = SESSION_STATE_READY;
 
   return 0;
+
+error:
+  app_worker_connect_notify (client_wrk, 0, err, opaque);
+  return -1;
 }
 
 static int
@@ -180,7 +190,11 @@ ct_init_local_session (app_worker_t * client_wrk, app_worker_t * server_wrk,
   props = application_segment_manager_properties (server);
   round_rx_fifo_sz = 1 << max_log2 (props->rx_fifo_size);
   round_tx_fifo_sz = 1 << max_log2 (props->tx_fifo_size);
-  seg_size = round_rx_fifo_sz + round_tx_fifo_sz + margin;
+  /* Increase size because of inefficient chunk allocations. Depending on
+   * how data is consumed, it may happen that more chunks than needed are
+   * allocated.
+   * TODO should remove once allocations are done more efficiently */
+  seg_size = 4 * (round_rx_fifo_sz + round_tx_fifo_sz + margin);
 
   sm = app_worker_get_listen_segment_manager (server_wrk, ll);
   seg_index = segment_manager_add_segment (sm, seg_size);
@@ -191,7 +205,8 @@ ct_init_local_session (app_worker_t * client_wrk, app_worker_t * server_wrk,
     }
   seg = segment_manager_get_segment_w_lock (sm, seg_index);
 
-  rv = segment_manager_try_alloc_fifos (seg, props->rx_fifo_size,
+  rv = segment_manager_try_alloc_fifos (seg, ls->thread_index,
+					props->rx_fifo_size,
 					props->tx_fifo_size, &ls->rx_fifo,
 					&ls->tx_fifo);
   if (rv)
@@ -208,6 +223,10 @@ ct_init_local_session (app_worker_t * client_wrk, app_worker_t * server_wrk,
   ls->tx_fifo->segment_manager = sm_index;
   ls->rx_fifo->segment_index = seg_index;
   ls->tx_fifo->segment_index = seg_index;
+
+  /* Disable ooo lookups on the cut-through fifos. TODO remove once init of
+   * chunk lookup rbtrees is delegated to transports */
+  svm_fifo_free_chunk_lookup (ls->tx_fifo);
 
   segment_handle = segment_manager_segment_handle (sm, seg);
   if ((rv = app_worker_add_segment_notify (server_wrk, segment_handle)))
@@ -291,7 +310,6 @@ ct_connect (app_worker_t * client_wrk, session_t * ll,
 
   if (ct_init_local_session (client_wrk, server_wrk, sct, ss, ll))
     {
-      clib_warning ("failed");
       ct_connection_free (sct);
       session_free (ss);
       return -1;
@@ -300,9 +318,9 @@ ct_connect (app_worker_t * client_wrk, session_t * ll,
   ss->session_state = SESSION_STATE_ACCEPTING;
   if (app_worker_accept_notify (server_wrk, ss))
     {
-      clib_warning ("failed");
       ct_connection_free (sct);
-      session_free_w_fifos (ss);
+      segment_manager_dealloc_fifos (ss->rx_fifo, ss->tx_fifo);
+      session_free (ss);
       return -1;
     }
 
@@ -366,7 +384,7 @@ ct_session_connect (transport_endpoint_cfg_t * tep)
   table_index = application_local_session_table (app);
   lh = session_lookup_local_endpoint (table_index, sep);
   if (lh == SESSION_DROP_HANDLE)
-    return VNET_API_ERROR_APP_CONNECT_FILTERED;
+    return SESSION_E_FILTERED;
 
   if (lh == SESSION_INVALID_HANDLE)
     goto global_scope;
@@ -391,13 +409,13 @@ ct_session_connect (transport_endpoint_cfg_t * tep)
 
 global_scope:
   if (session_endpoint_is_local (sep))
-    return VNET_API_ERROR_SESSION_CONNECT;
+    return SESSION_E_NOROUTE;
 
   if (!application_has_global_scope (app))
-    return VNET_API_ERROR_APP_CONNECT_SCOPE;
+    return SESSION_E_SCOPE;
 
   fib_proto = session_endpoint_fib_proto (sep);
-  table_index = application_session_table (app, fib_proto);
+  table_index = session_lookup_get_index_for_fib (fib_proto, sep->fib_index);
   ll = session_lookup_listener_wildcard (table_index, sep);
 
   if (ll)
@@ -467,11 +485,14 @@ format_ct_connection_id (u8 * s, va_list * args)
 }
 
 static int
-ct_custom_tx (void *session, u32 max_burst_size)
+ct_custom_tx (void *session, transport_send_params_t * sp)
 {
   session_t *s = (session_t *) session;
   if (session_has_transport (s))
     return 0;
+  /* As all other sessions, cut-throughs are scheduled by vpp for tx so let
+   * the scheduler's custom tx logic decide when to deschedule, i.e., after
+   * fifo is emptied. */
   return ct_session_tx (s);
 }
 
@@ -495,9 +516,9 @@ format_ct_listener (u8 * s, va_list * args)
   u32 __clib_unused thread_index = va_arg (*args, u32);
   u32 __clib_unused verbose = va_arg (*args, u32);
   ct_connection_t *ct = ct_connection_get (tc_index);
-  s = format (s, "%-50U", format_ct_connection_id, ct);
+  s = format (s, "%-" SESSION_CLI_ID_LEN "U", format_ct_connection_id, ct);
   if (verbose)
-    s = format (s, "%-15s", "LISTEN");
+    s = format (s, "%-" SESSION_CLI_STATE_LEN "s", "LISTEN");
   return s;
 }
 
@@ -509,10 +530,10 @@ format_ct_connection (u8 * s, va_list * args)
 
   if (!ct)
     return s;
-  s = format (s, "%-50U", format_ct_connection_id, ct);
+  s = format (s, "%-" SESSION_CLI_ID_LEN "U", format_ct_connection_id, ct);
   if (verbose)
     {
-      s = format (s, "%-15s", "ESTABLISHED");
+      s = format (s, "%-" SESSION_CLI_STATE_LEN "s", "ESTABLISHED");
       if (verbose > 1)
 	{
 	  s = format (s, "\n");
@@ -553,6 +574,8 @@ static const transport_proto_vft_t cut_thru_proto = {
   .format_listener = format_ct_listener,
   .format_connection = format_ct_session,
   .transport_options = {
+    .name = "ct",
+    .short_name = "C",
     .tx_type = TRANSPORT_TX_INTERNAL,
     .service_type = TRANSPORT_SERVICE_APP,
   },
@@ -568,11 +591,14 @@ ct_session_tx (session_t * s)
   ct = (ct_connection_t *) session_get_transport (s);
   peer_ct = ct_connection_get (ct->peer_index);
   if (!peer_ct)
-    return -1;
+    return 0;
   peer_s = session_get (peer_ct->c_s_index, 0);
   if (peer_s->session_state >= SESSION_STATE_TRANSPORT_CLOSING)
     return 0;
-  return session_enqueue_notify (peer_s);
+  session_enqueue_notify (peer_s);
+  /* The scheduler uses packet count as a means of upper bounding the amount
+   * of work done per dispatch. So make it look like we have sent something */
+  return 1;
 }
 
 static clib_error_t *

@@ -364,12 +364,6 @@ no_more_desc:
   or_qw1 |= or_q1x4[0] | or_q1x4[1] | or_q1x4[2] | or_q1x4[3];
 #endif
 
-  /* refill rx ring */
-  if (ad->flags & AVF_DEVICE_F_VA_DMA)
-    avf_rxq_refill (vm, node, rxq, 1 /* use_va_dma */ );
-  else
-    avf_rxq_refill (vm, node, rxq, 0 /* use_va_dma */ );
-
   vlib_get_buffers (vm, to_next, ptd->bufs, n_rx_packets);
 
   vnet_buffer (bt)->sw_if_index[VLIB_RX] = ad->sw_if_index;
@@ -437,6 +431,12 @@ no_more_desc:
 				   ad->hw_if_index, n_rx_packets, n_rx_bytes);
 
 done:
+  /* refill rx ring */
+  if (ad->flags & AVF_DEVICE_F_VA_DMA)
+    avf_rxq_refill (vm, node, rxq, 1 /* use_va_dma */ );
+  else
+    avf_rxq_refill (vm, node, rxq, 0 /* use_va_dma */ );
+
   return n_rx_packets;
 }
 
@@ -444,14 +444,13 @@ VLIB_NODE_FN (avf_input_node) (vlib_main_t * vm, vlib_node_runtime_t * node,
 			       vlib_frame_t * frame)
 {
   u32 n_rx = 0;
-  avf_main_t *am = &avf_main;
   vnet_device_input_runtime_t *rt = (void *) node->runtime_data;
   vnet_device_and_queue_t *dq;
 
   foreach_device_and_queue (dq, rt->devices_and_queues)
   {
     avf_device_t *ad;
-    ad = vec_elt_at_index (am->devices, dq->dev_instance);
+    ad = avf_get_device (dq->dev_instance);
     if ((ad->flags & AVF_DEVICE_F_ADMIN_UP) == 0)
       continue;
     n_rx += avf_device_input_inline (vm, node, frame, ad, dq->queue_id);

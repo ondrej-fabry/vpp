@@ -62,14 +62,14 @@ vmxnet3_interface_admin_up_down (vnet_main_t * vnm, u32 hw_if_index,
 
 static clib_error_t *
 vmxnet3_interface_rx_mode_change (vnet_main_t * vnm, u32 hw_if_index, u32 qid,
-				  vnet_hw_interface_rx_mode mode)
+				  vnet_hw_if_rx_mode mode)
 {
   vmxnet3_main_t *vmxm = &vmxnet3_main;
   vnet_hw_interface_t *hw = vnet_get_hw_interface (vnm, hw_if_index);
   vmxnet3_device_t *vd = pool_elt_at_index (vmxm->devices, hw->dev_instance);
   vmxnet3_rxq_t *rxq = vec_elt_at_index (vd->rxqs, qid);
 
-  if (mode == VNET_HW_INTERFACE_RX_MODE_POLLING)
+  if (mode == VNET_HW_IF_RX_MODE_POLLING)
     rxq->int_mode = 0;
   else
     rxq->int_mode = 1;
@@ -405,7 +405,6 @@ static clib_error_t *
 vmxnet3_device_init (vlib_main_t * vm, vmxnet3_device_t * vd,
 		     vmxnet3_create_if_args_t * args)
 {
-  vnet_main_t *vnm = vnet_get_main ();
   clib_error_t *error = 0;
   u32 ret, i, size;
   vlib_thread_main_t *tm = vlib_get_thread_main ();
@@ -453,10 +452,18 @@ vmxnet3_device_init (vlib_main_t * vm, vmxnet3_device_t * vd,
     }
 
   /* GSO is only supported for version >= 3 */
-  if (args->enable_gso && (vd->version >= 3))
+  if (args->enable_gso)
     {
-      vd->gso_enable = 1;
-      vnm->interface_main.gso_interface_count++;
+      if (vd->version >= 3)
+	vd->gso_enable = 1;
+      else
+	{
+	  error =
+	    clib_error_return (0,
+			       "GSO is not supported because hardware version"
+			       " is %u. It must be >= 3", vd->version);
+	  return error;
+	}
     }
 
   vmxnet3_reg_write (vd, 1, VMXNET3_REG_CMD, VMXNET3_CMD_GET_LINK);
@@ -743,6 +750,10 @@ vmxnet3_create_if (vlib_main_t * vm, vmxnet3_create_if_args_t * args)
       vmxnet3_log_error (vd,
 			 "No sufficient interrupt lines (%u) for rx queues",
 			 num_intr);
+      error =
+	clib_error_return (0,
+			   "No sufficient interrupt lines (%u) for rx queues",
+			   num_intr);
       goto error;
     }
   if ((error = vlib_pci_register_msix_handler (vm, h, 0, vd->num_rx_queues,
@@ -798,7 +809,8 @@ vmxnet3_create_if (vlib_main_t * vm, vmxnet3_create_if_args_t * args)
   vnet_hw_interface_t *hw = vnet_get_hw_interface (vnm, vd->hw_if_index);
   hw->flags |= VNET_HW_INTERFACE_FLAG_SUPPORTS_INT_MODE;
   if (vd->gso_enable)
-    hw->flags |= VNET_HW_INTERFACE_FLAG_SUPPORTS_GSO;
+    hw->flags |= (VNET_HW_INTERFACE_FLAG_SUPPORTS_GSO |
+		  VNET_HW_INTERFACE_FLAG_SUPPORTS_TX_L4_CKSUM_OFFLOAD);
 
   vnet_hw_interface_set_input_node (vnm, vd->hw_if_index,
 				    vmxnet3_input_node.index);
@@ -918,8 +930,6 @@ vmxnet3_delete_if (vlib_main_t * vm, vmxnet3_device_t * vd)
   clib_memset (vd, 0, sizeof (*vd));
   pool_put (vmxm->devices, vd);
 
-  if (vd->gso_enable)
-    vnm->interface_main.gso_interface_count--;
 }
 
 /*

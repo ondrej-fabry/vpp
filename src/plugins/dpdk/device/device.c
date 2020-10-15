@@ -15,7 +15,6 @@
 #include <vnet/vnet.h>
 #include <vppinfra/vec.h>
 #include <vppinfra/format.h>
-#include <vlib/unix/cj.h>
 #include <assert.h>
 
 #include <vnet/ethernet/ethernet.h>
@@ -43,6 +42,29 @@ static char *dpdk_tx_func_error_strings[] = {
 };
 
 static clib_error_t *
+dpdk_add_del_mac_address (vnet_hw_interface_t * hi,
+			  const u8 * address, u8 is_add)
+{
+  int error;
+  dpdk_main_t *dm = &dpdk_main;
+  dpdk_device_t *xd = vec_elt_at_index (dm->devices, hi->dev_instance);
+
+  if (is_add)
+    error = rte_eth_dev_mac_addr_add (xd->port_id,
+				      (struct rte_ether_addr *) address, 0);
+  else
+    error = rte_eth_dev_mac_addr_remove (xd->port_id,
+					 (struct rte_ether_addr *) address);
+
+  if (error)
+    {
+      return clib_error_return (0, "mac address add/del failed: %d", error);
+    }
+
+  return NULL;
+}
+
+static clib_error_t *
 dpdk_set_mac_address (vnet_hw_interface_t * hi,
 		      const u8 * old_address, const u8 * address)
 {
@@ -59,7 +81,7 @@ dpdk_set_mac_address (vnet_hw_interface_t * hi,
   else
     {
       vec_reset_length (xd->default_mac_address);
-      vec_add (xd->default_mac_address, address, sizeof (address));
+      vec_add (xd->default_mac_address, address, sizeof (mac_address_t));
       return NULL;
     }
 }
@@ -136,46 +158,24 @@ static_always_inline
 				struct rte_mbuf **mb, u32 n_left)
 {
   dpdk_main_t *dm = &dpdk_main;
+  dpdk_tx_queue_t *txq;
   u32 n_retry;
   int n_sent = 0;
   int queue_id;
 
   n_retry = 16;
-  queue_id = vm->thread_index;
+  queue_id = vm->thread_index % xd->tx_q_used;
+  txq = vec_elt_at_index (xd->tx_queues, queue_id);
 
   do
     {
-      /*
-       * This device only supports one TX queue,
-       * and we're running multi-threaded...
-       */
-      if (PREDICT_FALSE (xd->lockp != 0))
-	{
-	  queue_id = queue_id % xd->tx_q_used;
-	  while (clib_atomic_test_and_set (xd->lockp[queue_id]))
-	    /* zzzz */
-	    queue_id = (queue_id + 1) % xd->tx_q_used;
-	}
+      clib_spinlock_lock_if_init (&txq->lock);
 
-#if 0
-      if (PREDICT_FALSE (xd->flags & DPDK_DEVICE_FLAG_HQOS))	/* HQoS ON */
-	{
-	  /* no wrap, transmit in one burst */
-	  dpdk_device_hqos_per_worker_thread_t *hqos =
-	    &xd->hqos_wt[vm->thread_index];
-
-	  ASSERT (hqos->swq != NULL);
-
-	  dpdk_hqos_metadata_set (hqos, mb, n_left);
-	  n_sent = rte_ring_sp_enqueue_burst (hqos->swq, (void **) mb,
-					      n_left, 0);
-	}
-      else
-#endif
       if (PREDICT_TRUE (xd->flags & DPDK_DEVICE_FLAG_PMD))
 	{
 	  /* no wrap, transmit in one burst */
 	  n_sent = rte_eth_tx_burst (xd->port_id, queue_id, mb, n_left);
+	  n_retry--;
 	}
       else
 	{
@@ -183,8 +183,7 @@ static_always_inline
 	  n_sent = 0;
 	}
 
-      if (PREDICT_FALSE (xd->lockp != 0))
-	clib_atomic_release (xd->lockp[queue_id]);
+      clib_spinlock_unlock_if_init (&txq->lock);
 
       if (PREDICT_FALSE (n_sent < 0))
 	{
@@ -197,8 +196,6 @@ static_always_inline
 					 xd->hw_if_index)->tx_node_index;
 
 	  vlib_error_count (vm, node_index, DPDK_TX_FUNC_ERROR_BAD_RETVAL, 1);
-	  clib_warning ("rte_eth_tx_burst[%d]: error %d",
-			xd->port_id, n_sent);
 	  return n_left;	// untransmitted packets
 	}
       n_left -= n_sent;
@@ -209,7 +206,7 @@ static_always_inline
   return n_left;
 }
 
-static_always_inline void
+static_always_inline __clib_unused void
 dpdk_prefetch_buffer (vlib_main_t * vm, struct rte_mbuf *mb)
 {
   vlib_buffer_t *b = vlib_buffer_from_rte_mbuf (mb);
@@ -587,6 +584,116 @@ done:
   return err;
 }
 
+static clib_error_t *
+dpdk_interface_set_rss_queues (struct vnet_main_t *vnm,
+			       struct vnet_hw_interface_t *hi,
+			       clib_bitmap_t * bitmap)
+{
+  dpdk_main_t *xm = &dpdk_main;
+  u32 hw_if_index = hi->hw_if_index;
+  vnet_hw_interface_t *hw = vnet_get_hw_interface (vnm, hw_if_index);
+  dpdk_device_t *xd = vec_elt_at_index (xm->devices, hw->dev_instance);
+  clib_error_t *err = 0;
+  struct rte_eth_rss_reta_entry64 *reta_conf = NULL;
+  struct rte_eth_dev_info dev_info;
+  u16 *reta = NULL;
+  u16 *valid_queue = NULL;
+  u16 valid_queue_count = 0;
+  uint32_t i, j;
+  uint32_t ret;
+
+  rte_eth_dev_info_get (xd->port_id, &dev_info);
+
+  /* parameter check */
+  if (clib_bitmap_count_set_bits (bitmap) == 0)
+    {
+      err = clib_error_return (0, "must assign at least one valid rss queue");
+      goto done;
+    }
+
+  if (clib_bitmap_count_set_bits (bitmap) > dev_info.nb_rx_queues)
+    {
+      err = clib_error_return (0, "too many rss queues");
+      goto done;
+    }
+
+  /* new RETA */
+  reta = clib_mem_alloc (dev_info.reta_size * sizeof (*reta));
+  if (reta == NULL)
+    {
+      err = clib_error_return (0, "clib_mem_alloc failed");
+      goto done;
+    }
+
+  clib_memset (reta, 0, dev_info.reta_size * sizeof (*reta));
+
+  valid_queue_count = 0;
+  /* *INDENT-OFF* */
+  clib_bitmap_foreach (i, bitmap, ({
+    if (i >= dev_info.nb_rx_queues)
+      {
+        err = clib_error_return (0, "illegal queue number");
+        goto done;
+      }
+    reta[valid_queue_count++] = i;
+  }));
+  /* *INDENT-ON* */
+
+  /* check valid_queue_count not zero, make coverity happy */
+  if (valid_queue_count == 0)
+    {
+      err = clib_error_return (0, "must assign at least one valid rss queue");
+      goto done;
+    }
+
+  valid_queue = reta;
+  for (i = valid_queue_count, j = 0; i < dev_info.reta_size; i++, j++)
+    {
+      j = j % valid_queue_count;
+      reta[i] = valid_queue[j];
+    }
+
+  /* update reta table */
+  reta_conf =
+    (struct rte_eth_rss_reta_entry64 *) clib_mem_alloc (dev_info.reta_size /
+							RTE_RETA_GROUP_SIZE *
+							sizeof (*reta_conf));
+  if (reta_conf == NULL)
+    {
+      err = clib_error_return (0, "clib_mem_alloc failed");
+      goto done;
+    }
+
+  clib_memset (reta_conf, 0,
+	       dev_info.reta_size / RTE_RETA_GROUP_SIZE *
+	       sizeof (*reta_conf));
+
+  for (i = 0; i < dev_info.reta_size; i++)
+    {
+      uint32_t reta_id = i / RTE_RETA_GROUP_SIZE;
+      uint32_t reta_pos = i % RTE_RETA_GROUP_SIZE;
+
+      reta_conf[reta_id].mask = UINT64_MAX;
+      reta_conf[reta_id].reta[reta_pos] = reta[i];
+    }
+
+  ret =
+    rte_eth_dev_rss_reta_update (xd->port_id, reta_conf, dev_info.reta_size);
+  if (ret)
+    {
+      err = clib_error_return (0, "rte_eth_dev_rss_reta_update err %d", ret);
+      goto done;
+    }
+
+done:
+  if (reta)
+    clib_mem_free (reta);
+  if (reta_conf)
+    clib_mem_free (reta_conf);
+
+  return err;
+}
+
 /* *INDENT-OFF* */
 VNET_DEVICE_CLASS (dpdk_device_class) = {
   .name = "dpdk",
@@ -600,8 +707,10 @@ VNET_DEVICE_CLASS (dpdk_device_class) = {
   .subif_add_del_function = dpdk_subif_add_del_function,
   .rx_redirect_to_node = dpdk_set_interface_next_node,
   .mac_addr_change_function = dpdk_set_mac_address,
+  .mac_addr_add_del_function = dpdk_add_del_mac_address,
   .format_flow = format_dpdk_flow,
   .flow_ops_function = dpdk_flow_ops_fn,
+  .set_rss_queues_function = dpdk_interface_set_rss_queues,
 };
 /* *INDENT-ON* */
 

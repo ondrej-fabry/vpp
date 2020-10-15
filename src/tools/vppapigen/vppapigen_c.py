@@ -117,7 +117,7 @@ format_strings = {'u8': '%u',
                   'u32': '%u',
                   'i32': '%ld',
                   'u64': '%llu',
-                  'i64': '%llu',
+                  'i64': '%lld',
                   'f64': '%.2f'}
 
 noprint_fields = {'_vl_msg_id': None,
@@ -136,10 +136,9 @@ class Printfun():
         if o.modern_vla:
             write('    if (vl_api_string_len(&a->{f}) > 0) {{\n'
                   .format(f=o.fieldname))
-            write('        s = format(s, "\\n%U{f}: %.*s", '
+            write('        s = format(s, "\\n%U{f}: %U", '
                   'format_white_space, indent, '
-                  'vl_api_string_len(&a->{f}) - 1, '
-                  'vl_api_from_api_string(&a->{f}));\n'.format(f=o.fieldname))
+                  'vl_api_format_string, (&a->{f}));\n'.format(f=o.fieldname))
             write('    } else {\n')
             write('        s = format(s, "\\n%U{f}:", '
                   'format_white_space, indent);\n'.format(f=o.fieldname))
@@ -359,10 +358,10 @@ endian_strings = {
     'u16': 'clib_net_to_host_u16',
     'u32': 'clib_net_to_host_u32',
     'u64': 'clib_net_to_host_u64',
-    'i16': 'clib_net_to_host_u16',
-    'i32': 'clib_net_to_host_u32',
-    'i64': 'clib_net_to_host_u64',
-    'f64': 'clib_net_to_host_u64',
+    'i16': 'clib_net_to_host_i16',
+    'i32': 'clib_net_to_host_i32',
+    'i64': 'clib_net_to_host_i64',
+    'f64': 'clib_net_to_host_f64',
 }
 
 
@@ -395,6 +394,7 @@ def endianfun_array(o):
                                name=o.fieldname))
     return output
 
+no_endian_conversion = {'client_index': None}
 
 def endianfun_obj(o):
     output = ''
@@ -403,6 +403,9 @@ def endianfun_obj(o):
     elif o.type != 'Field':
         output += ('    s = format(s, "\\n{} {} {} (print not implemented");\n'
                    .format(o.type, o.fieldtype, o.fieldname))
+        return output
+    if o.fieldname in no_endian_conversion:
+        output += '    /* a->{n} = a->{n} (no-op) */\n'.format(n=o.fieldname)
         return output
     if o.fieldtype in endian_strings:
         output += ('    a->{name} = {format}(a->{name});\n'
@@ -458,7 +461,6 @@ static inline void vl_api_{name}_t_endian (vl_api_{name}_t *a)
             output += "/***** manual: vl_api_%s_t_endian  *****/\n\n" % t.name
             continue
 
-
         if t.__class__.__name__ == 'Using':
             output += signature.format(name=t.name)
             if ('length' in t.alias and t.alias['length'] and
@@ -510,8 +512,25 @@ def generate_include_enum(s, module, stream):
         write('typedef enum {\n')
         for t in s['Define']:
             write('   VL_API_{},\n'.format(t.name.upper()))
-        write('   VL_MSG_FIRST_AVAILABLE\n')
+        write('   VL_MSG_{}_LAST\n'.format(module.upper()))
         write('}} vl_api_{}_enum_t;\n'.format(module))
+
+
+def generate_include_counters(s, module, stream):
+    write = stream.write
+
+    for counters in s:
+        csetname = counters.name
+        write('typedef enum {\n')
+        for c in counters.block:
+            write('   {}_ERROR_{},\n'
+                  .format(csetname.upper(), c['name'].upper()))
+        write('   {}_N_ERROR\n'.format(csetname.upper()))
+        write('}} vl_counter_{}_enum_t;\n'.format(csetname))
+
+        # write('extern char *{}_error_strings[];\n'.format(csetname))
+        # write('extern char *{}_description_strings[];\n'.format(csetname))
+        write('extern vl_counter_t {}_error_counters[];\n'.format(csetname))
 
 #
 # Generate separate API _types file.
@@ -521,6 +540,13 @@ def generate_include_types(s, module, stream):
 
     write('#ifndef included_{module}_api_types_h\n'.format(module=module))
     write('#define included_{module}_api_types_h\n'.format(module=module))
+
+    if 'version' in s['Option']:
+        v = s['Option']['version']
+        (major, minor, patch) = v.split('.')
+        write('#define VL_API_{m}_API_VERSION_MAJOR {v}\n'.format(m=module.upper(), v=major))
+        write('#define VL_API_{m}_API_VERSION_MINOR {v}\n'.format(m=module.upper(), v=minor))
+        write('#define VL_API_{m}_API_VERSION_PATCH {v}\n'.format(m=module.upper(), v=patch))
 
     if len(s['Import']):
         write('/* Imported API files */\n')
@@ -586,11 +612,17 @@ def generate_include_types(s, module, stream):
 
             write('} vl_api_%s_t;\n' % o.name)
 
+    for t in s['Define']:
+        write('#define VL_API_{ID}_CRC "{n}_{crc:08x}"\n'
+              .format(n=t.name, ID=t.name.upper(), crc=t.crc))
+
     write("\n#endif\n")
 
 
-def generate_c_boilerplate(services, defines, file_crc, module, stream):
+def generate_c_boilerplate(services, defines, counters, file_crc,
+                           module, stream):
     write = stream.write
+    define_hash = {d.name: d for d in defines}
 
     hdr = '''\
 #define vl_endianfun		/* define message structures */
@@ -608,9 +640,10 @@ def generate_c_boilerplate(services, defines, file_crc, module, stream):
     write(hdr.format(module=module))
     write('static u16\n')
     write('setup_message_id_table (void) {\n')
-    write('   api_main_t *am = &api_main;\n')
-    write('   u16 msg_id_base = vl_msg_api_get_msg_ids ("{}_{crc:08x}", VL_MSG_FIRST_AVAILABLE);\n'
-          .format(module, crc=file_crc))
+    write('   api_main_t *am = my_api_main;\n')
+    write('   vl_msg_api_msg_config_t c;\n')
+    write('   u16 msg_id_base = vl_msg_api_get_msg_ids ("{}_{crc:08x}", VL_MSG_{m}_LAST);\n'
+          .format(module, crc=file_crc, m=module.upper()))
 
 
     for d in defines:
@@ -618,17 +651,59 @@ def generate_c_boilerplate(services, defines, file_crc, module, stream):
               '                                VL_API_{ID} + msg_id_base);\n'
               .format(n=d.name, ID=d.name.upper(), crc=d.crc))
     for s in services:
-        write('   vl_msg_api_set_handlers(VL_API_{ID} + msg_id_base, "{n}",\n'
-              '                           vl_api_{n}_t_handler, vl_noop_handler,\n'
-              '                           vl_api_{n}_t_endian, vl_api_{n}_t_print,\n'
-              '                           sizeof(vl_api_{n}_t), 1);\n'
+        d = define_hash[s.caller]
+        write('   c = (vl_msg_api_msg_config_t) {{.id = VL_API_{ID} + msg_id_base,\n'
+              '                                  .name = "{n}",\n'
+              '                                  .handler = vl_api_{n}_t_handler,\n'
+              '                                  .cleanup = vl_noop_handler,\n'
+              '                                  .endian = vl_api_{n}_t_endian,\n'
+              '                                  .print = vl_api_{n}_t_print,\n'
+              '                                  .is_autoendian = 0}};\n'
               .format(n=s.caller, ID=s.caller.upper()))
+        write('   vl_msg_api_config (&c);\n')
+        try:
+            d = define_hash[s.reply]
+            write('   c = (vl_msg_api_msg_config_t) {{.id = VL_API_{ID} + msg_id_base,\n'
+                  '                                  .name = "{n}",\n'
+                  '                                  .handler = 0,\n'
+                  '                                  .cleanup = vl_noop_handler,\n'
+                  '                                  .endian = vl_api_{n}_t_endian,\n'
+                  '                                  .print = vl_api_{n}_t_print,\n'
+                  '                                  .is_autoendian = 0}};\n'
+                  .format(n=s.reply, ID=s.reply.upper()))
+            write('   vl_msg_api_config (&c);\n')
+        except KeyError:
+            pass
 
     write('   return msg_id_base;\n')
     write('}\n')
 
+    severity = {'error': 'VL_COUNTER_SEVERITY_ERROR',
+                'info': 'VL_COUNTER_SEVERITY_INFO',
+                'warn': 'VL_COUNTER_SEVERITY_WARN'}
 
-def generate_c_test_plugin_boilerplate(services, defines, file_crc, module, stream):
+    for cnt in counters:
+        csetname = cnt.name
+        '''
+        write('char *{}_error_strings[] = {{\n'.format(csetname))
+        for c in cnt.block:
+            write('   "{}",\n'.format(c['name']))
+        write('};\n')
+        write('char *{}_description_strings[] = {{\n'.format(csetname))
+        for c in cnt.block:
+            write('   "{}",\n'.format(c['description']))
+        write('};\n')
+        '''
+        write('vl_counter_t {}_error_counters[] = {{\n'.format(csetname))
+        for c in cnt.block:
+            write('  {\n')
+            write('   .name = "{}",\n'.format(c['name']))
+            write('   .desc = "{}",\n'.format(c['description']))
+            write('   .severity = {},\n'.format(severity[c['severity']]))
+            write('  },\n')
+        write('};\n')
+
+def generate_c_test_boilerplate(services, defines, file_crc, module, plugin, stream):
     write = stream.write
 
     define_hash = {d.name:d for d in defines}
@@ -654,13 +729,14 @@ def generate_c_test_plugin_boilerplate(services, defines, file_crc, module, stre
         except:
             continue
         if d.manual_print:
-            write('/* Manual definition requested for: vl_api_{n}_t_hander() */\n'
+            write('/* Manual definition requested for: vl_api_{n}_t_handler() */\n'
                   .format(n=s.reply))
             continue
         if not define_hash[s.caller].autoreply:
-            write('/* Only autoreply is supported (vl_api_{n}_t_hander()) */\n'
+            write('/* Only autoreply is supported (vl_api_{n}_t_handler()) */\n'
                   .format(n=s.reply))
             continue
+        write('#ifndef VL_API_{n}_T_HANDLER\n'.format(n=s.reply.upper()))
         write('static void\n')
         write('vl_api_{n}_t_handler (vl_api_{n}_t * mp) {{\n'.format(n=s.reply))
         write('   vat_main_t * vam = {}_test_main.vat_main;\n'.format(module))
@@ -672,6 +748,16 @@ def generate_c_test_plugin_boilerplate(services, defines, file_crc, module, stre
         write('      vam->result_ready = 1;\n')
         write('   }\n')
         write('}\n')
+        write('#endif\n')
+
+        for e in s.events:
+            if define_hash[e].manual_print:
+                continue
+            write('static void\n')
+            write('vl_api_{n}_t_handler (vl_api_{n}_t * mp) {{\n'.format(n=e))
+            write('    vl_print(0, "{n} event called:");\n'.format(n=e))
+            write('    vl_api_{n}_t_print(mp, 0);\n'.format(n=e))
+            write('}\n')
 
     write('static void\n')
     write('setup_message_id_table (vat_main_t * vam, u16 msg_id_base) {\n')
@@ -688,9 +774,19 @@ def generate_c_test_plugin_boilerplate(services, defines, file_crc, module, stre
         except:
             pass
 
-    write('}\n')
+        # Events
+        for e in s.events:
+            write('   vl_msg_api_set_handlers(VL_API_{ID} + msg_id_base, "{n}",\n'
+                  '                           vl_api_{n}_t_handler, vl_noop_handler,\n'
+                  '                           vl_api_{n}_t_endian, vl_api_{n}_t_print,\n'
+                  '                           sizeof(vl_api_{n}_t), 1);\n'
+                  .format(n=e, ID=e.upper()))
 
-    write('clib_error_t * vat_plugin_register (vat_main_t *vam)\n')
+    write('}\n')
+    if plugin:
+        write('clib_error_t * vat_plugin_register (vat_main_t *vam)\n')
+    else:
+        write('clib_error_t * vat_{}_plugin_register (vat_main_t *vam)\n'.format(module))
     write('{\n')
     write('   {n}_test_main_t * mainp = &{n}_test_main;\n'.format(n=module))
     write('   mainp->vat_main = vam;\n')
@@ -699,9 +795,11 @@ def generate_c_test_plugin_boilerplate(services, defines, file_crc, module, stre
     write('   if (mainp->msg_id_base == (u16) ~0)\n')
     write('      return clib_error_return (0, "{} plugin not loaded...");\n'.format(module))
     write('   setup_message_id_table (vam, mainp->msg_id_base);\n')
+    write('#ifdef VL_API_LOCAL_SETUP_MESSAGE_ID_TABLE\n')
+    write('    VL_API_LOCAL_SETUP_MESSAGE_ID_TABLE(vam);\n')
+    write('#endif\n')
     write('   return 0;\n')
     write('}\n')
-
 
 #
 # Plugin entry point
@@ -731,7 +829,11 @@ def run(args, input_filename, s):
 
     # Generate separate enum file
     st = StringIO()
+    st.write('#ifndef included_{}_api_enum_h\n'.format(modulename))
+    st.write('#define included_{}_api_enum_h\n'.format(modulename))
     generate_include_enum(s, modulename, st)
+    generate_include_counters(s['Counters'], modulename, st)
+    st.write('#endif\n')
     with open (filename_enum, 'w') as fd:
         st.seek (0)
         shutil.copyfileobj (st, fd)
@@ -739,18 +841,18 @@ def run(args, input_filename, s):
 
     # Generate separate C file
     st = StringIO()
-    generate_c_boilerplate(s['Service'], s['Define'], s['file_crc'],
-                           modulename, st)
+    generate_c_boilerplate(s['Service'], s['Define'], s['Counters'],
+                           s['file_crc'], modulename, st)
     with open (filename_c, 'w') as fd:
         st.seek (0)
         shutil.copyfileobj(st, fd)
     st.close()
 
     # Generate separate C test file
-    # This is only supported for plugins at the moment
     st = StringIO()
-    generate_c_test_plugin_boilerplate(s['Service'], s['Define'], s['file_crc'],
-                                       modulename, st)
+    plugin = True if 'plugin' in input_filename else False
+    generate_c_test_boilerplate(s['Service'], s['Define'], s['file_crc'],
+                                modulename, plugin, st)
     with open (filename_c_test, 'w') as fd:
         st.seek (0)
         shutil.copyfileobj(st, fd)

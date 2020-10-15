@@ -16,14 +16,14 @@
 /** \file
 
     This file defines vpe control-plane API messages which are generally
-    called through a shared memory interface. 
+    called through a shared memory interface.
 */
 
-option version = "1.6.0";
+option version = "1.6.1";
 
 import "vpp/api/vpe_types.api";
 
-/* 
+/*
  * Note: API placement cleanup in progress
  * If you're looking for interface APIs, please
  * see .../src/vnet/{interface.api,interface_api.c}
@@ -32,7 +32,6 @@ import "vpp/api/vpe_types.api";
  * GENEVE APIs: see .../src/vnet/geneve/{geneve.api, geneve_api.c}
  * LLDP APIs: see .../src/vnet/lldp/{lldp.api, lldp_api.c}
  * AF-PACKET APIs: see ... /vnet/devices/af_packet/{af_packet.api, af_packet_api.c}
- * NETMAP APIs: see ... /src/vnet/devices/netmap/{netmap.api, netmap_api.c}
  * VHOST-USER APIs: see .../vnet/devices/virtio/{vhost_user.api, vhost_user_api.c}
  * VXLAN GPE APIs: see .../src/vnet/vxlan-gpe/{vxlan_gpe.api, vxlan_gpe_api.c}
  * GRE APIs: see .../src/vnet/gre/{gre.api, gre_api.c}
@@ -50,7 +49,8 @@ import "vpp/api/vpe_types.api";
  * DHCP APIs: see ... /src/vnet/dhcp/{dhcp.api, dhcp_api.c}
  * COP APIs: see ... /src/vnet/cop/{cop.api, cop_api.c}
  * POLICER APIs: see ... /src/vnet/policer/{policer.api, policer_api.c}
- * BIER APIs: see ... /src/vnet/policer/{bier.api, bier_api.c}
+ * BIER APIs: see ... /src/vnet/policer/{bier.api, bier_api.c}.
+ * flow APIs: see .../vnet/vnet/flow/{flow.api, flow_api.c}
  */
 
 /** \brief Control ping from client to api server request
@@ -122,7 +122,7 @@ define get_node_index
 {
   u32 client_index;
   u32 context;
-  u8 node_name[64];
+  string node_name[64];
 };
 
 /** \brief Get node index using name request
@@ -147,8 +147,8 @@ define add_node_next
 {
   u32 client_index;
   u32 context;
-  u8 node_name[64];
-  u8 next_name[64];
+  string node_name[64];
+  string next_name[64];
 };
 
 /** \brief IP Set the next node for a given node response
@@ -216,8 +216,8 @@ define show_threads
 typedef thread_data
 {
   u32 id;
-  u8 name[64];
-  u8 type[64];
+  string name[64];
+  string type[64];
   u32 pid;
   u32 cpu_id;
   u32 core;
@@ -269,8 +269,8 @@ define get_next_index
 {
   u32 client_index;
   u32 context;
-  u8 node_name[64];
-  u8 next_name[64];
+  string node_name[64];
+  string next_name[64];
 };
 
 /** \brief Reply for get next node index

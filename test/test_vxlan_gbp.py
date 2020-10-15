@@ -1,16 +1,16 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import socket
 from util import ip4_range, reassemble4_ether
 import unittest
 from framework import VppTestCase, VppTestRunner
 from template_bd import BridgeDomain
-from vpp_ip import VppIpAddress
 
-from scapy.layers.l2 import Ether, Raw
+from scapy.layers.l2 import Ether
+from scapy.packet import Raw
 from scapy.layers.inet import IP, UDP
 from scapy.layers.vxlan import VXLAN
-from scapy.utils import atol
+
 from vpp_ip_route import VppIpRoute, VppRoutePath
 from vpp_ip import INVALID_INDEX
 
@@ -24,7 +24,7 @@ class TestVxlanGbp(VppTestCase):
         return (Ether(src='00:00:00:00:00:01', dst='00:00:00:00:00:02') /
                 IP(src='1.2.3.4', dst='4.3.2.1') /
                 UDP(sport=10000, dport=20000) /
-                Raw('\xa5' * 100))
+                Raw(b'\xa5' * 100))
 
     @property
     def frame_reply(self):
@@ -32,7 +32,7 @@ class TestVxlanGbp(VppTestCase):
         return (Ether(src='00:00:00:00:00:02', dst='00:00:00:00:00:01') /
                 IP(src='4.3.2.1', dst='1.2.3.4') /
                 UDP(sport=20000, dport=10000) /
-                Raw('\xa5' * 100))
+                Raw(b'\xa5' * 100))
 
     def encapsulate(self, pkt, vni):
         """
@@ -80,7 +80,8 @@ class TestVxlanGbp(VppTestCase):
         # Verify UDP destination port is VXLAN GBP 48879, source UDP port could
         # be arbitrary.
         self.assertEqual(pkt[UDP].dport, type(self).dport)
-        # TODO: checksum check
+        # Verify UDP checksum
+        self.assert_udp_checksum_valid(pkt)
         # Verify VNI
         # pkt.show()
         self.assertEqual(pkt[VXLAN].vni, vni)
@@ -96,7 +97,7 @@ class TestVxlanGbp(VppTestCase):
         for dest_ip4 in ip4_range(cls.pg0.remote_ip4,
                                   ip_range_start,
                                   ip_range_end):
-            # add host route so dest_ip4n will not be resolved
+            # add host route so dest_ip4 will not be resolved
             rip = VppIpRoute(cls, dest_ip4, 32,
                              [VppRoutePath(next_hop_address,
                                            INVALID_INDEX)],
@@ -104,8 +105,8 @@ class TestVxlanGbp(VppTestCase):
             rip.add_vpp_config()
             r = cls.vapi.vxlan_gbp_tunnel_add_del(
                 tunnel={
-                    'src': VppIpAddress(cls.pg0.local_ip4).encode(),
-                    'dst': VppIpAddress(dest_ip4).encode(),
+                    'src': cls.pg0.local_ip4,
+                    'dst': dest_ip4,
                     'vni': vni,
                     'instance': INVALID_INDEX,
                     'mcast_sw_if_index': INVALID_INDEX,
@@ -145,11 +146,12 @@ class TestVxlanGbp(VppTestCase):
             # Create VXLAN GBP VTEP on VPP pg0, and put vxlan_gbp_tunnel0 and
             # pg1 into BD.
             cls.single_tunnel_bd = 1
+            cls.single_tunnel_vni = 0xabcde
             r = cls.vapi.vxlan_gbp_tunnel_add_del(
                 tunnel={
-                    'src': VppIpAddress(cls.pg0.local_ip4).encode(),
-                    'dst': VppIpAddress(cls.pg0.remote_ip4).encode(),
-                    'vni': cls.single_tunnel_bd,
+                    'src': cls.pg0.local_ip4,
+                    'dst': cls.pg0.remote_ip4,
+                    'vni': cls.single_tunnel_vni,
                     'instance': INVALID_INDEX,
                     'mcast_sw_if_index': INVALID_INDEX,
                     'mode': 1,
@@ -197,7 +199,7 @@ class TestVxlanGbp(VppTestCase):
         Verify receipt of decapsulated frames on pg1
         """
         encapsulated_pkt = self.encapsulate(self.frame_request,
-                                            self.single_tunnel_bd)
+                                            self.single_tunnel_vni)
 
         self.pg0.add_stream([encapsulated_pkt, ])
 
@@ -225,7 +227,7 @@ class TestVxlanGbp(VppTestCase):
         # Pick first received frame and check if it's correctly encapsulated.
         out = self.pg0.get_capture(1)
         pkt = out[0]
-        self.check_encapsulation(pkt, self.single_tunnel_bd)
+        self.check_encapsulation(pkt, self.single_tunnel_vni)
 
         payload = self.decapsulate(pkt)
         self.assert_eq_pkts(payload, self.frame_reply)
@@ -258,7 +260,7 @@ class TestVxlanGbp(VppTestCase):
         frame = (Ether(src='00:00:00:00:00:02', dst='00:00:00:00:00:01') /
                  IP(src='4.3.2.1', dst='1.2.3.4') /
                  UDP(sport=20000, dport=10000) /
-                 Raw('\xa5' * 1450))
+                 Raw(b'\xa5' * 1450))
 
         self.pg1.add_stream([frame])
 
@@ -269,7 +271,7 @@ class TestVxlanGbp(VppTestCase):
         # Pick first received frame and check if it's correctly encapsulated.
         out = self.pg0.get_capture(2)
         pkt = reassemble4_ether(out)
-        self.check_encapsulation(pkt, self.single_tunnel_bd)
+        self.check_encapsulation(pkt, self.single_tunnel_vni)
 
         payload = self.decapsulate(pkt)
         self.assert_eq_pkts(payload, frame)

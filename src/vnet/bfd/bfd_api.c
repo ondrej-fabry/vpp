@@ -225,7 +225,8 @@ vl_api_bfd_udp_session_set_flags_t_handler (vl_api_bfd_udp_session_set_flags_t
 
   BFD_UDP_API_PARAM_COMMON_CODE;
 
-  rv = bfd_udp_session_set_flags (BFD_UDP_API_PARAM_FROM_MP (mp),
+  rv = bfd_udp_session_set_flags (vlib_get_main (),
+				  BFD_UDP_API_PARAM_FROM_MP (mp),
 				  clib_net_to_host_u32 (mp->flags) &
 				  IF_STATUS_API_FLAG_ADMIN_UP);
 
@@ -415,7 +416,7 @@ setup_message_id_table (api_main_t * am)
 static clib_error_t *
 bfd_api_hookup (vlib_main_t * vm)
 {
-  api_main_t *am = &api_main;
+  api_main_t *am = vlibapi_get_main ();
 
 #define _(N, n)                                                    \
   vl_msg_api_set_handlers (VL_API_##N, #n, vl_api_##n##_t_handler, \

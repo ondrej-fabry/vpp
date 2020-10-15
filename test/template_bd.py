@@ -1,9 +1,10 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import abc
 import six
 
-from scapy.layers.l2 import Ether, Raw
+from scapy.layers.l2 import Ether
+from scapy.packet import Raw
 from scapy.layers.inet import IP, UDP
 
 from util import ip4_range
@@ -73,7 +74,7 @@ class BridgeDomain(object):
         """
 
         encapsulated_pkt = self.encapsulate(self.frame_request,
-                                            self.single_tunnel_bd)
+                                            self.single_tunnel_vni)
 
         self.pg0.add_stream([encapsulated_pkt, ])
 
@@ -101,7 +102,7 @@ class BridgeDomain(object):
         # Pick first received frame and check if it's correctly encapsulated.
         out = self.pg0.get_capture(1)
         pkt = out[0]
-        self.check_encapsulation(pkt, self.single_tunnel_bd)
+        self.check_encapsulation(pkt, self.single_tunnel_vni)
 
         payload = self.decapsulate(pkt)
         self.assert_eq_pkts(payload, self.frame_reply)

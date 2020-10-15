@@ -29,6 +29,10 @@ add_vpp_executable(vpp_api_test ENABLE_EXPORTS
   plugin.c
   json_format.c
   types.c
+  ip_types_api.c
+  ip_types.c
+  protocols.def
+  ../vnet/arp/arp_test.c
 
   DEPENDS api_headers
 
@@ -65,4 +69,3 @@ add_vpp_executable(vpp_restart
   SOURCES restart.c
   LINK_LIBRARIES svm svmdb vppinfra Threads::Threads rt
 )
-

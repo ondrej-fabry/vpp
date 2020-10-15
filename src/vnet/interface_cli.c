@@ -52,6 +52,7 @@
 #include <vnet/fib/ip6_fib.h>
 #include <vnet/l2/l2_output.h>
 #include <vnet/l2/l2_input.h>
+#include <vnet/classify/vnet_classify.h>
 
 static int
 compare_interface_names (void *a1, void *a2)
@@ -65,16 +66,15 @@ compare_interface_names (void *a1, void *a2)
 static clib_error_t *
 show_or_clear_hw_interfaces (vlib_main_t * vm,
 			     unformat_input_t * input,
-			     vlib_cli_command_t * cmd)
+			     vlib_cli_command_t * cmd, int is_show)
 {
   clib_error_t *error = 0;
   vnet_main_t *vnm = vnet_get_main ();
   vnet_interface_main_t *im = &vnm->interface_main;
   vnet_hw_interface_t *hi;
   u32 hw_if_index, *hw_if_indices = 0;
-  int i, verbose = -1, is_show, show_bond = 0;
+  int i, verbose = -1, show_bond = 0;
 
-  is_show = strstr (cmd->path, "show") != 0;
   while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
     {
       /* See if user wants to show a specific interface. */
@@ -168,6 +168,21 @@ done:
   return error;
 }
 
+static clib_error_t *
+show_hw_interfaces (vlib_main_t * vm,
+		    unformat_input_t * input, vlib_cli_command_t * cmd)
+{
+  return show_or_clear_hw_interfaces (vm, input, cmd, 1 /* is_show */ );
+}
+
+static clib_error_t *
+clear_hw_interfaces (vlib_main_t * vm,
+		     unformat_input_t * input, vlib_cli_command_t * cmd)
+{
+  return show_or_clear_hw_interfaces (vm, input, cmd, 0 /* is_show */ );
+}
+
+
 /*?
  * Display more detailed information about all or a list of given interfaces.
  * The verboseness of the output can be controlled by the following optional
@@ -229,7 +244,7 @@ VLIB_CLI_COMMAND (show_hw_interfaces_command, static) = {
   .path = "show hardware-interfaces",
   .short_help = "show hardware-interfaces [brief|verbose|detail] [bond] "
     "[<interface> [<interface> [..]]] [<sw_idx> [<sw_idx> [..]]]",
-  .function = show_or_clear_hw_interfaces,
+  .function = show_hw_interfaces,
 };
 /* *INDENT-ON* */
 
@@ -250,7 +265,7 @@ VLIB_CLI_COMMAND (clear_hw_interface_counters_command, static) = {
   .path = "clear hardware-interfaces",
   .short_help = "clear hardware-interfaces "
     "[<interface> [<interface> [..]]] [<sw_idx> [<sw_idx> [..]]]",
-  .function = show_or_clear_hw_interfaces,
+  .function = clear_hw_interfaces,
 };
 /* *INDENT-ON* */
 
@@ -277,6 +292,7 @@ show_sw_interfaces (vlib_main_t * vm,
   u8 show_addresses = 0;
   u8 show_features = 0;
   u8 show_tag = 0;
+  u8 show_vtr = 0;
   int verbose = 0;
 
   /*
@@ -300,6 +316,8 @@ show_sw_interfaces (vlib_main_t * vm,
 	    show_features = 1;
 	  else if (unformat (linput, "tag"))
 	    show_tag = 1;
+	  else if (unformat (linput, "vtr"))
+	    show_vtr = 1;
 	  else if (unformat (linput, "verbose"))
 	    verbose = 1;
 	  else
@@ -312,7 +330,7 @@ show_sw_interfaces (vlib_main_t * vm,
 	}
       unformat_free (linput);
     }
-  if (show_features || show_tag)
+  if (show_features || show_tag || show_vtr)
     {
       if (sw_if_index == ~(u32) 0)
 	{
@@ -324,14 +342,7 @@ show_sw_interfaces (vlib_main_t * vm,
   if (show_features)
     {
       vnet_interface_features_show (vm, sw_if_index, verbose);
-
-      l2_input_config_t *l2_input = l2input_intf_config (sw_if_index);
-      u32 fb = l2_input->feature_bitmap;
-      /* intf input features are masked by bridge domain */
-      if (l2_input->bridge)
-	fb &= l2input_bd_config (l2_input->bd_index)->feature_bitmap;
-      vlib_cli_output (vm, "\nl2-input:\n%U", format_l2_input_features, fb,
-		       1);
+      vlib_cli_output (vm, "%U", format_l2_input_features, sw_if_index, 1);
 
       l2_output_config_t *l2_output = l2output_intf_config (sw_if_index);
       vlib_cli_output (vm, "\nl2-output:");
@@ -350,6 +361,27 @@ show_sw_interfaces (vlib_main_t * vm,
 		       format_vnet_sw_if_index_name, vnm, sw_if_index,
 		       tag ? (char *) tag : "(none)");
       vec_free (sorted_sis);
+      return 0;
+    }
+
+  /*
+   * Show vlan tag rewrite data for one interface.
+   */
+  if (show_vtr)
+    {
+      u32 vtr_op = L2_VTR_DISABLED;
+      u32 push_dot1q = 0, tag1 = 0, tag2 = 0;
+
+      if (l2vtr_get (vm, vnm, sw_if_index,
+		     &vtr_op, &push_dot1q, &tag1, &tag2) != 0)
+	{
+	  vlib_cli_output (vm, "%U: Problem getting vlan tag-rewrite data",
+			   format_vnet_sw_if_index_name, vnm, sw_if_index);
+	  return 0;
+	}
+      vlib_cli_output (vm, "%U:  VTR %0U",
+		       format_vnet_sw_if_index_name, vnm, sw_if_index,
+		       format_vtr, vtr_op, push_dot1q, tag1, tag2);
       return 0;
     }
 
@@ -409,19 +441,7 @@ show_sw_interfaces (vlib_main_t * vm,
 	     (si->flags & VNET_SW_INTERFACE_FLAG_ADMIN_UP) ? "up" : "dn");
 
 	/* Display any L2 info */
-	l2_input_config_t *l2_input = l2input_intf_config (si->sw_if_index);
-	if (l2_input->bridge)
-	  {
-	    bd_main_t *bdm = &bd_main;
-	    u32 bd_id = l2input_main.bd_configs[l2_input->bd_index].bd_id;
-	    vlib_cli_output (vm, "  L2 bridge bd-id %d idx %d shg %d %s",
-			     bd_id, bd_find_index (bdm, bd_id), l2_input->shg,
-			     l2_input->bvi ? "bvi" : " ");
-	  }
-	else if (l2_input->xconnect)
-	  vlib_cli_output (vm, "  L2 xconnect %U",
-			   format_vnet_sw_if_index_name, vnm,
-			   l2_input->output_sw_if_index);
+	vlib_cli_output (vm, "%U", format_l2_input, si->sw_if_index);
 
 	/* *INDENT-OFF* */
 	/* Display any IP4 addressing info */
@@ -474,7 +494,7 @@ done:
 /* *INDENT-OFF* */
 VLIB_CLI_COMMAND (show_sw_interfaces_command, static) = {
   .path = "show interface",
-  .short_help = "show interface [address|addr|features|feat] [<interface> [<interface> [..]]] [verbose]",
+  .short_help = "show interface [address|addr|features|feat|vtr] [<interface> [<interface> [..]]] [verbose]",
   .function = show_sw_interfaces,
   .is_mp_safe = 1,
 };
@@ -757,9 +777,6 @@ create_sub_interfaces (vlib_main_t * vm,
 	  continue;
 	}
 
-      kp = clib_mem_alloc (sizeof (*kp));
-      *kp = sup_and_sub_key;
-
       template.type = VNET_SW_INTERFACE_TYPE_SUB;
       template.flood_class = VNET_FLOOD_CLASS_NORMAL;
       template.sup_sw_if_index = hi->sw_if_index;
@@ -770,6 +787,9 @@ create_sub_interfaces (vlib_main_t * vm,
       error = vnet_create_sw_interface (vnm, &template, &sw_if_index);
       if (error)
 	goto done;
+
+      kp = clib_mem_alloc (sizeof (*kp));
+      *kp = sup_and_sub_key;
 
       hash_set (hi->sub_interface_sw_if_index_by_id, id, sw_if_index);
       hash_set_mem (im->sw_if_index_by_sup_and_sub, kp, sw_if_index);
@@ -1165,6 +1185,158 @@ VLIB_CLI_COMMAND (set_interface_mtu_cmd, static) = {
 /* *INDENT-ON* */
 
 static clib_error_t *
+show_interface_sec_mac_addr_fn (vlib_main_t * vm, unformat_input_t * input,
+				vlib_cli_command_t * cmd)
+{
+  vnet_main_t *vnm = vnet_get_main ();
+  vnet_interface_main_t *im = &vnm->interface_main;
+  ethernet_main_t *em = &ethernet_main;
+  u32 sw_if_index = ~0;
+  vnet_sw_interface_t *si, *sorted_sis = 0;
+
+  if (unformat (input, "%U", unformat_vnet_sw_interface, vnm, &sw_if_index))
+    {
+      si = pool_elt_at_index (im->sw_interfaces, sw_if_index);
+      vec_add1 (sorted_sis, si[0]);
+    }
+
+  /* if an interface name was not passed, get all interfaces */
+  if (vec_len (sorted_sis) == 0)
+    {
+      sorted_sis =
+	vec_new (vnet_sw_interface_t, pool_elts (im->sw_interfaces));
+      _vec_len (sorted_sis) = 0;
+      /* *INDENT-OFF* */
+      pool_foreach (si, im->sw_interfaces,
+      ({
+        int visible = vnet_swif_is_api_visible (si);
+        if (visible)
+          vec_add1 (sorted_sis, si[0]);}
+        ));
+      /* *INDENT-ON* */
+      /* Sort by name. */
+      vec_sort_with_function (sorted_sis, sw_interface_name_compare);
+    }
+
+  vec_foreach (si, sorted_sis)
+  {
+    vnet_sw_interface_t *sup_si;
+    ethernet_interface_t *ei;
+
+    sup_si = vnet_get_sup_sw_interface (vnm, si->sw_if_index);
+    ei = ethernet_get_interface (em, sup_si->hw_if_index);
+
+    vlib_cli_output (vm, "%U (%s):",
+		     format_vnet_sw_if_index_name, vnm, si->sw_if_index,
+		     (si->flags & VNET_SW_INTERFACE_FLAG_ADMIN_UP) ?
+		     "up" : "dn");
+
+    if (ei && ei->secondary_addrs)
+      {
+	mac_address_t *sec_addr;
+
+	vec_foreach (sec_addr, ei->secondary_addrs)
+	{
+	  vlib_cli_output (vm, "  %U", format_mac_address_t, sec_addr);
+	}
+      }
+  }
+
+  vec_free (sorted_sis);
+  return 0;
+}
+
+/*?
+ * This command is used to display interface secondary mac addresses.
+ *
+ * @cliexpar
+ * Example of how to display interface secondary mac addresses:
+ * @cliexstart{show interface secondary-mac-address}
+ * @cliexend
+?*/
+/* *INDENT-OFF* */
+VLIB_CLI_COMMAND (show_interface_sec_mac_addr, static) = {
+  .path = "show interface secondary-mac-address",
+  .short_help = "show interface secondary-mac-address [<interface>]",
+  .function = show_interface_sec_mac_addr_fn,
+};
+/* *INDENT-ON* */
+
+static clib_error_t *
+interface_add_del_mac_address (vlib_main_t * vm, unformat_input_t * input,
+			       vlib_cli_command_t * cmd)
+{
+  vnet_main_t *vnm = vnet_get_main ();
+  vnet_sw_interface_t *si = NULL;
+  clib_error_t *error = 0;
+  u32 sw_if_index = ~0;
+  u8 mac[6] = { 0 };
+  u8 is_add, is_del;
+
+  is_add = is_del = 0;
+
+  if (!unformat_user (input, unformat_vnet_sw_interface, vnm, &sw_if_index))
+    {
+      error = clib_error_return (0, "unknown interface `%U'",
+				 format_unformat_error, input);
+      goto done;
+    }
+  if (!unformat_user (input, unformat_ethernet_address, mac))
+    {
+      error = clib_error_return (0, "expected mac address `%U'",
+				 format_unformat_error, input);
+      goto done;
+    }
+
+  while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (input, "add"))
+	is_add = 1;
+      else if (unformat (input, "del"))
+	is_del = 1;
+      else
+	break;
+    }
+
+  if (is_add == is_del)
+    {
+      error = clib_error_return (0, "must choose one of add or del");
+      goto done;
+    }
+
+  si = vnet_get_sw_interface (vnm, sw_if_index);
+  error =
+    vnet_hw_interface_add_del_mac_address (vnm, si->hw_if_index, mac, is_add);
+
+done:
+  return error;
+}
+
+/*?
+ * The '<em>set interface secondary-mac-address </em>' command allows adding
+ * or deleting extra MAC addresses on a given interface without changing the
+ * default MAC address. This could allow packets sent to these MAC addresses
+ * to be received without setting the interface to promiscuous mode.
+ * Not all interfaces support this operation. The ones that do are mostly
+ * hardware NICs, though virtio does also.
+ *
+ * @cliexpar
+ * @parblock
+ * Example of how to add a secondary MAC Address on an interface:
+ * @cliexcmd{set interface secondary-mac-address GigabitEthernet0/8/0 aa:bb:cc:dd:ee:01 add}
+ * Example of how to delete a secondary MAC address from an interface:
+ * @cliexcmd{set interface secondary-mac-address GigabitEthernet0/8/0 aa:bb:cc:dd:ee:01 del}
+ * @endparblock
+?*/
+/* *INDENT-OFF* */
+VLIB_CLI_COMMAND (interface_add_del_mac_address_cmd, static) = {
+  .path = "set interface secondary-mac-address",
+  .short_help = "set interface secondary-mac-address <interface> <mac-address> [(add|del)]",
+  .function = interface_add_del_mac_address,
+};
+/* *INDENT-ON* */
+
+static clib_error_t *
 set_interface_mac_address (vlib_main_t * vm, unformat_input_t * input,
 			   vlib_cli_command_t * cmd)
 {
@@ -1305,16 +1477,16 @@ VLIB_CLI_COMMAND (set_ip_directed_broadcast_command, static) = {
 
 static clib_error_t *
 set_hw_interface_rx_mode (vnet_main_t * vnm, u32 hw_if_index,
-			  u32 queue_id, vnet_hw_interface_rx_mode mode)
+			  u32 queue_id, vnet_hw_if_rx_mode mode)
 {
   vnet_hw_interface_t *hw = vnet_get_hw_interface (vnm, hw_if_index);
   vnet_device_class_t *dev_class =
     vnet_get_device_class (vnm, hw->dev_class_index);
   clib_error_t *error;
-  vnet_hw_interface_rx_mode old_mode;
+  vnet_hw_if_rx_mode old_mode;
   int rv;
 
-  if (mode == VNET_HW_INTERFACE_RX_MODE_DEFAULT)
+  if (mode == VNET_HW_IF_RX_MODE_DEFAULT)
     mode = hw->default_rx_mode;
 
   rv = vnet_hw_interface_get_rx_mode (vnm, hw_if_index, queue_id, &old_mode);
@@ -1361,7 +1533,7 @@ set_hw_interface_rx_mode (vnet_main_t * vnm, u32 hw_if_index,
 clib_error_t *
 set_hw_interface_change_rx_mode (vnet_main_t * vnm, u32 hw_if_index,
 				 u8 queue_id_valid, u32 queue_id,
-				 vnet_hw_interface_rx_mode mode)
+				 vnet_hw_if_rx_mode mode)
 {
   clib_error_t *error = 0;
   vnet_hw_interface_t *hw;
@@ -1394,7 +1566,7 @@ set_interface_rx_mode (vlib_main_t * vm, unformat_input_t * input,
   vnet_main_t *vnm = vnet_get_main ();
   u32 hw_if_index = (u32) ~ 0;
   u32 queue_id = (u32) ~ 0;
-  vnet_hw_interface_rx_mode mode = VNET_HW_INTERFACE_RX_MODE_UNKNOWN;
+  vnet_hw_if_rx_mode mode = VNET_HW_IF_RX_MODE_UNKNOWN;
   u8 queue_id_valid = 0;
 
   if (!unformat_user (input, unformat_line_input, line_input))
@@ -1408,11 +1580,11 @@ set_interface_rx_mode (vlib_main_t * vm, unformat_input_t * input,
       else if (unformat (line_input, "queue %d", &queue_id))
 	queue_id_valid = 1;
       else if (unformat (line_input, "polling"))
-	mode = VNET_HW_INTERFACE_RX_MODE_POLLING;
+	mode = VNET_HW_IF_RX_MODE_POLLING;
       else if (unformat (line_input, "interrupt"))
-	mode = VNET_HW_INTERFACE_RX_MODE_INTERRUPT;
+	mode = VNET_HW_IF_RX_MODE_INTERRUPT;
       else if (unformat (line_input, "adaptive"))
-	mode = VNET_HW_INTERFACE_RX_MODE_ADAPTIVE;
+	mode = VNET_HW_IF_RX_MODE_ADAPTIVE;
       else
 	{
 	  error = clib_error_return (0, "parse error: '%U'",
@@ -1427,7 +1599,7 @@ set_interface_rx_mode (vlib_main_t * vm, unformat_input_t * input,
   if (hw_if_index == (u32) ~ 0)
     return clib_error_return (0, "please specify valid interface name");
 
-  if (mode == VNET_HW_INTERFACE_RX_MODE_UNKNOWN)
+  if (mode == VNET_HW_IF_RX_MODE_UNKNOWN)
     return clib_error_return (0, "please specify valid rx-mode");
 
   error = set_hw_interface_change_rx_mode (vnm, hw_if_index, queue_id_valid,
@@ -1505,7 +1677,7 @@ show_interface_rx_placement_fn (vlib_main_t * vm, unformat_input_t * input,
 	    s = format (s, "    %U queue %u (%U)\n",
 			format_vnet_sw_if_index_name, vnm, hi->sw_if_index,
 			dq->queue_id,
-			format_vnet_hw_interface_rx_mode, dq->mode);
+			format_vnet_hw_if_rx_mode, dq->mode);
 	  }
       }));
     if (vec_len (s) > 0)
@@ -1562,7 +1734,7 @@ set_hw_interface_rx_placement (u32 hw_if_index, u32 queue_id,
   vnet_main_t *vnm = vnet_get_main ();
   vnet_device_main_t *vdm = &vnet_device_main;
   clib_error_t *error = 0;
-  vnet_hw_interface_rx_mode mode = VNET_HW_INTERFACE_RX_MODE_UNKNOWN;
+  vnet_hw_if_rx_mode mode = VNET_HW_IF_RX_MODE_UNKNOWN;
   int rv;
 
   if (is_main)
@@ -1695,6 +1867,89 @@ VLIB_CLI_COMMAND (cmd_set_if_rx_placement,static) = {
 };
 /* *INDENT-ON* */
 
+clib_error_t *
+set_interface_rss_queues (vlib_main_t * vm, u32 hw_if_index,
+			  clib_bitmap_t * bitmap)
+{
+  vnet_main_t *vnm = vnet_get_main ();
+  vnet_hw_interface_t *hi = vnet_get_hw_interface (vnm, hw_if_index);
+
+  return vnet_hw_interface_set_rss_queues (vnm, hi, bitmap);
+}
+
+static clib_error_t *
+set_interface_rss_queues_fn (vlib_main_t * vm,
+			     unformat_input_t * input,
+			     vlib_cli_command_t * cmd)
+{
+  clib_error_t *error = 0;
+  unformat_input_t _line_input, *line_input = &_line_input;
+  vnet_main_t *vnm = vnet_get_main ();
+  u32 hw_if_index = (u32) ~ 0;
+  clib_bitmap_t *bitmap = NULL;
+
+  if (!unformat_user (input, unformat_line_input, line_input))
+    return 0;
+
+  while (unformat_check_input (line_input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat
+	  (line_input, "%U", unformat_vnet_hw_interface, vnm, &hw_if_index))
+	;
+      else
+	if (unformat (line_input, "list %U", unformat_bitmap_list, &bitmap))
+	;
+      else
+	{
+	  error = clib_error_return (0, "parse error: '%U'",
+				     format_unformat_error, line_input);
+	  unformat_free (line_input);
+	  goto done;
+	}
+    }
+
+  unformat_free (line_input);
+
+  if (hw_if_index == (u32) ~ 0)
+    {
+      error = clib_error_return (0, "please specify valid interface name");
+      goto done;
+    }
+
+  if (bitmap == NULL)
+    {
+      error = clib_error_return (0, "please specify the valid rss queues");
+      goto done;
+    }
+
+  error = set_interface_rss_queues (vm, hw_if_index, bitmap);
+
+done:
+  if (bitmap)
+    clib_bitmap_free (bitmap);
+
+  return (error);
+}
+
+/*?
+ * This command is used to set the rss queues of a given interface
+ * Not all the interfaces support this operation.
+ * To display the current rss queues, use the command
+ * '<em>show hardware-interfaces</em>'.
+ *
+ * @cliexpar
+ * Example of how to set the rss queues to 0,2-5,7 of an interface:
+ * @cliexstart{set interface rss queues VirtualFunctionEthernet18/1/0 list 0,2-5,7}
+ * @cliexend
+?*/
+/* *INDENT-OFF* */
+VLIB_CLI_COMMAND (cmd_set_interface_rss_queues,static) = {
+    .path = "set interface rss queues",
+    .short_help = "set interface rss queues <interface> <list <queue-list>>",
+    .function = set_interface_rss_queues_fn,
+};
+/* *INDENT-ON* */
+
 static u8 *
 format_vnet_pcap (u8 * s, va_list * args)
 {
@@ -1734,9 +1989,10 @@ int
 vnet_pcap_dispatch_trace_configure (vnet_pcap_dispatch_trace_args_t * a)
 {
   vlib_main_t *vm = vlib_get_main ();
-  vnet_main_t *vnm = vnet_get_main ();
   vnet_pcap_t *pp = &vm->pcap;
   pcap_main_t *pm = &pp->pcap_main;
+  vnet_classify_main_t *cm = &vnet_classify_main;
+  vnet_classify_filter_set_t *set = 0;
 
   if (a->status)
     {
@@ -1772,23 +2028,36 @@ vnet_pcap_dispatch_trace_configure (vnet_pcap_dispatch_trace_args_t * a)
       && (pm->n_packets_to_capture != a->packets_to_capture))
     return VNET_API_ERROR_INVALID_VALUE_2;
 
+  set = pool_elt_at_index (cm->filter_sets, cm->filter_set_by_sw_if_index[0]);
+
   /* Classify filter specified, but no classify filter configured */
-  if ((a->rx_enable + a->tx_enable + a->drop_enable) && a->filter
-      && (vec_len (vnm->classify_filter_table_indices) == 0))
+  if ((a->rx_enable + a->tx_enable + a->drop_enable) && a->filter &&
+      (set->table_indices == 0 || set->table_indices[0] == ~0))
     return VNET_API_ERROR_NO_SUCH_LABEL;
 
   if (a->rx_enable + a->tx_enable + a->drop_enable)
     {
+      void *save_pcap_data;
+
       /* Sanity check max bytes per pkt */
       if (a->max_bytes_per_pkt < 32 || a->max_bytes_per_pkt > 9000)
 	return VNET_API_ERROR_INVALID_MEMORY_SIZE;
 
       /* Clean up from previous run, if any */
-      vec_free (pm->file_name);
-      vec_free (pm->pcap_data);
+      vec_reset_length (pm->pcap_data);
+
+      /* Throw away the data buffer? */
+      if (a->free_data)
+	vec_free (pm->pcap_data);
+
+      save_pcap_data = pm->pcap_data;
+
       memset (pm, 0, sizeof (*pm));
 
-      vec_validate_aligned (vnet_trace_dummy, 2048, CLIB_CACHE_LINE_BYTES);
+      pm->pcap_data = save_pcap_data;
+
+      vec_validate_aligned (vnet_trace_placeholder, 2048,
+			    CLIB_CACHE_LINE_BYTES);
       if (pm->lock == 0)
 	clib_spinlock_init (&(pm->lock));
 
@@ -1802,18 +2071,25 @@ vnet_pcap_dispatch_trace_configure (vnet_pcap_dispatch_trace_args_t * a)
 	    stem = format (stem, "tx");
 	  if (a->drop_enable)
 	    stem = format (stem, "drop");
-	  a->filename = format (0, "/tmp/%s.pcap%c", stem, 0);
+	  a->filename = format (0, "/tmp/%v.pcap%c", stem, 0);
 	  vec_free (stem);
 	}
 
       pm->file_name = (char *) a->filename;
       pm->n_packets_captured = 0;
       pm->packet_type = PCAP_PACKET_TYPE_ethernet;
+      /* Preallocate the data vector? */
+      if (a->preallocate_data)
+	{
+	  vec_validate
+	    (pm->pcap_data, a->packets_to_capture
+	     * ((sizeof (pcap_packet_header_t) + a->max_bytes_per_pkt)));
+	  vec_reset_length (pm->pcap_data);
+	}
       pm->n_packets_to_capture = a->packets_to_capture;
       pp->pcap_sw_if_index = a->sw_if_index;
       if (a->filter)
-	pp->filter_classify_table_index =
-	  vnm->classify_filter_table_indices[0];
+	pp->filter_classify_table_index = set->table_indices[0];
       else
 	pp->filter_classify_table_index = ~0;
       pp->pcap_rx_enable = a->rx_enable;
@@ -1826,6 +2102,7 @@ vnet_pcap_dispatch_trace_configure (vnet_pcap_dispatch_trace_args_t * a)
       pp->pcap_rx_enable = 0;
       pp->pcap_tx_enable = 0;
       pp->pcap_drop_enable = 0;
+      pp->filter_classify_table_index = ~0;
       if (pm->n_packets_captured)
 	{
 	  clib_error_t *error;
@@ -1841,6 +2118,9 @@ vnet_pcap_dispatch_trace_configure (vnet_pcap_dispatch_trace_args_t * a)
 	      clib_error_report (error);
 	      return VNET_API_ERROR_SYSCALL_ERROR_1;
 	    }
+	  vec_free (pm->file_name);
+	  if (a->free_data)
+	    vec_free (pm->pcap_data);
 	  return 0;
 	}
       else
@@ -1863,10 +2143,12 @@ pcap_trace_command_fn (vlib_main_t * vm,
   int rv;
   int rx_enable = 0;
   int tx_enable = 0;
+  int preallocate_data = 0;
   int drop_enable = 0;
   int status = 0;
   int filter = 0;
-  u32 sw_if_index = 0;
+  int free_data = 0;
+  u32 sw_if_index = 0;		/* default: any interface */
 
   /* Get a line of input. */
   if (!unformat_user (input, unformat_line_input, line_input))
@@ -1897,7 +2179,16 @@ pcap_trace_command_fn (vlib_main_t * vm,
       else if (unformat (line_input, "intfc %U",
 			 unformat_vnet_sw_interface, vnm, &sw_if_index))
 	;
-      else if (unformat (line_input, "intfc any"))
+      else if (unformat (line_input, "interface %U",
+			 unformat_vnet_sw_interface, vnm, &sw_if_index))
+	;
+      else if (unformat (line_input, "preallocate-data %=",
+			 &preallocate_data, 1))
+	;
+      else if (unformat (line_input, "free-data %=", &free_data, 1))
+	;
+      else if (unformat (line_input, "intfc any")
+	       || unformat (line_input, "interface any"))
 	sw_if_index = 0;
       else if (unformat (line_input, "filter"))
 	filter = 1;
@@ -1914,6 +2205,8 @@ pcap_trace_command_fn (vlib_main_t * vm,
   a->filename = filename;
   a->rx_enable = rx_enable;
   a->tx_enable = tx_enable;
+  a->preallocate_data = preallocate_data;
+  a->free_data = free_data;
   a->drop_enable = drop_enable;
   a->status = status;
   a->packets_to_capture = max;
@@ -1983,11 +2276,22 @@ pcap_trace_command_fn (vlib_main_t * vm,
  * - <b>max-bytes-per-pkt <nnnn></b> - Maximum number of bytes to capture
  *   for each packet. Must be >= 32, <= 9000.
  *
+ * - <b>preallocate-data</b> - Preallocate the data buffer, to avoid
+ *   vector expansion delays during pcap capture
+ *
+ * - <b>free-data</b> - Free the data buffer. Ordinarily it's a feature
+ *   to retain the data buffer so this option is seldom used.
+ *
  * - <b>intfc <interface-name>|any</b> - Used to specify a given interface,
  *   or use '<em>any</em>' to run packet capture on all interfaces.
  *   '<em>any</em>' is the default if not provided. Settings from a previous
  *   packet capture are preserved, so '<em>any</em>' can be used to reset
  *   the interface setting.
+ *
+ * - <b>filter</b> - Use the pcap rx / tx / drop trace filter, which
+ *   must be configured. Use <b>classify filter pcap...</b> to configure the
+ *   filter. The filter will only be executed if the per-interface or
+ *   any-interface tests fail.
  *
  * - <b>file <name></b> - Used to specify the output filename. The file will
  *   be placed in the '<em>/tmp</em>' directory, so only the filename is
@@ -2027,7 +2331,9 @@ pcap_trace_command_fn (vlib_main_t * vm,
 VLIB_CLI_COMMAND (pcap_tx_trace_command, static) = {
     .path = "pcap trace",
     .short_help =
-    "pcap trace rx tx drop off [max <nn>] [intfc <interface>|any] [file <name>] [status] [max-bytes-per-pkt <nnnn>]",
+    "pcap trace [rx] [tx] [drop] [off] [max <nn>] [intfc <interface>|any]\n"
+    "           [file <name>] [status] [max-bytes-per-pkt <nnnn>][filter]\n"
+    "           [preallocate-data][free-data]",
     .function = pcap_trace_command_fn,
 };
 /* *INDENT-ON* */

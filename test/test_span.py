@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import unittest
 
@@ -11,6 +11,7 @@ from framework import VppTestCase, VppTestRunner
 from util import Host, ppp
 from vpp_sub_interface import L2_VTR_OP, VppDot1QSubint, VppDot1ADSubint
 from vpp_gre_interface import VppGreInterface
+from vpp_vxlan_tunnel import VppVxlanTunnel
 from collections import namedtuple
 from vpp_papi import VppEnum
 
@@ -53,12 +54,11 @@ class TestSpan(VppTestCase):
             i.config_ip4()
             i.resolve_arp()
 
-        cls.vxlan = cls.vapi.vxlan_add_del_tunnel(
-            src_address=cls.pg2.local_ip4n, dst_address=cls.pg2.remote_ip4n,
-            is_add=1, vni=1111)
-
     def setUp(self):
         super(TestSpan, self).setUp()
+        self.vxlan = VppVxlanTunnel(self, src=self.pg2.local_ip4,
+                                    dst=self.pg2.remote_ip4, vni=1111)
+        self.vxlan.add_vpp_config()
         self.reset_packet_infos()
 
     def tearDown(self):
@@ -144,7 +144,7 @@ class TestSpan(VppTestCase):
 
         for i in range(0, self.pkts_per_burst):
             payload = "span test"
-            size = packet_sizes[(i / 2) % len(packet_sizes)]
+            size = packet_sizes[int((i / 2) % len(packet_sizes))]
             p = (Ether(src=src_if.local_mac, dst=dst_mac) /
                  IP(src=src_if.remote_ip4, dst=dst_if.remote_ip4) /
                  UDP(sport=10000 + src_if.sw_if_index * 1000 + i, dport=1234) /

@@ -21,8 +21,14 @@
 #include <vppinfra/error.h>
 
 #define IKEV2_NONCE_SIZE  32
-
+#define IKEV2_PORT        500
+#define IKEV2_PORT_NATT   4500
 #define IKEV2_KEY_PAD "Key Pad for IKEv2"
+
+#define IKEV2_GCM_ICV_SIZE 16
+#define IKEV2_GCM_NONCE_SIZE 12
+#define IKEV2_GCM_SALT_SIZE 4
+#define IKEV2_GCM_IV_SIZE (IKEV2_GCM_NONCE_SIZE - IKEV2_GCM_SALT_SIZE)
 
 typedef u8 v8;
 
@@ -39,13 +45,14 @@ typedef CLIB_PACKED (struct {
 /* *INDENT-ON* */
 
 /* *INDENT-OFF* */
-typedef CLIB_PACKED (struct
-		     {
-		     u8 nextpayload;
-		     u8 flags;
-		     u16 length;
-		     u16 dh_group;
-		     u8 reserved[2]; u8 payload[0];}) ike_ke_payload_header_t;
+typedef CLIB_PACKED (struct {
+  u8 nextpayload;
+  u8 flags;
+  u16 length;
+  u16 dh_group;
+  u8 reserved[2];
+  u8 payload[0];
+}) ike_ke_payload_header_t;
 /* *INDENT-ON* */
 
 /* *INDENT-OFF* */
@@ -91,6 +98,8 @@ typedef CLIB_PACKED (struct {
 #define IKEV2_PAYLOAD_FLAG_CRITICAL      (1<<7)
 
 #define IKEV2_PAYLOAD_NONE      0
+#define IKEV2_PAYLOAD_NAT_D     20
+#define IKEV2_PAYLOAD_NAT_OA    21
 #define IKEV2_PAYLOAD_SA        33
 #define IKEV2_PAYLOAD_KE        34
 #define IKEV2_PAYLOAD_IDI       35
@@ -222,7 +231,7 @@ typedef enum
   _(11, NULL,      "null")     \
   _(12, AES_CBC,   "aes-cbc")  \
   _(13, AES_CTR,   "aes-ctr")  \
-  _(14, AES_GCM,   "aes-gcm")
+  _(20, AES_GCM_16, "aes-gcm-16")
 
 typedef enum
 {
@@ -360,6 +369,12 @@ typedef enum
 #undef _
 } ikev2_id_type_t;
 
+typedef enum
+{
+  TS_IPV4_ADDR_RANGE = 7,
+  TS_IPV6_ADDR_RANGE = 8,
+} ikev2_traffic_selector_type_t;
+
 clib_error_t *ikev2_init (vlib_main_t * vm);
 clib_error_t *ikev2_set_local_key (vlib_main_t * vm, u8 * file);
 clib_error_t *ikev2_add_del_profile (vlib_main_t * vm, u8 * name, int is_add);
@@ -370,11 +385,11 @@ clib_error_t *ikev2_set_profile_id (vlib_main_t * vm, u8 * name,
 				    u8 id_type, u8 * data, int is_local);
 clib_error_t *ikev2_set_profile_ts (vlib_main_t * vm, u8 * name,
 				    u8 protocol_id, u16 start_port,
-				    u16 end_port, ip4_address_t start_addr,
-				    ip4_address_t end_addr, int is_local);
+				    u16 end_port, ip_address_t start_addr,
+				    ip_address_t end_addr, int is_local);
 clib_error_t *ikev2_set_profile_responder (vlib_main_t * vm, u8 * name,
 					   u32 sw_if_index,
-					   ip4_address_t ip4);
+					   ip_address_t addr);
 clib_error_t *ikev2_set_profile_ike_transforms (vlib_main_t * vm, u8 * name,
 						ikev2_transform_encr_type_t
 						crypto_alg,
@@ -387,11 +402,16 @@ clib_error_t *ikev2_set_profile_esp_transforms (vlib_main_t * vm, u8 * name,
 						crypto_alg,
 						ikev2_transform_integ_type_t
 						integ_alg,
-						ikev2_transform_dh_type_t
-						dh_type, u32 crypto_key_size);
+						u32 crypto_key_size);
 clib_error_t *ikev2_set_profile_sa_lifetime (vlib_main_t * vm, u8 * name,
 					     u64 lifetime, u32 jitter,
 					     u32 handover, u64 maxdata);
+clib_error_t *ikev2_set_profile_tunnel_interface (vlib_main_t * vm, u8 * name,
+						  u32 sw_if_index);
+vnet_api_error_t ikev2_set_profile_ipsec_udp_port (vlib_main_t * vm,
+						   u8 * name, u16 port,
+						   u8 is_set);
+clib_error_t *ikev2_set_profile_udp_encap (vlib_main_t * vm, u8 * name);
 clib_error_t *ikev2_initiate_sa_init (vlib_main_t * vm, u8 * name);
 clib_error_t *ikev2_initiate_delete_child_sa (vlib_main_t * vm, u32 ispi);
 clib_error_t *ikev2_initiate_delete_ike_sa (vlib_main_t * vm, u64 ispi);
@@ -424,6 +444,8 @@ uword unformat_ikev2_transform_dh_type (unformat_input_t * input,
 uword unformat_ikev2_transform_esn_type (unformat_input_t * input,
 					 va_list * args);
 void ikev2_cli_reference (void);
+
+clib_error_t *ikev2_set_liveness_params (u32 period, u32 max_retries);
 
 #endif /* __included_ikev2_h__ */
 

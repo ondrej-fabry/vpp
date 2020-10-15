@@ -33,9 +33,8 @@ endif
 OS_ID ?= $(shell grep '^ID=' /etc/os-release | cut -f2- -d= | sed -e 's/\"//g')
 
 # Package dependencies
-DOC_DEB_DEPENDS = doxygen graphviz python-pyparsing python-jinja2
-DOC_RPM_DEPENDS = doxygen graphviz pyparsing python-jinja2
-DOC_SUSE_RPM_DEPENDS = doxygen graphviz python-pyparsing python-Jinja2
+DOC_DEB_DEPENDS = doxygen graphviz python3-pyparsing python3-jinja2
+DOC_RPM_DEPENDS = doxygen graphviz python3-pyparsing python3-jinja2
 DOC_MAC_BIN_DEPENDS = doxygen dot git
 DOC_MAC_PY_DEPENDS = pyparsing jinja2
 
@@ -43,7 +42,7 @@ DOC_MAC_PY_DEPENDS = pyparsing jinja2
 DOXY_DIR ?= $(WS_ROOT)/doxygen
 
 # Primary source directories
-DOXY_SRC ?= src
+DOXY_SRC ?= $(WS_ROOT)/src
 DOXY_SRC_DIRECTORIES = \
 	$(shell find $(DOXY_SRC) -name '*.md' -print | xargs dirname \
 	| sort | uniq) \
@@ -156,8 +155,6 @@ else ifeq ($(OS_ID),darwin)
 			false; \
 		); \
 	done
-else ifeq ($(OS_ID),opensuse)
-	@sudo zypper install $(CONFIRM) $(DOC_SUSE_RPM_DEPENDS)
 else
 	$(error "Building documentation currently works only on Ubuntu, CentOS, MacOS and OpenSUSE systems.")
 endif
@@ -264,7 +261,10 @@ doxygen: $(SIPHON_DOCS)
 
 .PHONY: wipe-doxygen
 wipe-doxygen:
-	rm -rf "$(BR)/docs" "$(BR)/.doxygen-siphon.d"
+	@rm -rf $(BR)/docs
+	@rm -rf $(BR)/.doxygen-siphon.dep
+	@rm -rf $(BR)/.doxygen-bootstrap.ok
+	@rm -rf $(DOXY_DIR)/siphon/__pycache__
 
 .PHONY: clean
 clean: wipe-doxygen

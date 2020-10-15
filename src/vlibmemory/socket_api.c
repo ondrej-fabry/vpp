@@ -118,7 +118,7 @@ vl_socket_api_send (vl_api_registration_t * rp, u8 * elem)
 #endif
   socket_main_t *sm = &socket_main;
   u16 msg_id = ntohs (*(u16 *) elem);
-  api_main_t *am = &api_main;
+  api_main_t *am = vlibapi_get_main ();
   msgbuf_t *mb = (msgbuf_t *) (elem - offsetof (msgbuf_t, data));
   vl_api_registration_t *sock_rp;
   clib_file_main_t *fm = &file_main;
@@ -170,12 +170,16 @@ vl_socket_free_registration_index (u32 pool_index)
 {
   int i;
   vl_api_registration_t *rp;
+  void vl_api_call_reaper_functions (u32 client_index);
+
   if (pool_is_free_index (socket_main.registration_pool, pool_index))
     {
       clib_warning ("main pool index %d already free", pool_index);
       return;
     }
   rp = pool_elt_at_index (socket_main.registration_pool, pool_index);
+
+  vl_api_call_reaper_functions (pool_index);
 
   ASSERT (rp->registration_type != REGISTRATION_TYPE_FREE);
   for (i = 0; i < vec_len (rp->additional_fds_to_close); i++)
@@ -190,56 +194,69 @@ vl_socket_free_registration_index (u32 pool_index)
 }
 
 void
-vl_socket_process_api_msg (clib_file_t * uf, vl_api_registration_t * rp,
-			   i8 * input_v)
+vl_socket_process_api_msg (vl_api_registration_t * rp, i8 * input_v)
 {
   msgbuf_t *mbp = (msgbuf_t *) input_v;
 
   u8 *the_msg = (u8 *) (mbp->data);
-  socket_main.current_uf = uf;
   socket_main.current_rp = rp;
   vl_msg_api_socket_handler (the_msg);
-  socket_main.current_uf = 0;
   socket_main.current_rp = 0;
 }
 
+/*
+ * Read function for API socket.
+ *
+ * Read data from socket, invoke SOCKET_READ_EVENT
+ * for each fully read API message, return 0.
+ * Store incomplete data for next invocation to continue.
+ *
+ * On severe read error, the file is closed.
+ *
+ * As reading is single threaded,
+ * socket_main.input_buffer is used temporarily.
+ * Even its length is modified, but always restored before return.
+ *
+ * Incomplete data is copied into a vector,
+ * pointer saved in registration's unprocessed_input.
+ */
 clib_error_t *
 vl_socket_read_ready (clib_file_t * uf)
 {
   clib_file_main_t *fm = &file_main;
   vlib_main_t *vm = vlib_get_main ();
   vl_api_registration_t *rp;
+  /* n is the size of data read to input_buffer */
   int n;
+  /* msg_buffer vector can point to input_buffer or unprocessed_input */
   i8 *msg_buffer = 0;
+  /* data_for_process is a vector containing one full message, incl msgbuf_t */
   u8 *data_for_process;
-  u32 msg_len;
+  /* msgbuf_len is the size of one message, including sizeof (msgbuf_t) */
+  u32 msgbuf_len;
   u32 save_input_buffer_length = vec_len (socket_main.input_buffer);
   vl_socket_args_for_process_t *a;
-  msgbuf_t *mbp;
-  int mbp_set = 0;
+  u32 reg_index = uf->private_data;
 
-  rp = pool_elt_at_index (socket_main.registration_pool, uf->private_data);
+  rp = vl_socket_get_registration (reg_index);
 
+  /* Ignore unprocessed_input for now, n describes input_buffer for now. */
   n = read (uf->file_descriptor, socket_main.input_buffer,
 	    vec_len (socket_main.input_buffer));
 
-  if (n <= 0 && errno != EAGAIN)
+  if (n <= 0)
     {
-      clib_file_del (fm, uf);
-
-      if (!pool_is_free (socket_main.registration_pool, rp))
+      if (errno != EAGAIN)
 	{
-	  u32 index = rp - socket_main.registration_pool;
-	  vl_socket_free_registration_index (index);
+	  /* Severe error, close the file. */
+	  clib_file_del (fm, uf);
+	  vl_socket_free_registration_index (reg_index);
 	}
-      else
-	{
-	  clib_warning ("client index %d already free?",
-			rp->vl_api_registration_pool_index);
-	}
+      /* EAGAIN means we do not close the file, but no data to process anyway. */
       return 0;
     }
 
+  /* Fake smaller length teporarily, so input_buffer can be used as msg_buffer. */
   _vec_len (socket_main.input_buffer) = n;
 
   /*
@@ -248,37 +265,38 @@ vl_socket_read_ready (clib_file_t * uf)
    * boundaries. In the case of a long message (>4K bytes)
    * we have to do (at least) 2 reads, etc.
    */
+  /* Determine msg_buffer. */
+  if (vec_len (rp->unprocessed_input))
+    {
+      vec_append (rp->unprocessed_input, socket_main.input_buffer);
+      msg_buffer = rp->unprocessed_input;
+    }
+  else
+    {
+      msg_buffer = socket_main.input_buffer;
+    }
+  /* Loop to process any full messages. */
+  ASSERT (vec_len (msg_buffer) > 0);
   do
     {
-      if (vec_len (rp->unprocessed_input))
-	{
-	  vec_append (rp->unprocessed_input, socket_main.input_buffer);
-	  msg_buffer = rp->unprocessed_input;
-	}
-      else
-	{
-	  msg_buffer = socket_main.input_buffer;
-	  mbp_set = 0;
-	}
+      /* Here, we are not sure how big a chunk of message we have left. */
+      /* Do we at least know how big the full message will be? */
+      if (vec_len (msg_buffer) <= sizeof (msgbuf_t))
+	/* No, so fragment is not a full message. */
+	goto save_and_split;
 
-      if (mbp_set == 0)
-	{
-	  /* Any chance that we have a complete message? */
-	  if (vec_len (msg_buffer) <= sizeof (msgbuf_t))
-	    goto save_and_split;
+      /* Now we know how big the full message will be. */
+      msgbuf_len =
+	ntohl (((msgbuf_t *) msg_buffer)->data_len) + sizeof (msgbuf_t);
 
-	  mbp = (msgbuf_t *) msg_buffer;
-	  msg_len = ntohl (mbp->data_len);
-	  mbp_set = 1;
-	}
-
-      /* We don't have the entire message yet. */
-      if (mbp_set == 0
-	  || (msg_len + sizeof (msgbuf_t)) > vec_len (msg_buffer))
+      /* But do we have a full message? */
+      if (msgbuf_len > vec_len (msg_buffer))
 	{
 	save_and_split:
-	  /* if we were using the input buffer save the fragment */
+	  /* We don't have the entire message yet. */
+	  /* If msg_buffer is unprocessed_input, nothing needs to be done. */
 	  if (msg_buffer == socket_main.input_buffer)
+	    /* But if we were using the input buffer, save the fragment. */
 	    {
 	      ASSERT (vec_len (rp->unprocessed_input) == 0);
 	      vec_validate (rp->unprocessed_input, vec_len (msg_buffer) - 1);
@@ -286,32 +304,37 @@ vl_socket_read_ready (clib_file_t * uf)
 				vec_len (msg_buffer));
 	      _vec_len (rp->unprocessed_input) = vec_len (msg_buffer);
 	    }
+	  /* No more full messages, restore original input_buffer length. */
 	  _vec_len (socket_main.input_buffer) = save_input_buffer_length;
 	  return 0;
 	}
 
+      /*
+       * We have at least one full message.
+       * But msg_buffer can contain more data, so copy one message data
+       * so we can overwrite its length to what single message has.
+       */
       data_for_process = (u8 *) vec_dup (msg_buffer);
-      _vec_len (data_for_process) = (msg_len + sizeof (msgbuf_t));
+      _vec_len (data_for_process) = msgbuf_len;
+      /* Everything is ready to signal the SOCKET_READ_EVENT. */
       pool_get (socket_main.process_args, a);
-      a->clib_file = uf;
-      a->regp = rp;
+      a->reg_index = reg_index;
       a->data = data_for_process;
 
       vlib_process_signal_event (vm, vl_api_clnt_node.index,
 				 SOCKET_READ_EVENT,
 				 a - socket_main.process_args);
-      if (n > (msg_len + sizeof (*mbp)))
-	vec_delete (msg_buffer, msg_len + sizeof (*mbp), 0);
+      if (vec_len (msg_buffer) > msgbuf_len)
+	/* There are some fragments left. Shrink the msg_buffer to simplify logic. */
+	vec_delete (msg_buffer, msgbuf_len, 0);
       else
+	/* We are done with msg_buffer. */
 	_vec_len (msg_buffer) = 0;
-      n -= msg_len + sizeof (msgbuf_t);
-      msg_len = 0;
-      mbp_set = 0;
     }
-  while (n > 0);
+  while (vec_len (msg_buffer) > 0);
 
+  /* Restore input_buffer, it could have been msg_buffer. */
   _vec_len (socket_main.input_buffer) = save_input_buffer_length;
-
   return 0;
 }
 
@@ -426,7 +449,7 @@ vl_api_sockclnt_create_t_handler (vl_api_sockclnt_create_t * mp)
 {
   vl_api_registration_t *regp;
   vl_api_sockclnt_create_reply_t *rp;
-  api_main_t *am = &api_main;
+  api_main_t *am = vlibapi_get_main ();
   hash_pair_t *hp;
   int rv = 0;
   u32 nmsg = hash_elts (am->msg_index_by_name_and_crc);
@@ -450,8 +473,10 @@ vl_api_sockclnt_create_t_handler (vl_api_sockclnt_create_t * mp)
   hash_foreach_pair (hp, am->msg_index_by_name_and_crc,
   ({
     rp->message_table[i].index = htons(hp->value[0]);
-    strncpy_s((char *)rp->message_table[i].name, 64 /* bytes of space at dst */,
-              (char *)hp->key, 64-1 /* chars to copy, without zero byte. */);
+    (void) strncpy_s((char *)rp->message_table[i].name,
+                     64 /* bytes of space at dst */,
+                     (char *)hp->key,
+                     64-1 /* chars to copy, without zero byte. */);
     i++;
   }));
   /* *INDENT-ON* */
@@ -516,7 +541,8 @@ vl_sock_api_send_fd_msg (int socket_fd, int fds[], int n_fds)
   cmsg->cmsg_type = SCM_RIGHTS;
   clib_memcpy_fast (CMSG_DATA (cmsg), fds, sizeof (int) * n_fds);
 
-  rv = sendmsg (socket_fd, &mh, 0);
+  while ((rv = sendmsg (socket_fd, &mh, 0)) < 0 && errno == EAGAIN)
+    ;
   if (rv < 0)
     return clib_error_return_unix (0, "sendmsg");
   return 0;
@@ -587,7 +613,7 @@ vl_api_sock_init_shm_t_handler (vl_api_sock_init_shm_t * mp)
   ssvm_private_t _memfd_private, *memfd = &_memfd_private;
   svm_map_region_args_t _args, *a = &_args;
   vl_api_registration_t *regp;
-  api_main_t *am = &api_main;
+  api_main_t *am = vlibapi_get_main ();
   svm_region_t *vlib_rp;
   clib_file_t *cf;
   vl_api_shm_elem_config_t *config = 0;
@@ -613,10 +639,10 @@ vl_api_sock_init_shm_t_handler (vl_api_sock_init_shm_t * mp)
   clib_memset (memfd, 0, sizeof (*memfd));
   memfd->ssvm_size = mp->requested_size;
   memfd->requested_va = 0ULL;
-  memfd->i_am_master = 1;
+  memfd->is_server = 1;
   memfd->name = format (0, "%s%c", regp->name, 0);
 
-  if ((rv = ssvm_master_init_memfd (memfd)))
+  if ((rv = ssvm_server_init_memfd (memfd)))
     goto reply;
 
   /* Remember to close this fd when the socket connection goes away */

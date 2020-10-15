@@ -73,9 +73,9 @@ test_bihash_vec64 (test_main_t * tm)
   h = &tm->hash;
 
 #if BIHASH_32_64_SVM
-  BV (clib_bihash_master_init_svm) (h, "test", user_buckets,
-				    0x30000000 /* base_addr */ ,
-				    user_memory_size);
+  BV (clib_bihash_initiator_init_svm) (h, "test", user_buckets,
+				       0x30000000 /* base_addr */ ,
+				       user_memory_size);
 #else
   BV (clib_bihash_init) (h, "test", user_buckets, user_memory_size);
 #endif
@@ -123,9 +123,9 @@ test_bihash_stale_overwrite (test_main_t * tm)
   h = &tm->hash;
 
 #if BIHASH_32_64_SVM
-  BV (clib_bihash_master_init_svm) (h, "test", tm->nbuckets,
-				    0x30000000 /* base_addr */ ,
-				    tm->hash_memory_size);
+  BV (clib_bihash_initiator_init_svm) (h, "test", tm->nbuckets,
+				       0x30000000 /* base_addr */ ,
+				       tm->hash_memory_size);
 #else
   BV (clib_bihash_init) (h, "test", tm->nbuckets, tm->hash_memory_size);
 #endif
@@ -208,9 +208,9 @@ test_bihash_threads (test_main_t * tm)
   h = &tm->hash;
 
 #if BIHASH_32_64_SVM
-  BV (clib_bihash_master_init_svm) (h, "test", tm->nbuckets,
-				    0x30000000 /* base_addr */ ,
-				    tm->hash_memory_size);
+  BV (clib_bihash_initiator_init_svm) (h, "test", tm->nbuckets,
+				       0x30000000 /* base_addr */ ,
+				       tm->hash_memory_size);
 #else
   BV (clib_bihash_init) (h, "test", tm->nbuckets, tm->hash_memory_size);
 #endif
@@ -262,9 +262,9 @@ test_bihash (test_main_t * tm)
   h = &tm->hash;
 
 #if BIHASH_32_64_SVM
-  BV (clib_bihash_master_init_svm) (h, "test", tm->nbuckets,
-				    0x30000000 /* base_addr */ ,
-				    tm->hash_memory_size);
+  BV (clib_bihash_initiator_init_svm) (h, "test", tm->nbuckets,
+				       0x30000000 /* base_addr */ ,
+				       tm->hash_memory_size);
 #else
   BV (clib_bihash_init) (h, "test", tm->nbuckets, tm->hash_memory_size);
 #endif
@@ -337,6 +337,16 @@ test_bihash (test_main_t * tm)
 	{
 	  for (i = 0; i < tm->nitems; i++)
 	    {
+	      /* Prefetch buckets 8 iterations ahead */
+	      if (1 && (i < (tm->nitems - 8)))
+		{
+		  BVT (clib_bihash_kv) pref_kv;
+		  u64 pref_hash;
+		  pref_kv.key = tm->keys[i + 8];
+		  pref_hash = BV (clib_bihash_hash) (&pref_kv);
+		  BV (clib_bihash_prefetch_bucket) (h, pref_hash);
+		}
+
 	      kv.key = tm->keys[i];
 	      if (BV (clib_bihash_search) (h, &kv, &kv) < 0)
 		if (BV (clib_bihash_search) (h, &kv, &kv) < 0)
@@ -356,8 +366,10 @@ test_bihash (test_main_t * tm)
 	  total_searches = (uword) tm->search_iter * (uword) tm->nitems;
 
 	  if (delta > 0)
-	    fformat (stdout, "%.f searches per second\n",
-		     ((f64) total_searches) / delta);
+	    fformat (stdout,
+		     "%.f searches per second, %.2f nsec per search\n",
+		     ((f64) total_searches) / delta,
+		     1e9 * (delta / ((f64) total_searches)));
 
 	  fformat (stdout, "%lld searches in %.6f seconds\n", total_searches,
 		   delta);
@@ -409,6 +421,16 @@ test_bihash (test_main_t * tm)
 	    {
 	      for (j = 0; j < tm->nitems; j++)
 		{
+		  /* Prefetch buckets 8 iterations ahead */
+		  if (1 && (j < (tm->nitems - 8)))
+		    {
+		      BVT (clib_bihash_kv) pref_kv;
+		      u64 pref_hash;
+		      pref_kv.key = tm->keys[j + 8];
+		      pref_hash = BV (clib_bihash_hash) (&pref_kv);
+		      BV (clib_bihash_prefetch_bucket) (h, pref_hash);
+		    }
+
 		  kv.key = tm->keys[j];
 		  rv = BV (clib_bihash_search) (h, &kv, &kv);
 		  if (j <= i && rv >= 0)

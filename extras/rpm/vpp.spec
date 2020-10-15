@@ -59,20 +59,25 @@ BuildRequires: python, python-devel, python-virtualenv, python-ply
 BuildRequires: python3, python36-devel, python3-virtualenv
 BuildRequires: cmake
 %else
-%if 0%{rhel} == 7
-Requires: epel-release
+%if 0%{rhel} >= 7
 Requires: vpp-lib = %{_version}-%{_release}, vpp-selinux-policy = %{_version}-%{_release}, net-tools, pciutils, python36
 Requires: boost-filesystem mbedtls libffi-devel
 BuildRequires: epel-release
 BuildRequires: mbedtls-devel mbedtls
-BuildRequires: devtoolset-7-toolchain
 BuildREquires: openssl-devel
 BuildRequires: python36-devel
+%if 0%{rhel} == 7
+BuildRequires: devtoolset-9-toolchain
 BuildRequires: cmake3
+BuildRequires: glibc-static, yum-utils
+%else
+BuildRequires: cmake
+BuildRequires: dnf-utils
+%endif
 %endif
 %endif
 BuildRequires: libffi-devel
-BuildRequires: glibc-static, yum-utils, redhat-lsb
+BuildRequires: redhat-lsb
 BuildRequires: apr-devel
 BuildRequires: numactl-devel
 BuildRequires: autoconf automake libtool byacc bison flex
@@ -144,7 +149,7 @@ This package contains the python bindings for the vpp api
 Summary: VPP api python3 bindings
 Group: Development/Libraries
 Requires: vpp = %{_version}-%{_release}, vpp-lib = %{_version}-%{_release}, libffi-devel
-Requires: python-setuptools
+Requires: python3-setuptools
 
 %description api-python3
 This package contains the python3 bindings for the vpp api
@@ -152,24 +157,32 @@ This package contains the python3 bindings for the vpp api
 %package selinux-policy
 Summary: VPP Security-Enhanced Linux (SELinux) policy
 Group: System Environment/Base
-Requires(post): selinux-policy-base >= %{selinux_policyver}, selinux-policy-targeted >= %{selinux_policyver}, policycoreutils, policycoreutils-python libselinux-utils
+Requires(post): selinux-policy-base >= %{selinux_policyver}, selinux-policy-targeted >= %{selinux_policyver}, policycoreutils, libselinux-utils
+%if 0%{rhel} < 8
+Requires(post): policycoreutils-python
+%else
+Requires(post): python3-policycoreutils
+%endif
 
 %description selinux-policy
 This package contains a tailored VPP SELinux policy
 
 %prep
-%setup -q -n %{name}-%{_version}
+%setup -q -c -T -n %{name}-%{_version}
+cd ..
+unxz --stdout ./SOURCES/%{name}-%{_version}-%{_release}.tar.xz | tar --extract --touch
+cd -
 
 %pre
 # Add the vpp group
 groupadd -f -r vpp
 
 %build
-%if 0%{?rhel}
-. /opt/rh/devtoolset-7/enable
+%if 0%{rhel} < 8
+. /opt/rh/devtoolset-9/enable
 %endif
 %if %{with aesni}
-    make bootstrap
+    make install-dep
     make -C build-root PLATFORM=vpp TAG=%{_vpp_tag} install-packages
 %else
     make bootstrap AESNI=n
@@ -364,7 +377,6 @@ fi
 %{_unitdir}/vpp.service
 /usr/bin/vpp*
 /usr/bin/svm*
-/usr/bin/elftool
 %config(noreplace) /etc/sysctl.d/80-vpp.conf
 %config(noreplace) /etc/vpp/startup.conf
 /usr/share/vpp/api/*
@@ -403,6 +415,9 @@ fi
 %files devel
 %defattr(-,bin,bin)
 /usr/bin/vppapigen
+/usr/bin/vapi_c_gen.py
+/usr/bin/vapi_cpp_gen.py
+/usr/bin/vapi_json_parser.py
 %{_includedir}/*
 /usr/share/doc/vpp/examples/sample-plugin
 /usr/share/vpp

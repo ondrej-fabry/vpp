@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import unittest
 
@@ -12,8 +12,11 @@ from scapy.volatile import RandMAC, RandIP
 from framework import VppTestCase, VppTestRunner
 from vpp_sub_interface import L2_VTR_OP, VppDot1QSubint
 from vpp_gre_interface import VppGreInterface
+from vpp_teib import VppTeib
 from vpp_ip import DpoProto
-from vpp_ip_route import VppIpRoute, VppRoutePath, VppIpTable, FibPathProto
+from vpp_ip_route import VppIpRoute, VppRoutePath, VppIpTable, FibPathProto, \
+    VppMplsLabel
+from vpp_mpls_tunnel_interface import VppMPLSTunnelInterface
 from util import ppp, ppc
 from vpp_papi import VppEnum
 
@@ -47,7 +50,7 @@ class TestGREInputNodes(VppTestCase):
         self.pg_start()
         # no tunnel created, gre-input not registered
         err = self.statistics.get_counter(
-            '/err/ip4-input/unknown ip protocol')[0]
+            '/err/ip4-local/unknown ip protocol')[0]
         self.assertEqual(err, 1)
         err_count = err
 
@@ -59,7 +62,7 @@ class TestGREInputNodes(VppTestCase):
         self.pg_start()
         # tunnel created, gre-input registered
         err = self.statistics.get_counter(
-            '/err/ip4-input/unknown ip protocol')[0]
+            '/err/ip4-local/unknown ip protocol')[0]
         # expect no new errors
         self.assertEqual(err, err_count)
 
@@ -79,7 +82,7 @@ class TestGRE(VppTestCase):
         super(TestGRE, self).setUp()
 
         # create 3 pg interfaces - set one in a non-default table.
-        self.create_pg_interfaces(range(3))
+        self.create_pg_interfaces(range(5))
 
         self.tbl = VppIpTable(self, 1)
         self.tbl.add_vpp_config()
@@ -94,6 +97,10 @@ class TestGRE(VppTestCase):
         self.pg1.resolve_arp()
         self.pg2.config_ip6()
         self.pg2.resolve_ndp()
+        self.pg3.config_ip4()
+        self.pg3.resolve_arp()
+        self.pg4.config_ip4()
+        self.pg4.resolve_arp()
 
     def tearDown(self):
         for i in self.pg_interfaces:
@@ -103,26 +110,28 @@ class TestGRE(VppTestCase):
         self.pg1.set_table_ip4(0)
         super(TestGRE, self).tearDown()
 
-    def create_stream_ip4(self, src_if, src_ip, dst_ip):
+    def create_stream_ip4(self, src_if, src_ip, dst_ip, dscp=0, ecn=0):
         pkts = []
+        tos = (dscp << 2) | ecn
         for i in range(0, 257):
             info = self.create_packet_info(src_if, src_if)
             payload = self.info_to_payload(info)
             p = (Ether(dst=src_if.local_mac, src=src_if.remote_mac) /
-                 IP(src=src_ip, dst=dst_ip) /
+                 IP(src=src_ip, dst=dst_ip, tos=tos) /
                  UDP(sport=1234, dport=1234) /
                  Raw(payload))
             info.data = p.copy()
             pkts.append(p)
         return pkts
 
-    def create_stream_ip6(self, src_if, src_ip, dst_ip):
+    def create_stream_ip6(self, src_if, src_ip, dst_ip, dscp=0, ecn=0):
         pkts = []
+        tc = (dscp << 2) | ecn
         for i in range(0, 257):
             info = self.create_packet_info(src_if, src_if)
             payload = self.info_to_payload(info)
             p = (Ether(dst=src_if.local_mac, src=src_if.remote_mac) /
-                 IPv6(src=src_ip, dst=dst_ip) /
+                 IPv6(src=src_ip, dst=dst_ip, tc=tc) /
                  UDP(sport=1234, dport=1234) /
                  Raw(payload))
             info.data = p.copy()
@@ -220,9 +229,11 @@ class TestGRE(VppTestCase):
         return pkts
 
     def verify_tunneled_4o4(self, src_if, capture, sent,
-                            tunnel_src, tunnel_dst):
+                            tunnel_src, tunnel_dst,
+                            dscp=0, ecn=0):
 
         self.assertEqual(len(capture), len(sent))
+        tos = (dscp << 2) | ecn
 
         for i in range(len(capture)):
             try:
@@ -234,6 +245,8 @@ class TestGRE(VppTestCase):
 
                 self.assertEqual(rx_ip.src, tunnel_src)
                 self.assertEqual(rx_ip.dst, tunnel_dst)
+                self.assertEqual(rx_ip.tos, tos)
+                self.assertEqual(rx_ip.len, len(rx_ip))
 
                 rx_gre = rx[GRE]
                 rx_ip = rx_gre[IP]
@@ -249,9 +262,11 @@ class TestGRE(VppTestCase):
                 raise
 
     def verify_tunneled_6o6(self, src_if, capture, sent,
-                            tunnel_src, tunnel_dst):
+                            tunnel_src, tunnel_dst,
+                            dscp=0, ecn=0):
 
         self.assertEqual(len(capture), len(sent))
+        tc = (dscp << 2) | ecn
 
         for i in range(len(capture)):
             try:
@@ -263,8 +278,12 @@ class TestGRE(VppTestCase):
 
                 self.assertEqual(rx_ip.src, tunnel_src)
                 self.assertEqual(rx_ip.dst, tunnel_dst)
+                self.assertEqual(rx_ip.tc, tc)
 
                 rx_gre = GRE(scapy.compat.raw(rx_ip[IPv6].payload))
+
+                self.assertEqual(rx_ip.plen, len(rx_gre))
+
                 rx_ip = rx_gre[IPv6]
 
                 self.assertEqual(rx_ip.src, tx_ip.src)
@@ -291,6 +310,9 @@ class TestGRE(VppTestCase):
                 self.assertEqual(rx_ip.dst, tunnel_dst)
 
                 rx_gre = GRE(scapy.compat.raw(rx_ip[IPv6].payload))
+
+                self.assertEqual(rx_ip.plen, len(rx_gre))
+
                 tx_ip = tx[IP]
                 rx_ip = rx_gre[IP]
 
@@ -316,6 +338,7 @@ class TestGRE(VppTestCase):
 
                 self.assertEqual(rx_ip.src, tunnel_src)
                 self.assertEqual(rx_ip.dst, tunnel_dst)
+                self.assertEqual(rx_ip.len, len(rx_ip))
 
                 rx_gre = GRE(scapy.compat.raw(rx_ip[IP].payload))
                 rx_ip = rx_gre[IPv6]
@@ -343,6 +366,7 @@ class TestGRE(VppTestCase):
 
                 self.assertEqual(rx_ip.src, tunnel_src)
                 self.assertEqual(rx_ip.dst, tunnel_dst)
+                self.assertEqual(rx_ip.len, len(rx_ip))
 
                 rx_gre = rx[GRE]
                 rx_l2 = rx_gre[Ether]
@@ -433,6 +457,28 @@ class TestGRE(VppTestCase):
                 rx = capture[i]
 
                 tx_ip = tx[IP]
+                rx_ip = rx[IPv6]
+                tx_gre = tx[GRE]
+                tx_ip = tx_gre[IPv6]
+
+                self.assertEqual(rx_ip.src, tx_ip.src)
+                self.assertEqual(rx_ip.dst, tx_ip.dst)
+                self.assertEqual(rx_ip.hlim + 1, tx_ip.hlim)
+
+            except:
+                self.logger.error(ppp("Rx:", rx))
+                self.logger.error(ppp("Tx:", tx))
+                raise
+
+    def verify_decapped_6o6(self, src_if, capture, sent):
+        self.assertEqual(len(capture), len(sent))
+
+        for i in range(len(capture)):
+            try:
+                tx = sent[i]
+                rx = capture[i]
+
+                tx_ip = tx[IPv6]
                 rx_ip = rx[IPv6]
                 tx_gre = tx[GRE]
                 tx_ip = tx_gre[IPv6]
@@ -586,11 +632,63 @@ class TestGRE(VppTestCase):
                                  self.pg0.local_ip4, "1.1.1.2")
 
         #
+        # add a labelled route through the tunnel
+        #
+        label_via_tun = VppIpRoute(self, "5.4.3.2", 32,
+                                   [VppRoutePath("0.0.0.0",
+                                                 gre_if.sw_if_index,
+                                                 labels=[VppMplsLabel(33)])])
+        label_via_tun.add_vpp_config()
+
+        tx = self.create_stream_ip4(self.pg0, "5.5.5.5", "5.4.3.2")
+        rx = self.send_and_expect(self.pg0, tx, self.pg0)
+        self.verify_tunneled_4o4(self.pg0, rx, tx,
+                                 self.pg0.local_ip4, "1.1.1.2")
+
+        #
+        # an MPLS tunnel over the GRE tunnel add a route through
+        # the mpls tunnel
+        #
+        mpls_tun = VppMPLSTunnelInterface(
+            self,
+            [VppRoutePath("0.0.0.0",
+                          gre_if.sw_if_index,
+                          labels=[VppMplsLabel(44),
+                                  VppMplsLabel(46)])])
+        mpls_tun.add_vpp_config()
+        mpls_tun.admin_up()
+
+        label_via_mpls = VppIpRoute(self, "5.4.3.1", 32,
+                                    [VppRoutePath("0.0.0.0",
+                                                  mpls_tun.sw_if_index,
+                                                  labels=[VppMplsLabel(33)])])
+        label_via_mpls.add_vpp_config()
+
+        tx = self.create_stream_ip4(self.pg0, "5.5.5.5", "5.4.3.1")
+        rx = self.send_and_expect(self.pg0, tx, self.pg0)
+        self.verify_tunneled_4o4(self.pg0, rx, tx,
+                                 self.pg0.local_ip4, "1.1.1.2")
+
+        mpls_tun_l2 = VppMPLSTunnelInterface(
+            self,
+            [VppRoutePath("0.0.0.0",
+                          gre_if.sw_if_index,
+                          labels=[VppMplsLabel(44),
+                                  VppMplsLabel(46)])],
+            is_l2=1)
+        mpls_tun_l2.add_vpp_config()
+        mpls_tun_l2.admin_up()
+
+        #
         # test case cleanup
         #
         route_tun_dst.remove_vpp_config()
         route_via_tun.remove_vpp_config()
         route6_via_tun.remove_vpp_config()
+        label_via_mpls.remove_vpp_config()
+        label_via_tun.remove_vpp_config()
+        mpls_tun.remove_vpp_config()
+        mpls_tun_l2.remove_vpp_config()
         gre_if.remove_vpp_config()
 
         self.pg0.unconfig_ip6()
@@ -692,6 +790,8 @@ class TestGRE(VppTestCase):
     def test_gre_vrf(self):
         """ GRE tunnel VRF Tests """
 
+        e = VppEnum.vl_api_tunnel_encap_decap_flags_t
+
         #
         # Create an L3 GRE tunnel whose destination is in the non-default
         # table. The underlay is thus non-default - the overlay is still
@@ -699,9 +799,13 @@ class TestGRE(VppTestCase):
         #  - set it admin up
         #  - assign an IP Addres
         #
-        gre_if = VppGreInterface(self, self.pg1.local_ip4,
-                                 "2.2.2.2",
-                                 outer_fib_id=1)
+        gre_if = VppGreInterface(
+            self, self.pg1.local_ip4,
+            "2.2.2.2",
+            outer_table_id=1,
+            flags=(e.TUNNEL_API_ENCAP_DECAP_FLAG_ENCAP_COPY_DSCP |
+                   e.TUNNEL_API_ENCAP_DECAP_FLAG_ENCAP_COPY_ECN))
+
         gre_if.add_vpp_config()
         gre_if.admin_up()
         gre_if.config_ip4()
@@ -729,10 +833,12 @@ class TestGRE(VppTestCase):
         #  - packets are GRE encapped
         #
         self.vapi.cli("clear trace")
-        tx = self.create_stream_ip4(self.pg0, "5.5.5.5", "9.9.9.9")
+        tx = self.create_stream_ip4(self.pg0, "5.5.5.5", "9.9.9.9",
+                                    dscp=5, ecn=3)
         rx = self.send_and_expect(self.pg0, tx, self.pg1)
         self.verify_tunneled_4o4(self.pg1, rx, tx,
-                                 self.pg1.local_ip4, "2.2.2.2")
+                                 self.pg1.local_ip4, "2.2.2.2",
+                                 dscp=5, ecn=3)
 
         #
         # Send tunneled packets that match the created tunnel and
@@ -967,6 +1073,202 @@ class TestGRE(VppTestCase):
         #
         route_via_tun_2.remove_vpp_config()
         gre_if.remove_vpp_config()
+
+    def test_mgre(self):
+        """ mGRE IPv4 tunnel Tests """
+
+        for itf in self.pg_interfaces[3:]:
+            #
+            # one underlay nh for each overlay/tunnel peer
+            #
+            itf.generate_remote_hosts(4)
+            itf.configure_ipv4_neighbors()
+
+            #
+            # Create an L3 GRE tunnel.
+            #  - set it admin up
+            #  - assign an IP Addres
+            #  - Add a route via the tunnel
+            #
+            gre_if = VppGreInterface(self,
+                                     itf.local_ip4,
+                                     "0.0.0.0",
+                                     mode=(VppEnum.vl_api_tunnel_mode_t.
+                                           TUNNEL_API_MODE_MP))
+            gre_if.add_vpp_config()
+            gre_if.admin_up()
+            gre_if.config_ip4()
+            gre_if.generate_remote_hosts(4)
+
+            self.logger.info(self.vapi.cli("sh adj"))
+            self.logger.info(self.vapi.cli("sh ip fib"))
+
+            #
+            # ensure we don't match to the tunnel if the source address
+            # is all zeros
+            #
+            tx = self.create_tunnel_stream_4o4(self.pg0,
+                                               "0.0.0.0",
+                                               itf.local_ip4,
+                                               self.pg0.local_ip4,
+                                               self.pg0.remote_ip4)
+            self.send_and_assert_no_replies(self.pg0, tx)
+
+            #
+            # for-each peer
+            #
+            for ii in range(1, 4):
+                route_addr = "4.4.4.%d" % ii
+
+                #
+                # route traffic via the peer
+                #
+                route_via_tun = VppIpRoute(
+                    self, route_addr, 32,
+                    [VppRoutePath(gre_if._remote_hosts[ii].ip4,
+                                  gre_if.sw_if_index)])
+                route_via_tun.add_vpp_config()
+
+                #
+                # Add a TEIB entry resolves the peer
+                #
+                teib = VppTeib(self, gre_if,
+                               gre_if._remote_hosts[ii].ip4,
+                               itf._remote_hosts[ii].ip4)
+                teib.add_vpp_config()
+
+                #
+                # Send a packet stream that is routed into the tunnel
+                #  - packets are GRE encapped
+                #
+                tx_e = self.create_stream_ip4(self.pg0, "5.5.5.5", route_addr)
+                rx = self.send_and_expect(self.pg0, tx_e, itf)
+                self.verify_tunneled_4o4(self.pg0, rx, tx_e,
+                                         itf.local_ip4,
+                                         itf._remote_hosts[ii].ip4)
+
+                tx_i = self.create_tunnel_stream_4o4(self.pg0,
+                                                     itf._remote_hosts[ii].ip4,
+                                                     itf.local_ip4,
+                                                     self.pg0.local_ip4,
+                                                     self.pg0.remote_ip4)
+                rx = self.send_and_expect(self.pg0, tx_i, self.pg0)
+                self.verify_decapped_4o4(self.pg0, rx, tx_i)
+
+                #
+                # delete and re-add the TEIB
+                #
+                teib.remove_vpp_config()
+                self.send_and_assert_no_replies(self.pg0, tx_e)
+                self.send_and_assert_no_replies(self.pg0, tx_i)
+
+                teib.add_vpp_config()
+                rx = self.send_and_expect(self.pg0, tx_e, itf)
+                self.verify_tunneled_4o4(self.pg0, rx, tx_e,
+                                         itf.local_ip4,
+                                         itf._remote_hosts[ii].ip4)
+                rx = self.send_and_expect(self.pg0, tx_i, self.pg0)
+                self.verify_decapped_4o4(self.pg0, rx, tx_i)
+
+            gre_if.admin_down()
+            gre_if.unconfig_ip4()
+
+    def test_mgre6(self):
+        """ mGRE IPv6 tunnel Tests """
+
+        self.pg0.config_ip6()
+        self.pg0.resolve_ndp()
+
+        e = VppEnum.vl_api_tunnel_encap_decap_flags_t
+
+        for itf in self.pg_interfaces[3:]:
+            #
+            # one underlay nh for each overlay/tunnel peer
+            #
+            itf.config_ip6()
+            itf.generate_remote_hosts(4)
+            itf.configure_ipv6_neighbors()
+
+            #
+            # Create an L3 GRE tunnel.
+            #  - set it admin up
+            #  - assign an IP Addres
+            #  - Add a route via the tunnel
+            #
+            gre_if = VppGreInterface(
+                self,
+                itf.local_ip6,
+                "::",
+                mode=(VppEnum.vl_api_tunnel_mode_t.
+                      TUNNEL_API_MODE_MP),
+                flags=e.TUNNEL_API_ENCAP_DECAP_FLAG_ENCAP_COPY_DSCP)
+
+            gre_if.add_vpp_config()
+            gre_if.admin_up()
+            gre_if.config_ip6()
+            gre_if.generate_remote_hosts(4)
+
+            #
+            # for-each peer
+            #
+            for ii in range(1, 4):
+                route_addr = "4::%d" % ii
+
+                #
+                # Add a TEIB entry resolves the peer
+                #
+                teib = VppTeib(self, gre_if,
+                               gre_if._remote_hosts[ii].ip6,
+                               itf._remote_hosts[ii].ip6)
+                teib.add_vpp_config()
+
+                #
+                # route traffic via the peer
+                #
+                route_via_tun = VppIpRoute(
+                    self, route_addr, 128,
+                    [VppRoutePath(gre_if._remote_hosts[ii].ip6,
+                                  gre_if.sw_if_index)])
+                route_via_tun.add_vpp_config()
+
+                #
+                # Send a packet stream that is routed into the tunnel
+                #  - packets are GRE encapped
+                #
+                tx_e = self.create_stream_ip6(self.pg0, "5::5", route_addr,
+                                              dscp=2, ecn=1)
+                rx = self.send_and_expect(self.pg0, tx_e, itf)
+                self.verify_tunneled_6o6(self.pg0, rx, tx_e,
+                                         itf.local_ip6,
+                                         itf._remote_hosts[ii].ip6,
+                                         dscp=2)
+                tx_i = self.create_tunnel_stream_6o6(self.pg0,
+                                                     itf._remote_hosts[ii].ip6,
+                                                     itf.local_ip6,
+                                                     self.pg0.local_ip6,
+                                                     self.pg0.remote_ip6)
+                rx = self.send_and_expect(self.pg0, tx_i, self.pg0)
+                self.verify_decapped_6o6(self.pg0, rx, tx_i)
+
+                #
+                # delete and re-add the TEIB
+                #
+                teib.remove_vpp_config()
+                self.send_and_assert_no_replies(self.pg0, tx_e)
+
+                teib.add_vpp_config()
+                rx = self.send_and_expect(self.pg0, tx_e, itf)
+                self.verify_tunneled_6o6(self.pg0, rx, tx_e,
+                                         itf.local_ip6,
+                                         itf._remote_hosts[ii].ip6,
+                                         dscp=2)
+                rx = self.send_and_expect(self.pg0, tx_i, self.pg0)
+                self.verify_decapped_6o6(self.pg0, rx, tx_i)
+
+            gre_if.admin_down()
+            gre_if.unconfig_ip4()
+            itf.unconfig_ip6()
+        self.pg0.unconfig_ip6()
 
 
 if __name__ == '__main__':

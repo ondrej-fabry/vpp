@@ -172,8 +172,8 @@ syslog:
 
 }
 
-vlib_log_class_t
-vlib_log_register_class (char *class, char *subclass)
+static vlib_log_class_t
+vlib_log_register_class_internal (char *class, char *subclass, u32 limit)
 {
   vlib_log_main_t *lm = &log_main;
   vlib_log_class_data_t *c = NULL;
@@ -199,11 +199,25 @@ vlib_log_register_class (char *class, char *subclass)
   vec_add2 (c->subclasses, s, 1);
   s->index = s - c->subclasses;
   s->name = subclass ? format (0, "%s", subclass) : 0;
-  s->rate_limit = lm->default_rate_limit;
+  s->rate_limit = (limit == 0) ? lm->default_rate_limit : limit;
   s->level = lm->default_log_level;
   s->syslog_level = lm->default_syslog_log_level;
   return (c->index << 16) | (s->index);
 }
+
+vlib_log_class_t
+vlib_log_register_class (char *class, char *subclass)
+{
+  return vlib_log_register_class_internal (class, subclass,
+					   0 /* default rate limit */ );
+}
+
+vlib_log_class_t
+vlib_log_register_class_rate_limit (char *class, char *subclass, u32 limit)
+{
+  return vlib_log_register_class_internal (class, subclass, limit);
+}
+
 
 u8 *
 format_vlib_log_level (u8 * s, va_list * args)
@@ -265,7 +279,7 @@ show_log (vlib_main_t * vm,
   while (count--)
     {
       e = vec_elt_at_index (lm->entries, i);
-      vlib_cli_output (vm, "%U %-10U %-10U %v",
+      vlib_cli_output (vm, "%U %-10U %-14U %v",
 		       format_time_float, 0, e->timestamp + time_offset,
 		       format_vlib_log_level, e->level,
 		       format_vlib_log_class, e->class, e->string);
@@ -491,7 +505,7 @@ set_log_class (vlib_main_t * vm,
 /* *INDENT-OFF* */
 VLIB_CLI_COMMAND (cli_set_log, static) = {
   .path = "set logging class",
-  .short_help = "set loggging class <class> [rate-limit <int>] "
+  .short_help = "set logging class <class> [rate-limit <int>] "
     "[level <level>] [syslog-level <level>]",
   .function = set_log_class,
 };

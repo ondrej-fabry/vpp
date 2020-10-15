@@ -27,12 +27,17 @@ if (NOT IBVERBS_LIB OR NOT RDMA_UTIL_LIB OR NOT MLX5_LIB)
   return()
 endif()
 
-if (MLX5_LIB)
-  string_append(RDMA_LINK_FLAGS "-Wl,--whole-archive,${MLX5_LIB},--no-whole-archive")
-endif()
+string_append(RDMA_LINK_FLAGS "-Wl,--whole-archive,${MLX5_LIB},--no-whole-archive")
 
-set(CMAKE_REQUIRED_FLAGS "-fPIC -shared ${IBVERBS_LIB} ${RDMA_UTIL_LIB} ${RDMA_LINK_FLAGS}")
-CHECK_C_SOURCE_COMPILES("" IBVERBS_COMPILES_CHECK)
+set(CMAKE_REQUIRED_FLAGS "-fPIC -shared -pthread -Wno-unused-command-line-argument ${RDMA_LINK_FLAGS} ${IBVERBS_LIB} ${RDMA_UTIL_LIB}")
+set(CMAKE_REQUIRED_INCLUDES "${IBVERBS_INCLUDE_DIR}")
+set(CMAKE_REQUIRED_LIBRARIES "c") # force linkage by including libc explicitely
+CHECK_C_SOURCE_COMPILES("
+#include <infiniband/verbs.h>
+int main(void)
+{
+    return 0 != ibv_get_device_list(0);
+}" IBVERBS_COMPILES_CHECK)
 
 if (NOT IBVERBS_COMPILES_CHECK)
   message(WARNING "rdma plugins - no working ibverbs found - rdma plugin disabled")
@@ -43,16 +48,25 @@ include_directories(${IBVERBS_INCLUDE_DIR})
 
 add_vpp_plugin(rdma
   SOURCES
+  api.c
   cli.c
   device.c
   format.c
   plugin.c
+  unformat.c
   input.c
   output.c
 
   MULTIARCH_SOURCES
   input.c
   output.c
+
+  API_FILES
+  rdma.api
+
+  API_TEST_SOURCES
+  unformat.c
+  test_api.c
 
   LINK_FLAGS
   "${RDMA_LINK_FLAGS}"

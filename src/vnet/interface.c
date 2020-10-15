@@ -42,7 +42,6 @@
 #include <vnet/fib/ip6_fib.h>
 #include <vnet/adj/adj.h>
 #include <vnet/adj/adj_mcast.h>
-#include <vnet/l2/l2_input.h>
 
 typedef enum vnet_interface_helper_flags_t_
 {
@@ -200,8 +199,14 @@ unserialize_vnet_interface_state (serialize_main_t * m, va_list * va)
     pool_foreach (hif, im->hw_interfaces, ({
       unserialize_cstring (m, &class_name);
       p = hash_get_mem (im->hw_interface_class_by_name, class_name);
-      ASSERT (p != 0);
-      error = vnet_hw_interface_set_class_helper (vnm, hif->hw_if_index, p[0], /* redistribute */ 0);
+      if (p)
+        {
+          error = vnet_hw_interface_set_class_helper
+            (vnm, hif->hw_if_index, p[0], /* redistribute */ 0);
+        }
+      else
+        error = clib_error_return (0, "hw class %s AWOL?", class_name);
+
       if (error)
 	clib_error_report (error);
       vec_free (class_name);
@@ -582,6 +587,16 @@ vnet_create_sw_interface (vnet_main_t * vnm, vnet_sw_interface_t * template,
   vnet_hw_interface_t *hi;
   vnet_device_class_t *dev_class;
 
+  if (template->sub.eth.flags.two_tags == 1
+      && template->sub.eth.flags.exact_match == 1
+      && (template->sub.eth.flags.inner_vlan_id_any == 1
+	  || template->sub.eth.flags.outer_vlan_id_any == 1))
+    {
+      error = clib_error_return (0,
+				 "inner-dot1q any exact-match is unsupported");
+      return error;
+    }
+
   hi = vnet_get_sup_hw_interface (vnm, template->sup_sw_if_index);
   dev_class = vnet_get_device_class (vnm, hi->dev_class_index);
 
@@ -620,18 +635,6 @@ vnet_delete_sw_interface (vnet_main_t * vnm, u32 sw_if_index)
     pool_elt_at_index (im->sw_interfaces, sw_if_index);
 
   /* Check if the interface has config and is removed from L2 BD or XConnect */
-  vlib_main_t *vm = vlib_get_main ();
-  l2_input_config_t *config;
-  if (sw_if_index < vec_len (l2input_main.configs))
-    {
-      config = vec_elt_at_index (l2input_main.configs, sw_if_index);
-      if (config->xconnect)
-	set_int_l2_mode (vm, vnm, MODE_L3, config->output_sw_if_index, 0,
-			 L2_BD_PORT_TYPE_NORMAL, 0, 0);
-      if (config->xconnect || config->bridge)
-	set_int_l2_mode (vm, vnm, MODE_L3, sw_if_index, 0,
-			 L2_BD_PORT_TYPE_NORMAL, 0, 0);
-    }
   vnet_clear_sw_interface_tag (vnm, sw_if_index);
 
   /* Bring down interface in case it is up. */
@@ -733,9 +736,10 @@ setup_tx_node (vlib_main_t * vm,
   n->function = dev_class->tx_function;
   n->format_trace = dev_class->format_tx_trace;
 
+  /// XXX: Update this to use counter structure
   vlib_register_errors (vm, node_index,
 			dev_class->tx_function_n_errors,
-			dev_class->tx_function_error_strings);
+			dev_class->tx_function_error_strings, 0);
 }
 
 static void
@@ -768,10 +772,11 @@ vnet_register_interface (vnet_main_t * vnm,
 
   pool_get (im->hw_interfaces, hw);
   clib_memset (hw, 0, sizeof (*hw));
+  hw->trace_classify_table_index = ~0;
 
   hw_index = hw - im->hw_interfaces;
   hw->hw_if_index = hw_index;
-  hw->default_rx_mode = VNET_HW_INTERFACE_RX_MODE_POLLING;
+  hw->default_rx_mode = VNET_HW_IF_RX_MODE_POLLING;
 
   if (dev_class->format_device_name)
     hw->name = format (0, "%U", dev_class->format_device_name, dev_instance);
@@ -855,6 +860,8 @@ vnet_register_interface (vnet_main_t * vnm,
       foreach_vlib_main ({
         nrt = vlib_node_get_runtime (this_vlib_main, hw->output_node_index);
         nrt->function = node->function;
+	vlib_node_runtime_perf_counter (this_vlib_main, nrt, 0, 0, 0,
+					VLIB_NODE_RUNTIME_PERF_RESET);
       });
       /* *INDENT-ON* */
 
@@ -865,6 +872,8 @@ vnet_register_interface (vnet_main_t * vnm,
       foreach_vlib_main ({
         nrt = vlib_node_get_runtime (this_vlib_main, hw->tx_node_index);
         nrt->function = node->function;
+	vlib_node_runtime_perf_counter (this_vlib_main, nrt, 0, 0, 0,
+					VLIB_NODE_RUNTIME_PERF_RESET);
       });
       /* *INDENT-ON* */
 
@@ -1234,6 +1243,16 @@ vnet_sw_interface_is_p2p (vnet_main_t * vnm, u32 sw_if_index)
   return (hc->flags & VNET_HW_INTERFACE_CLASS_FLAG_P2P);
 }
 
+int
+vnet_sw_interface_is_nbma (vnet_main_t * vnm, u32 sw_if_index)
+{
+  vnet_hw_interface_t *hw = vnet_get_sup_hw_interface (vnm, sw_if_index);
+  vnet_hw_interface_class_t *hc =
+    vnet_get_hw_interface_class (vnm, hw->hw_class_index);
+
+  return (hc->flags & VNET_HW_INTERFACE_CLASS_FLAG_NBMA);
+}
+
 clib_error_t *
 vnet_interface_init (vlib_main_t * vm)
 {
@@ -1340,7 +1359,6 @@ vnet_interface_init (vlib_main_t * vm)
       }
   }
 
-  im->gso_interface_count = 0;
   /* init per-thread data */
   vec_validate_aligned (im->per_thread_data, vlib_num_workers (),
 			CLIB_CACHE_LINE_BYTES);
@@ -1423,6 +1441,48 @@ vnet_rename_interface (vnet_main_t * vnm, u32 hw_if_index, char *new_name)
   /* free the old name vector */
   vec_free (old_name);
 
+  return error;
+}
+
+clib_error_t *
+vnet_hw_interface_add_del_mac_address (vnet_main_t * vnm,
+				       u32 hw_if_index,
+				       const u8 * mac_address, u8 is_add)
+{
+  clib_error_t *error = 0;
+  vnet_hw_interface_t *hi = vnet_get_hw_interface (vnm, hw_if_index);
+
+  vnet_device_class_t *dev_class =
+    vnet_get_device_class (vnm, hi->dev_class_index);
+
+  if (!hi->hw_address)
+    {
+      error =
+	clib_error_return
+	(0, "Secondary MAC Addresses not supported for interface index %u",
+	 hw_if_index);
+      goto done;
+    }
+
+  if (dev_class->mac_addr_add_del_function)
+    error = dev_class->mac_addr_add_del_function (hi, mac_address, is_add);
+
+  if (!error)
+    {
+      vnet_hw_interface_class_t *hw_class;
+
+      hw_class = vnet_get_hw_interface_class (vnm, hi->hw_class_index);
+
+      if (NULL != hw_class->mac_addr_add_del_function)
+	error = hw_class->mac_addr_add_del_function (hi, mac_address, is_add);
+    }
+
+  /* If no errors, add to the list of secondary MACs on the ethernet intf */
+  if (!error)
+    ethernet_interface_add_del_address (&ethernet_main, hw_if_index,
+					mac_address, is_add);
+
+done:
   return error;
 }
 
@@ -1618,6 +1678,42 @@ default_update_adjacency (vnet_main_t * vnm, u32 sw_if_index, u32 ai)
       ASSERT (0);
       break;
     }
+}
+
+clib_error_t *
+vnet_hw_interface_set_rss_queues (vnet_main_t * vnm,
+				  vnet_hw_interface_t * hi,
+				  clib_bitmap_t * bitmap)
+{
+  clib_error_t *error = 0;
+  vnet_device_class_t *dev_class =
+    vnet_get_device_class (vnm, hi->dev_class_index);
+
+  if (dev_class->set_rss_queues_function)
+    {
+      if (clib_bitmap_count_set_bits (bitmap) == 0)
+	{
+	  error = clib_error_return (0,
+				     "must assign at least one valid rss queue");
+	  goto done;
+	}
+
+      error = dev_class->set_rss_queues_function (vnm, hi, bitmap);
+    }
+  else
+    {
+      error = clib_error_return (0,
+				 "setting rss queues is not supported on this interface");
+    }
+
+  if (!error)
+    {
+      clib_bitmap_free (hi->rss_queues);
+      hi->rss_queues = clib_bitmap_dup (bitmap);
+    }
+
+done:
+  return error;
 }
 
 int collect_detailed_interface_stats_flag = 0;

@@ -25,9 +25,10 @@
 
 #include <vppinfra/bihash_template.c>
 
-/** @file Static http server, sufficient to
-    serve .html / .css / .js content.
-*/
+/** @file static_server.c
+ *  Static http server, sufficient to
+ *  serve .html / .css / .js content.
+ */
 /*? %%clicmd:group_label Static HTTP Server %% ?*/
 
 http_static_server_main_t http_static_server_main;
@@ -133,8 +134,10 @@ http_static_server_session_alloc (u32 thread_index)
 {
   http_static_server_main_t *hsm = &http_static_server_main;
   http_session_t *hs;
-  pool_get (hsm->sessions[thread_index], hs);
-  memset (hs, 0, sizeof (*hs));
+  pool_get_aligned_zero_numa (hsm->sessions[thread_index], hs,
+			      0 /* not aligned */ ,
+			      1 /* zero */ ,
+			      os_get_numa_index ());
   hs->session_index = hs - hsm->sessions[thread_index];
   hs->thread_index = thread_index;
   hs->timer_handle = ~0;
@@ -243,26 +246,8 @@ http_static_server_detach_cache_entry (http_session_t * hs)
   vec_free (hs->path);
 }
 
-/** \brief clean up a session
- */
-
-static void
-http_static_server_session_cleanup (http_session_t * hs)
-{
-  if (!hs)
-    return;
-
-  http_static_server_detach_cache_entry (hs);
-
-  http_static_server_session_lookup_del (hs->thread_index,
-					 hs->vpp_session_index);
-  vec_free (hs->rx_buf);
-  http_static_server_session_free (hs);
-}
-
 /** \brief Disconnect a session
  */
-
 static void
 http_static_server_session_disconnect (http_session_t * hs)
 {
@@ -297,6 +282,7 @@ static const char *http_response_template =
 /** \brief send http data
     @param hs - http session
     @param data - the data vector to transmit
+    @param length - length of data
     @param offset - transmit offset for this operation
     @return offset for next transmit operation, may be unchanged w/ full fifo
 */
@@ -531,7 +517,6 @@ static void
 close_session (http_session_t * hs)
 {
   http_static_server_session_disconnect (hs);
-  http_static_server_session_cleanup (hs);
 }
 
 /** \brief Register a builtin GET or POST handler
@@ -676,10 +661,10 @@ find_end:
   if (p)
     {
       int rv;
-      int (*fp) (u8 *, http_session_t *);
+      int (*fp) (http_builtin_method_type_t, u8 *, http_session_t *);
       fp = (void *) p[0];
       hs->path = path;
-      rv = (*fp) (request, hs);
+      rv = (*fp) (request_type, request, hs);
       if (rv)
 	{
 	  clib_warning ("builtin handler %llx hit on %s '%s' but failed!",
@@ -799,7 +784,7 @@ find_end:
 	  dp = pool_elt_at_index (hsm->cache_pool, kv.value);
 	  hs->data = dp->data;
 	  /* Update the cache entry, mark it in-use */
-	  lru_update (hsm, dp, vlib_time_now (hsm->vlib_main));
+	  lru_update (hsm, dp, vlib_time_now (vlib_get_main ()));
 	  hs->cache_pool_index = dp - hsm->cache_pool;
 	  dp->inuse++;
 	  if (hsm->debug_level > 1)
@@ -871,7 +856,7 @@ find_end:
 	  if (hsm->debug_level > 1)
 	    clib_warning ("index %d refcnt now %d", hs->cache_pool_index,
 			  dp->inuse);
-	  lru_add (hsm, dp, vlib_time_now (hsm->vlib_main));
+	  lru_add (hsm, dp, vlib_time_now (vlib_get_main ()));
 	  kv.key = (u64) vec_dup (hs->path);
 	  kv.value = dp - hsm->cache_pool;
 	  /* Add to the lookup table */
@@ -933,7 +918,7 @@ state_sent_ok (session_t * s, http_session_t * hs,
 
   /* What kind of dog food are we serving? */
   suffix = (char *) (hs->path + vec_len (hs->path) - 1);
-  while (*suffix != '.')
+  while ((u8 *) suffix >= hs->path && *suffix != '.')
     suffix--;
   suffix++;
   http_type = "text/html";
@@ -1078,14 +1063,6 @@ http_static_server_session_disconnect_callback (session_t * s)
 {
   http_static_server_main_t *hsm = &http_static_server_main;
   vnet_disconnect_args_t _a = { 0 }, *a = &_a;
-  http_session_t *hs;
-
-  http_static_server_sessions_writer_lock ();
-
-  hs = http_static_server_session_lookup (s->thread_index, s->session_index);
-  http_static_server_session_cleanup (hs);
-
-  http_static_server_sessions_writer_unlock ();
 
   a->handle = session_handle (s);
   a->app_index = hsm->app_index;
@@ -1100,14 +1077,6 @@ http_static_server_session_reset_callback (session_t * s)
 {
   http_static_server_main_t *hsm = &http_static_server_main;
   vnet_disconnect_args_t _a = { 0 }, *a = &_a;
-  http_session_t *hs;
-
-  http_static_server_sessions_writer_lock ();
-
-  hs = http_static_server_session_lookup (s->thread_index, s->session_index);
-  http_static_server_session_cleanup (hs);
-
-  http_static_server_sessions_writer_unlock ();
 
   a->handle = session_handle (s);
   a->app_index = hsm->app_index;
@@ -1116,7 +1085,8 @@ http_static_server_session_reset_callback (session_t * s)
 
 static int
 http_static_server_session_connected_callback (u32 app_index, u32 api_context,
-					       session_t * s, u8 is_fail)
+					       session_t * s,
+					       session_error_t err)
 {
   clib_warning ("called...");
   return -1;
@@ -1129,6 +1099,30 @@ http_static_server_add_segment_callback (u32 client_index, u64 segment_handle)
   return -1;
 }
 
+static void
+http_static_session_cleanup (session_t * s, session_cleanup_ntf_t ntf)
+{
+  http_session_t *hs;
+
+  if (ntf == SESSION_CLEANUP_TRANSPORT)
+    return;
+
+  http_static_server_sessions_writer_lock ();
+
+  hs = http_static_server_session_lookup (s->thread_index, s->session_index);
+  if (!hs)
+    goto done;
+
+  http_static_server_detach_cache_entry (hs);
+  http_static_server_session_lookup_del (hs->thread_index,
+					 hs->vpp_session_index);
+  vec_free (hs->rx_buf);
+  http_static_server_session_free (hs);
+
+done:
+  http_static_server_sessions_writer_unlock ();
+}
+
 /** \brief Session-layer virtual function table
  */
 static session_cb_vft_t http_static_server_session_cb_vft = {
@@ -1139,7 +1133,8 @@ static session_cb_vft_t http_static_server_session_cb_vft = {
   .add_segment_callback = http_static_server_add_segment_callback,
   .builtin_app_rx_callback = http_static_server_rx_callback,
   .builtin_app_tx_callback = http_static_server_tx_callback,
-  .session_reset_callback = http_static_server_session_reset_callback
+  .session_reset_callback = http_static_server_session_reset_callback,
+  .session_cleanup_callback = http_static_session_cleanup,
 };
 
 static int
@@ -1169,7 +1164,7 @@ http_static_server_attach ()
     hsm->fifo_size ? hsm->fifo_size : 32 << 10;
   a->options[APP_OPTIONS_FLAGS] = APP_OPTIONS_FLAGS_IS_BUILTIN;
   a->options[APP_OPTIONS_PREALLOC_FIFO_PAIRS] = hsm->prealloc_fifos;
-  a->options[APP_OPTIONS_TLS_ENGINE] = TLS_ENGINE_OPENSSL;
+  a->options[APP_OPTIONS_TLS_ENGINE] = CRYPTO_ENGINE_OPENSSL;
 
   if (vnet_application_attach (a))
     {
@@ -1209,7 +1204,7 @@ http_static_server_listen ()
 }
 
 static void
-http_static_server_session_cleanup_cb (void *hs_handlep)
+http_static_server_session_close_cb (void *hs_handlep)
 {
   http_static_server_main_t *hsm = &http_static_server_main;
   http_session_t *hs;
@@ -1225,7 +1220,6 @@ http_static_server_session_cleanup_cb (void *hs_handlep)
     return;
   hs->timer_handle = ~0;
   http_static_server_session_disconnect (hs);
-  http_static_server_session_cleanup (hs);
 }
 
 /** \brief Expired session timer-wheel callback
@@ -1241,7 +1235,7 @@ http_expired_timers_dispatch (u32 * expired_timers)
       /* Get session handle. The first bit is the timer id */
       hs_handle = expired_timers[i] & 0x7FFFFFFF;
       session_send_rpc_evt_to_thread (hs_handle >> 24,
-				      http_static_server_session_cleanup_cb,
+				      http_static_server_session_close_cb,
 				      uword_to_pointer (hs_handle, void *));
     }
 }
@@ -1657,6 +1651,81 @@ VLIB_CLI_COMMAND (http_show_static_server_command, static) =
 /* *INDENT-ON* */
 
 static clib_error_t *
+http_clear_static_cache_command_fn (vlib_main_t * vm,
+				    unformat_input_t * input,
+				    vlib_cli_command_t * cmd)
+{
+  http_static_server_main_t *hsm = &http_static_server_main;
+  file_data_cache_t *dp;
+  u32 free_index;
+  u32 busy_items = 0;
+  BVT (clib_bihash_kv) kv;
+
+  if (hsm->www_root == 0)
+    return clib_error_return (0, "Static server disabled");
+
+  http_static_server_sessions_reader_lock ();
+
+  /* Walk the LRU list to find active entries */
+  free_index = hsm->last_index;
+  while (free_index != ~0)
+    {
+      dp = pool_elt_at_index (hsm->cache_pool, free_index);
+      free_index = dp->prev_index;
+      /* Which could be in use... */
+      if (dp->inuse)
+	{
+	  busy_items++;
+	  free_index = dp->next_index;
+	  continue;
+	}
+      kv.key = (u64) (dp->filename);
+      kv.value = ~0ULL;
+      if (BV (clib_bihash_add_del) (&hsm->name_to_data, &kv,
+				    0 /* is_add */ ) < 0)
+	{
+	  clib_warning ("BUG: cache clear delete '%s' FAILED!", dp->filename);
+	}
+
+      lru_remove (hsm, dp);
+      hsm->cache_size -= vec_len (dp->data);
+      hsm->cache_evictions++;
+      vec_free (dp->filename);
+      vec_free (dp->data);
+      if (hsm->debug_level > 1)
+	clib_warning ("pool put index %d", dp - hsm->cache_pool);
+      pool_put (hsm->cache_pool, dp);
+      free_index = hsm->last_index;
+    }
+  http_static_server_sessions_reader_unlock ();
+  if (busy_items > 0)
+    vlib_cli_output (vm, "Note: %d busy items still in cache...", busy_items);
+  else
+    vlib_cli_output (vm, "Cache cleared...");
+  return 0;
+}
+
+/*?
+ * Clear the static http server cache, to force the server to
+ * reload content from backing files
+ *
+ * @cliexpar
+ * This command clear the static http server cache
+ * @clistart
+ * clear http static cache
+ * @cliend
+ * @cliexcmd{clear http static cache}
+?*/
+/* *INDENT-OFF* */
+VLIB_CLI_COMMAND (clear_http_static_cache_command, static) =
+{
+  .path = "clear http static cache",
+  .short_help = "clear http static cache",
+  .function = http_clear_static_cache_command_fn,
+};
+/* *INDENT-ON* */
+
+static clib_error_t *
 http_static_server_main_init (vlib_main_t * vm)
 {
   http_static_server_main_t *hsm = &http_static_server_main;
@@ -1666,7 +1735,8 @@ http_static_server_main_init (vlib_main_t * vm)
   hsm->first_index = hsm->last_index = ~0;
 
   clib_timebase_init (&hsm->timebase, 0 /* GMT */ ,
-		      CLIB_TIMEBASE_DAYLIGHT_NONE);
+		      CLIB_TIMEBASE_DAYLIGHT_NONE,
+		      &vm->clib_time /* share the system clock */ );
 
   return 0;
 }

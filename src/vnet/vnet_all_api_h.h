@@ -35,32 +35,23 @@
 
 #include <vnet/bonding/bond.api.h>
 #include <vnet/devices/af_packet/af_packet.api.h>
-#include <vnet/devices/netmap/netmap.api.h>
 #include <vnet/devices/virtio/vhost_user.api.h>
 #include <vnet/devices/tap/tapv2.api.h>
 #include <vnet/gre/gre.api.h>
 #include <vnet/interface.api.h>
 #include <vnet/l2/l2.api.h>
-#include <vnet/l2tp/l2tp.api.h>
 #include <vnet/span/span.api.h>
 #include <vnet/ip/ip.api.h>
-#include <vnet/ip/rd_cp.api.h>
 #include <vnet/vxlan/vxlan.api.h>
-#include <vnet/geneve/geneve.api.h>
-#include <vnet/lldp/lldp.api.h>
 #include <vnet/vxlan-gpe/vxlan_gpe.api.h>
 #include <vnet/bfd/bfd.api.h>
 #include <vnet/ipsec/ipsec.api.h>
-#include <vnet/lisp-cp/lisp.api.h>
-#include <vnet/lisp-gpe/lisp_gpe.api.h>
-#include <vnet/lisp-cp/one.api.h>
 #include <vnet/session/session.api.h>
 #include <vnet/mpls/mpls.api.h>
 #include <vnet/srv6/sr.api.h>
 #include <vnet/srmpls/sr_mpls.api.h>
 #include <vnet/classify/classify.api.h>
 #include <vnet/ipfix-export/ipfix_export.api.h>
-#include <vnet/dhcp/dhcp.api.h>
 #include <vnet/cop/cop.api.h>
 #include <vnet/policer/policer.api.h>
 #include <vnet/ethernet/p2p_ethernet.api.h>
@@ -71,12 +62,12 @@
 #include <vnet/pg/pg.api.h>
 #include <vnet/feature/feature.api.h>
 #include <vnet/qos/qos.api.h>
-#include <vnet/dhcp/dhcp6_pd_client_cp.api.h>
-#include <vnet/dhcp/dhcp6_ia_na_client_cp.api.h>
 #include <vnet/devices/pipe/pipe.api.h>
 #include <vnet/vxlan-gbp/vxlan_gbp.api.h>
 #include <vnet/syslog/syslog.api.h>
 #include <vnet/devices/virtio/virtio.api.h>
+#include <vnet/gso/gso.api.h>
+#include <vnet/flow/flow.api.h>
 
 /*
  * fd.io coding-style-patch-verification: ON

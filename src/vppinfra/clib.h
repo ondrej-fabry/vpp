@@ -38,7 +38,12 @@
 #ifndef included_clib_h
 #define included_clib_h
 
+#include <stddef.h>
 #include <vppinfra/config.h>
+
+#ifdef  __x86_64__
+#include <x86intrin.h>
+#endif
 
 /* Standalone means to not assume we are running on a Unix box. */
 #if ! defined (CLIB_STANDALONE) && ! defined (CLIB_LINUX_KERNEL)
@@ -62,8 +67,8 @@
 #define ARRAY_LEN(x)	(sizeof (x)/sizeof (x[0]))
 
 #define _STRUCT_FIELD(t,f) (((t *) 0)->f)
-#define STRUCT_OFFSET_OF(t,f) ((uword) & _STRUCT_FIELD (t, f))
-#define STRUCT_BIT_OFFSET_OF(t,f) (BITS(u8) * (uword) & _STRUCT_FIELD (t, f))
+#define STRUCT_OFFSET_OF(t,f) offsetof(t, f)
+#define STRUCT_BIT_OFFSET_OF(t,f) (BITS(u8) * STRUCT_OFFSET_OF (t, f))
 #define STRUCT_SIZE_OF(t,f)   (sizeof (_STRUCT_FIELD (t, f)))
 #define STRUCT_BITS_OF(t,f)   (BITS (_STRUCT_FIELD (t, f)))
 #define STRUCT_ARRAY_LEN(t,f) ARRAY_LEN (_STRUCT_FIELD (t, f))
@@ -91,6 +96,10 @@
 #define __clib_weak __attribute__ ((weak))
 #define __clib_packed __attribute__ ((packed))
 #define __clib_constructor __attribute__ ((constructor))
+#define __clib_noinline __attribute__ ((noinline))
+#define __clib_aligned(x) __attribute__ ((aligned(x)))
+#define __clib_section(s) __attribute__ ((section(s)))
+#define __clib_warn_unused_result __attribute__ ((warn_unused_result))
 
 #define never_inline __attribute__ ((__noinline__))
 
@@ -110,6 +119,14 @@
 /* Hints to compiler about hot/cold code. */
 #define PREDICT_FALSE(x) __builtin_expect((x),0)
 #define PREDICT_TRUE(x) __builtin_expect((x),1)
+
+/*
+ * Compiler barrier
+ *   prevent compiler to reorder memory access accross this boundary
+ *   prevent compiler to cache values in register (force reload)
+ * Not to be confused with CPU memory barrier below
+ */
+#define CLIB_COMPILER_BARRIER() asm volatile ("":::"memory")
 
 /* Full memory barrier (read and write). */
 #define CLIB_MEMORY_BARRIER() __sync_synchronize ()
@@ -238,6 +255,12 @@ is_pow2 (uword x)
 }
 
 always_inline uword
+round_down_pow2 (uword x, uword pow2)
+{
+  return (x) & ~(pow2 - 1);
+}
+
+always_inline uword
 round_pow2 (uword x, uword pow2)
 {
   return (x + pow2 - 1) & ~(pow2 - 1);
@@ -283,6 +306,15 @@ always_inline f64
 flt_round_to_multiple (f64 x, f64 f)
 {
   return f * flt_round_nearest (x / f);
+}
+
+always_inline uword
+extract_bits (uword x, int start, int count)
+{
+#ifdef __BMI__
+  return _bextr_u64 (x, start, count);
+#endif
+  return (x >> start) & pow2_mask (count);
 }
 
 #define clib_max(x,y)				\

@@ -61,6 +61,7 @@ typedef CLIB_PACKED(struct {
   u8 default_disabled;
   const char version[32];
   const char version_required[32];
+  const char overrides[256];
   const char *early_init;
   const char *description;
 }) vlib_plugin_registration_t;
@@ -91,6 +92,7 @@ typedef struct
   /* loaded plugin info */
   plugin_info_t *plugin_info;
   uword *plugin_by_name_hash;
+  uword *plugin_overrides_by_name_hash;
 
   /* paths and name filters */
   u8 *plugin_path;
@@ -102,6 +104,9 @@ typedef struct
   /* plugin configs and hash by name */
   plugin_config_t *configs;
   uword *config_index_by_name;
+
+  /* Plugin log, avoid filling syslog w/ junk */
+  vlib_log_class_t logger;
 
   /* usual */
   vlib_main_t *vlib_main;
@@ -117,6 +122,7 @@ u8 *vlib_get_vat_plugin_path (void);
 
 #define VLIB_PLUGIN_REGISTER() \
   vlib_plugin_registration_t vlib_plugin_registration \
+  CLIB_NOSANITIZE_PLUGIN_REG_SECTION \
   __attribute__((__section__(".vlib_plugin_registration")))
 
 /* Call a plugin init function: used for init function dependencies. */

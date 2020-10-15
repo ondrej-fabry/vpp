@@ -67,20 +67,17 @@
   _ (UDP_CHECKSUM, "bad udp checksum")					\
   _ (UDP_LENGTH, "inconsistent udp/ip lengths")				\
 									\
-  /* Errors signalled by ip4-source-check. */				\
-  _ (UNICAST_SOURCE_CHECK_FAILS, "ip4 unicast source check fails")	\
-                                                                        \
   /* Spoofed packets in ip4-rewrite-local */                            \
   _ (SPOOFED_LOCAL_PACKETS, "ip4 spoofed local-address packet drops")   \
                                                                         \
-  /* Errors singalled by ip4-inacl */                                   \
+  /* Errors signalled by ip4-inacl */                                   \
   _ (INACL_TABLE_MISS, "input ACL table-miss drops")                    \
   _ (INACL_SESSION_DENY, "input ACL session deny drops")                \
   /* Errors singalled by ip4-outacl */                                  \
   _ (OUTACL_TABLE_MISS, "output ACL table-miss drops")                  \
   _ (OUTACL_SESSION_DENY, "output ACL session deny drops")              \
                                                                         \
-  /* Erros from mfib-forward */                                         \
+  /* Errors from mfib-forward */                                         \
   _ (RPF_FAILURE, "Multicast RPF check failed")                         \
                                                                         \
   /* Errors signalled by ip4-reassembly */                              \
@@ -89,7 +86,8 @@
   _ (REASS_FRAGMENT_CHAIN_TOO_LONG, "fragment chain too long (drop)")   \
   _ (REASS_NO_BUF, "out of buffers (drop)")                             \
   _ (REASS_MALFORMED_PACKET, "malformed packets")                       \
-  _ (REASS_INTERNAL_ERROR, "drops due to internal reassembly error")
+  _ (REASS_INTERNAL_ERROR, "drops due to internal reassembly error")    \
+  _ (REASS_UNSUPP_IP_PROT, "unsupported ip protocol")
 
 typedef enum
 {

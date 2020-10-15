@@ -86,14 +86,17 @@ pg_capture (pg_capture_args_t * a)
   if (a->is_enabled == 1)
     {
       struct stat sb;
-      if (stat ((char *) a->pcap_file_name, &sb) != -1)
+      if (stat (a->pcap_file_name, &sb) != -1)
 	return clib_error_return (0, "pcap file '%s' already exists.",
 				  a->pcap_file_name);
     }
 
   pi = pool_elt_at_index (pg->interfaces, a->dev_instance);
   vec_free (pi->pcap_file_name);
+  if ((pi->pcap_main.flags & PCAP_MAIN_INIT_DONE))
+    pcap_close (&pi->pcap_main);
   clib_memset (&pi->pcap_main, 0, sizeof (pi->pcap_main));
+  pi->pcap_main.file_descriptor = -1;
 
   if (a->is_enabled == 0)
     return 0;
@@ -336,7 +339,7 @@ new_stream (vlib_main_t * vm,
 {
   clib_error_t *error = 0;
   u8 *tmp = 0;
-  u32 hw_if_index;
+  u32 maxframe, hw_if_index;
   unformat_input_t sub_input = { 0 };
   int sub_input_given = 0;
   vnet_main_t *vnm = vnet_get_main ();
@@ -349,7 +352,9 @@ new_stream (vlib_main_t * vm,
   s.max_packet_bytes = s.min_packet_bytes = 64;
   s.buffer_bytes = vlib_buffer_get_default_data_size (vm);
   s.if_id = 0;
+  s.n_max_frame = VLIB_FRAME_SIZE;
   pcap_file_name = 0;
+
   while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
     {
       if (unformat (input, "name %v", &tmp))
@@ -371,10 +376,15 @@ new_stream (vlib_main_t * vm,
       else if (unformat (input, "source pg%u", &s.if_id))
 	;
 
+      else if (unformat (input, "buffer-flags %U",
+			 unformat_vnet_buffer_flags, &s.buffer_flags))
+	;
+
       else if (unformat (input, "node %U",
 			 unformat_vlib_node, vm, &s.node_index))
 	;
-
+      else if (unformat (input, "maxframe %u", &maxframe))
+	s.n_max_frame = s.n_max_frame < maxframe ? s.n_max_frame : maxframe;
       else if (unformat (input, "worker %u", &s.worker_index))
 	;
 
@@ -485,7 +495,9 @@ VLIB_CLI_COMMAND (new_stream_cli, static) = {
   "interface STRING     interface for stream output \n"
   "node NODE-NAME       node for stream output\n"
   "data STRING          specifies packet data\n"
-  "pcap FILENAME        read packet data from pcap file\n",
+  "pcap FILENAME        read packet data from pcap file\n"
+  "rate PPS             rate to transfer packet data\n"
+  "maxframe NPKTS       maximum number of packets per frame\n",
 };
 /* *INDENT-ON* */
 
@@ -624,7 +636,7 @@ pg_capture_cmd_fn (vlib_main_t * vm,
   a->hw_if_index = hw_if_index;
   a->dev_instance = hi->dev_instance;
   a->is_enabled = !is_disable;
-  a->pcap_file_name = pcap_file_name;
+  a->pcap_file_name = (char *) pcap_file_name;
   a->count = count;
 
   error = pg_capture (a);
@@ -649,7 +661,7 @@ create_pg_if_cmd_fn (vlib_main_t * vm,
 {
   pg_main_t *pg = &pg_main;
   unformat_input_t _line_input, *line_input = &_line_input;
-  u32 if_id, gso_enabled = 0, gso_size = 0;
+  u32 if_id, gso_enabled = 0, gso_size = 0, coalesce_enabled = 0;
   clib_error_t *error = NULL;
 
   if (!unformat_user (input, unformat_line_input, line_input))
@@ -669,6 +681,8 @@ create_pg_if_cmd_fn (vlib_main_t * vm,
 	      error = clib_error_create ("gso enabled but gso size missing");
 	      goto done;
 	    }
+	  if (unformat (line_input, "coalesce-enabled"))
+	    coalesce_enabled = 1;
 	}
       else
 	{
@@ -678,7 +692,8 @@ create_pg_if_cmd_fn (vlib_main_t * vm,
 	}
     }
 
-  pg_interface_add_or_get (pg, if_id, gso_enabled, gso_size);
+  pg_interface_add_or_get (pg, if_id, gso_enabled, gso_size,
+			   coalesce_enabled);
 
 done:
   unformat_free (line_input);
@@ -689,7 +704,8 @@ done:
 /* *INDENT-OFF* */
 VLIB_CLI_COMMAND (create_pg_if_cmd, static) = {
   .path = "create packet-generator",
-  .short_help = "create packet-generator interface <interface name> [gso-enabled gso-size <size>]",
+  .short_help = "create packet-generator interface <interface name>"
+                " [gso-enabled gso-size <size> [coalesce-enabled]]",
   .function = create_pg_if_cmd_fn,
 };
 /* *INDENT-ON* */

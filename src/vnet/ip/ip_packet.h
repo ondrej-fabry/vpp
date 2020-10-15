@@ -48,7 +48,7 @@ typedef enum ip_protocol
 #define ip_protocol(n,s) IP_PROTOCOL_##s = n,
 #include "protocols.def"
 #undef ip_protocol
-} ip_protocol_t;
+} __clib_packed ip_protocol_t;
 
 /* TCP/UDP ports. */
 typedef enum
@@ -118,9 +118,34 @@ typedef enum ip_dscp_t_
 #undef _
 } __clib_packed ip_dscp_t;
 
-STATIC_ASSERT_SIZEOF (ip_dscp_t, 1);
-
 extern u8 *format_ip_dscp (u8 * s, va_list * va);
+
+/**
+ * IP DSCP bit shift
+ *  The ECN occupies the 2 least significant bits of the TC field
+ */
+#define IP_PACKET_TC_FIELD_DSCP_BIT_SHIFT 2
+#define IP_PACKET_TC_FIELD_ECN_MASK 0x03
+
+/**
+ * The set of RFC defined DSCP values.
+ */
+#define foreach_ip_ecn                        \
+  _(0, NON_ECN)                               \
+  _(1, ECT_0)                                 \
+  _(2, ECT_1)                                 \
+  _(3, CE)
+
+typedef enum ip_ecn_t_
+{
+#define _(n,f) IP_ECN_##f = n,
+  foreach_ip_ecn
+#undef _
+} __clib_packed ip_ecn_t;
+
+STATIC_ASSERT_SIZEOF (ip_ecn_t, 1);
+
+extern u8 *format_ip_ecn (u8 * s, va_list * va);
 
 /* IP checksum support. */
 
@@ -151,10 +176,10 @@ ip_csum (void *data, u16 n_left)
       v1 = u16x16_byte_swap (v1);
       v2 = u16x16_byte_swap (v2);
 #endif
-      sum8 += u16x8_extend_to_u32x8 (u16x16_extract_lo (v1));
-      sum8 += u16x8_extend_to_u32x8 (u16x16_extract_hi (v1));
-      sum8 += u16x8_extend_to_u32x8 (u16x16_extract_lo (v2));
-      sum8 += u16x8_extend_to_u32x8 (u16x16_extract_hi (v2));
+      sum8 += u32x8_from_u16x8 (u16x16_extract_lo (v1));
+      sum8 += u32x8_from_u16x8 (u16x16_extract_hi (v1));
+      sum8 += u32x8_from_u16x8 (u16x16_extract_lo (v2));
+      sum8 += u32x8_from_u16x8 (u16x16_extract_hi (v2));
       n_left -= 32;
       data += 64;
     }
@@ -166,8 +191,8 @@ ip_csum (void *data, u16 n_left)
       v1 = u16x16_byte_swap (v1);
 #endif
       v1 = u16x16_byte_swap (u16x16_load_unaligned (data));
-      sum8 += u16x8_extend_to_u32x8 (u16x16_extract_lo (v1));
-      sum8 += u16x8_extend_to_u32x8 (u16x16_extract_hi (v1));
+      sum8 += u32x8_from_u16x8 (u16x16_extract_lo (v1));
+      sum8 += u32x8_from_u16x8 (u16x16_extract_hi (v1));
       n_left -= 16;
       data += 32;
     }
@@ -179,8 +204,8 @@ ip_csum (void *data, u16 n_left)
       v1 = u16x16_byte_swap (v1);
 #endif
       v1 = u16x16_mask_last (v1, 16 - n_left);
-      sum8 += u16x8_extend_to_u32x8 (u16x16_extract_lo (v1));
-      sum8 += u16x8_extend_to_u32x8 (u16x16_extract_hi (v1));
+      sum8 += u32x8_from_u16x8 (u16x16_extract_lo (v1));
+      sum8 += u32x8_from_u16x8 (u16x16_extract_hi (v1));
     }
 
   sum8 = u32x8_hadd (sum8, zero);
@@ -288,6 +313,7 @@ ip_csum_fold (ip_csum_t c)
 
 extern ip_csum_t (*vnet_incremental_checksum_fp) (ip_csum_t, void *, uword);
 
+/* Checksum routine. */
 always_inline ip_csum_t
 ip_incremental_checksum (ip_csum_t sum, void *_data, uword n_bytes)
 {
@@ -299,9 +325,6 @@ ip_csum_and_memcpy_fold (ip_csum_t sum, void *dst)
 {
   return ip_csum_fold (sum);
 }
-
-/* Checksum routine. */
-ip_csum_t ip_incremental_checksum (ip_csum_t sum, void *data, uword n_bytes);
 
 #endif /* included_ip_packet_h */
 

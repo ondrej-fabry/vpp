@@ -40,7 +40,7 @@
 #ifndef included_vlib_trace_funcs_h
 #define included_vlib_trace_funcs_h
 
-extern u8 *vnet_trace_dummy;
+extern u8 *vnet_trace_placeholder;
 
 always_inline void
 vlib_validate_trace (vlib_trace_main_t * tm, vlib_buffer_t * b)
@@ -52,14 +52,18 @@ vlib_validate_trace (vlib_trace_main_t * tm, vlib_buffer_t * b)
 void vlib_add_handoff_trace (vlib_main_t * vm, vlib_buffer_t * b);
 
 always_inline void *
-vlib_add_trace (vlib_main_t * vm,
-		vlib_node_runtime_t * r, vlib_buffer_t * b, u32 n_data_bytes)
+vlib_add_trace_inline (vlib_main_t * vm,
+		       vlib_node_runtime_t * r, vlib_buffer_t * b,
+		       u32 n_data_bytes)
 {
   vlib_trace_main_t *tm = &vm->trace_main;
   vlib_trace_header_t *h;
   u32 n_data_words;
 
-  ASSERT (vnet_trace_dummy);
+  ASSERT (vnet_trace_placeholder);
+
+  if (PREDICT_FALSE ((b->flags & VLIB_BUFFER_IS_TRACED) == 0))
+    return vnet_trace_placeholder;
 
   if (PREDICT_FALSE (tm->add_trace_callback != 0))
     {
@@ -70,8 +74,8 @@ vlib_add_trace (vlib_main_t * vm,
     }
   else if (PREDICT_FALSE (tm->trace_enable == 0))
     {
-      ASSERT (vec_len (vnet_trace_dummy) >= n_data_bytes + sizeof (*h));
-      return vnet_trace_dummy;
+      ASSERT (vec_len (vnet_trace_placeholder) >= n_data_bytes + sizeof (*h));
+      return vnet_trace_placeholder;
     }
 
   /* Are we trying to trace a handoff case? */
@@ -91,6 +95,11 @@ vlib_add_trace (vlib_main_t * vm,
 
   return h->data;
 }
+
+/* Non-inline (typical use-case) version of the above */
+void *vlib_add_trace (vlib_main_t * vm,
+		      vlib_node_runtime_t * r, vlib_buffer_t * b,
+		      u32 n_data_bytes);
 
 always_inline vlib_trace_header_t *
 vlib_trace_header_next (vlib_trace_header_t * h)
@@ -118,6 +127,9 @@ vlib_trace_next_frame (vlib_main_t * vm,
 }
 
 void trace_apply_filter (vlib_main_t * vm);
+int vnet_is_packet_traced (vlib_buffer_t * b,
+			   u32 classify_table_index, int func);
+
 
 /* Mark buffer as traced and allocate trace buffer. */
 always_inline void
@@ -130,6 +142,16 @@ vlib_trace_buffer (vlib_main_t * vm,
 
   if (PREDICT_FALSE (tm->trace_enable == 0))
     return;
+
+  /* Classifier filter in use? */
+  if (PREDICT_FALSE (vlib_global_main.trace_filter.trace_filter_enable))
+    {
+      /* See if we're supposed to trace this packet... */
+      if (vnet_is_packet_traced
+	  (b, vlib_global_main.trace_filter.trace_classify_table_index,
+	   0 /* full classify */ ) != 1)
+	return;
+    }
 
   /*
    * Apply filter to existing traces to keep number of allocated traces low.

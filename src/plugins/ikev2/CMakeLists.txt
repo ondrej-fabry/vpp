@@ -11,6 +11,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+add_definitions (-DWITH_LIBSSL=1)
+include_directories(${OPENSSL_INCLUDE_DIR})
+
 add_vpp_plugin(ikev2
   SOURCES
   ikev2.c
@@ -21,6 +24,7 @@ add_vpp_plugin(ikev2
   ikev2_payload.c
 
   API_FILES
+  ikev2_types.api
   ikev2.api
 
   API_TEST_SOURCES
@@ -29,6 +33,7 @@ add_vpp_plugin(ikev2
   INSTALL_HEADERS
   ikev2.h
   ikev2_priv.h
-  ikev2_msg_enum.h
-  ikev2_all_api.h
+
+  LINK_LIBRARIES
+  ${OPENSSL_LIBRARIES}
 )

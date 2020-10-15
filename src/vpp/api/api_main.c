@@ -38,8 +38,29 @@ init_error_string_table (vat_main_t * vam)
   hash_set (vam->error_string_by_error_number, 99, "Misc");
 }
 
-static clib_error_t *
-api_main_init (vlib_main_t * vm)
+#if VPP_API_TEST_BUILTIN > 0
+static void
+load_features (void)
+{
+  vat_registered_features_t *f;
+  vat_main_t *vam = &vat_main;
+  clib_error_t *error;
+
+  f = vam->feature_function_registrations;
+
+  while (f)
+    {
+      error = f->function (vam);
+      if (error)
+	{
+	  clib_warning ("INIT FAILED");
+	}
+      f = f->next;
+    }
+}
+
+clib_error_t *
+vat_builtin_main_init (vlib_main_t * vm)
 {
   vat_main_t *vam = &vat_main;
   int rv;
@@ -56,10 +77,11 @@ api_main_init (vlib_main_t * vm)
   if (rv)
     clib_warning ("vat_plugin_init returned %d", rv);
 
+  load_features ();
+
   return 0;
 }
-
-VLIB_MAIN_LOOP_ENTER_FUNCTION (api_main_init);
+#endif
 
 void
 vat_plugin_hash_create (void)
@@ -76,26 +98,23 @@ maybe_register_api_client (vat_main_t * vam)
 {
   vl_api_registration_t **regpp;
   vl_api_registration_t *regp;
-  svm_region_t *svm;
   void *oldheap;
-  api_main_t *am = &api_main;
+  api_main_t *am = vlibapi_get_main ();
 
   if (vam->my_client_index != ~0)
     return;
 
   pool_get (am->vl_clients, regpp);
 
-  svm = am->vlib_rp;
+  oldheap = vl_msg_push_heap ();
 
-  pthread_mutex_lock (&svm->mutex);
-  oldheap = svm_push_data_heap (svm);
   *regpp = clib_mem_alloc (sizeof (vl_api_registration_t));
 
   regp = *regpp;
   clib_memset (regp, 0, sizeof (*regp));
   regp->registration_type = REGISTRATION_TYPE_SHMEM;
   regp->vl_api_registration_pool_index = regpp - am->vl_clients;
-  regp->vlib_rp = svm;
+  regp->vlib_rp = am->vlib_rp;
   regp->shmem_hdr = am->shmem_hdr;
 
   /* Loopback connection */
@@ -104,8 +123,7 @@ maybe_register_api_client (vat_main_t * vam)
   regp->name = format (0, "%s", "vpp-internal");
   vec_add1 (regp->name, 0);
 
-  pthread_mutex_unlock (&svm->mutex);
-  svm_pop_heap (oldheap);
+  vl_msg_pop_heap (oldheap);
 
   vam->my_client_index = vl_msg_api_handle_from_index_and_epoch
     (regp->vl_api_registration_pool_index,
@@ -260,7 +278,7 @@ api_cli_output (void *notused, const char *fmt, ...)
 u16
 vl_client_get_first_plugin_msg_id (const char *plugin_name)
 {
-  api_main_t *am = &api_main;
+  api_main_t *am = vlibapi_get_main ();
   vl_api_msg_range_t *rp;
   uword *p;
 

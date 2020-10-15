@@ -494,7 +494,6 @@ dpdk_crypto_session_disposal (crypto_session_disposal_t * v, u64 ts)
 static clib_error_t *
 add_del_sa_session (u32 sa_index, u8 is_add)
 {
-  ipsec_main_t *im = &ipsec_main;
   dpdk_crypto_main_t *dcm = &dpdk_crypto_main;
   crypto_data_t *data;
   struct rte_cryptodev_sym_session *s;
@@ -502,25 +501,7 @@ add_del_sa_session (u32 sa_index, u8 is_add)
   u32 drv_id;
 
   if (is_add)
-    {
-#if 1
-      ipsec_sa_t *sa = pool_elt_at_index (im->sad, sa_index);
-      u32 seed;
-      switch (sa->crypto_alg)
-	{
-	case IPSEC_CRYPTO_ALG_AES_GCM_128:
-	case IPSEC_CRYPTO_ALG_AES_GCM_192:
-	case IPSEC_CRYPTO_ALG_AES_GCM_256:
-	  clib_memcpy (&sa->salt,
-		       &sa->crypto_key.data[sa->crypto_key.len - 4], 4);
-	  break;
-	default:
-	  seed = (u32) clib_cpu_time_now ();
-	  sa->salt = random_u32 (&seed);
-	}
-#endif
-      return 0;
-    }
+    return 0;
 
   /* *INDENT-OFF* */
   vec_foreach (data, dcm->data)
@@ -1010,16 +991,33 @@ crypto_disable (void)
   vec_free (dcm->auth_algs);
 }
 
-static uword
-dpdk_ipsec_process (vlib_main_t * vm, vlib_node_runtime_t * rt,
-		    vlib_frame_t * f)
+static clib_error_t *
+dpdk_ipsec_enable_disable (int is_enable)
+{
+  vlib_main_t *vm = vlib_get_main ();
+  vlib_thread_main_t *tm = vlib_get_thread_main ();
+  vlib_node_t *node = vlib_get_node_by_name (vm, (u8 *) "dpdk-crypto-input");
+  u32 skip_master = vlib_num_workers () > 0;
+  u32 n_mains = tm->n_vlib_mains;
+  u32 i;
+
+  ASSERT (node);
+  for (i = skip_master; i < n_mains; i++)
+    vlib_node_set_state (vlib_mains[i], node->index, is_enable != 0 ?
+			 VLIB_NODE_STATE_POLLING : VLIB_NODE_STATE_DISABLED);
+
+  return 0;
+}
+
+static clib_error_t *
+dpdk_ipsec_main_init (vlib_main_t * vm)
 {
   ipsec_main_t *im = &ipsec_main;
   dpdk_crypto_main_t *dcm = &dpdk_crypto_main;
   vlib_thread_main_t *tm = vlib_get_thread_main ();
   crypto_worker_main_t *cwm;
   clib_error_t *error = NULL;
-  u32 i, skip_master, n_mains;
+  u32 skip_master, n_mains;
 
   n_mains = tm->n_vlib_mains;
   skip_master = vlib_num_workers () > 0;
@@ -1068,29 +1066,24 @@ dpdk_ipsec_process (vlib_main_t * vm, vlib_node_runtime_t * rt,
 					"dpdk-esp4-encrypt",
 					"dpdk-esp4-encrypt-tun",
 					"dpdk-esp4-decrypt",
+					"dpdk-esp4-decrypt",
 					"dpdk-esp6-encrypt",
 					"dpdk-esp6-encrypt-tun",
 					"dpdk-esp6-decrypt",
+					"dpdk-esp6-decrypt",
 					dpdk_ipsec_check_support,
-					add_del_sa_session);
-  int rv = ipsec_select_esp_backend (im, idx);
-  ASSERT (rv == 0);
-
-  vlib_node_t *node = vlib_get_node_by_name (vm, (u8 *) "dpdk-crypto-input");
-  ASSERT (node);
-  for (i = skip_master; i < n_mains; i++)
-    vlib_node_set_state (vlib_mains[i], node->index, VLIB_NODE_STATE_POLLING);
+					add_del_sa_session,
+					dpdk_ipsec_enable_disable);
+  int rv;
+  if (im->esp_current_backend == ~0)
+    {
+      rv = ipsec_select_esp_backend (im, idx);
+      ASSERT (rv == 0);
+    }
   return 0;
 }
 
-/* *INDENT-OFF* */
-VLIB_REGISTER_NODE (dpdk_ipsec_process_node,static) = {
-    .function = dpdk_ipsec_process,
-    .type = VLIB_NODE_TYPE_PROCESS,
-    .name = "dpdk-ipsec-process",
-    .process_log2_n_stack_bytes = 17,
-};
-/* *INDENT-ON* */
+VLIB_MAIN_LOOP_ENTER_FUNCTION (dpdk_ipsec_main_init);
 
 /*
  * fd.io coding-style-patch-verification: ON

@@ -1,8 +1,8 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import unittest
 
-from framework import VppTestCase, VppTestRunner
+from framework import VppTestCase, VppTestRunner, running_gcov_tests
 from vpp_ip_route import VppIpTable, VppIpRoute, VppRoutePath
 
 
@@ -50,6 +50,7 @@ class TestBihash(VppTestCase):
             self.logger.critical(error)
             self.assertNotIn('failed', error)
 
+    @unittest.skipUnless(running_gcov_tests, "part of code coverage tests")
     def test_bihash_coverage(self):
         """ Improve Code Coverage """
 
@@ -60,6 +61,11 @@ class TestBihash(VppTestCase):
             self.logger.critical(error)
             self.assertNotIn('failed', error)
 
+        error = self.vapi.cli("test bihash nitems 10 nbuckets 1 ncycles 3" +
+                              "search 2 careful 1 verbose 2 non-random-keys")
+        if error:
+            self.logger.critical(error)
+            self.assertNotIn('failed', error)
 
 if __name__ == '__main__':
     unittest.main(testRunner=VppTestRunner)

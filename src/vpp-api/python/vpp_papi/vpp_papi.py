@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
 # Copyright (c) 2016 Cisco and/or its affiliates.
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,6 +17,7 @@
 from __future__ import print_function
 from __future__ import absolute_import
 import ctypes
+import ipaddress
 import sys
 import multiprocessing as mp
 import os
@@ -27,6 +28,8 @@ import threading
 import fnmatch
 import weakref
 import atexit
+import time
+from . vpp_format import verify_enum_hint
 from . vpp_serializer import VPPType, VPPEnumType, VPPUnionType
 from . vpp_serializer import VPPMessage, vpp_get_type, VPPTypeAlias
 
@@ -76,6 +79,26 @@ else:
         return d.items()
 
 
+def add_convenience_methods():
+    # provide convenience methods to IP[46]Address.vapi_af
+    def _vapi_af(self):
+        if 6 == self._version:
+            return VppEnum.vl_api_address_family_t.ADDRESS_IP6.value
+        if 4 == self._version:
+            return VppEnum.vl_api_address_family_t.ADDRESS_IP4.value
+        raise ValueError("Invalid _version.")
+
+    def _vapi_af_name(self):
+        if 6 == self._version:
+            return 'ip6'
+        if 4 == self._version:
+            return 'ip4'
+        raise ValueError("Invalid _version.")
+
+    ipaddress._IPAddressBase.vapi_af = property(_vapi_af)
+    ipaddress._IPAddressBase.vapi_af_name = property(_vapi_af_name)
+
+
 class VppApiDynamicMethodHolder(object):
     pass
 
@@ -111,6 +134,7 @@ class VPPRuntimeError(RuntimeError):
 
 class VPPValueError(ValueError):
     pass
+
 
 class VPPApiJSONFiles(object):
     @classmethod
@@ -294,6 +318,7 @@ class VPPApiJSONFiles(object):
                 self.logger.error('Not implemented error for {}'.format(m[0]))
         return messages, services
 
+
 class VPPApiClient(object):
     """VPP interface.
 
@@ -353,6 +378,7 @@ class VPPApiClient(object):
         self.use_socket = use_socket
         self.server_address = server_address
         self._apifiles = apifiles
+        self.stats = {}
 
         if use_socket:
             from . vpp_transport_socket import VppTransport
@@ -381,15 +407,19 @@ class VPPApiClient(object):
         # Basic sanity check
         if len(self.messages) == 0 and not testmode:
             raise VPPValueError(1, 'Missing JSON message definitions')
+        if not(verify_enum_hint(VppEnum.vl_api_address_family_t)):
+            raise VPPRuntimeError("Invalid address family hints. "
+                                  "Cannot continue.")
 
         self.transport = VppTransport(self, read_timeout=read_timeout,
                                       server_address=server_address)
         # Make sure we allow VPP to clean up the message rings.
         atexit.register(vpp_atexit, weakref.ref(self))
 
+        add_convenience_methods()
+
     def get_function(self, name):
         return getattr(self._api, name)
-
 
     class ContextId(object):
         """Multiprocessing-safe provider of unique context IDs."""
@@ -442,12 +472,7 @@ class VPPApiClient(object):
 
                 # Create function for client side messages.
                 if name in self.services:
-                    if 'stream' in self.services[name] and \
-                       self.services[name]['stream']:
-                        multipart = True
-                    else:
-                        multipart = False
-                    f = self.make_function(msg, i, multipart, do_async)
+                    f = self.make_function(msg, i, self.services[name], do_async)
                     setattr(self._api, name, FuncWrapper(f))
             else:
                 self.logger.debug(
@@ -596,7 +621,25 @@ class VPPApiClient(object):
             raise VPPValueError('Invalid argument {} to {}'
                                 .format(list(d), msg.name))
 
-    def _call_vpp(self, i, msgdef, multipart, **kwargs):
+    def _add_stat(self, name, ms):
+        if not name in self.stats:
+            self.stats[name] = {'max': ms, 'count': 1, 'avg': ms}
+        else:
+            if ms > self.stats[name]['max']:
+                self.stats[name]['max'] = ms
+            self.stats[name]['count'] += 1
+            n = self.stats[name]['count']
+            self.stats[name]['avg'] = self.stats[name]['avg'] * (n - 1) / n + ms / n
+
+    def get_stats(self):
+        s = '\n=== API PAPI STATISTICS ===\n'
+        s += '{:<30} {:>4} {:>6} {:>6}\n'.format('message', 'cnt', 'avg', 'max')
+        for n in sorted(self.stats.items(), key=lambda v: v[1]['avg'], reverse=True):
+            s += '{:<30} {:>4} {:>6.2f} {:>6.2f}\n'.format(n[0], n[1]['count'],
+                                                           n[1]['avg'], n[1]['max'])
+        return s
+
+    def _call_vpp(self, i, msgdef, service, **kwargs):
         """Given a message, send the message and await a reply.
 
         msgdef - the message packing definition
@@ -611,7 +654,7 @@ class VPPApiClient(object):
         the response.  It will raise an IOError exception if there was
         no response within the timeout window.
         """
-
+        ts = time.time()
         if 'context' not in kwargs:
             context = self.get_context()
             kwargs['context'] = context
@@ -620,6 +663,7 @@ class VPPApiClient(object):
         kwargs['_vl_msg_id'] = i
 
         no_type_conversion = kwargs.pop('_no_type_conversion', False)
+        timeout = kwargs.pop('_timeout', None)
 
         try:
             if self.transport.socket_index:
@@ -637,28 +681,41 @@ class VPPApiClient(object):
 
         self.transport.write(b)
 
-        if multipart:
-            # Send a ping after the request - we use its response
-            # to detect that we have seen all results.
-            self._control_ping(context)
+        msgreply = service['reply']
+        stream = True if 'stream' in service else False
+        if stream:
+            if 'stream_msg' in service:
+                # New service['reply'] = _reply and service['stream_message'] = _details
+                stream_message = service['stream_msg']
+                modern =True
+            else:
+                # Old  service['reply'] = _details
+                stream_message = msgreply
+                msgreply = 'control_ping_reply'
+                modern = False
+                # Send a ping after the request - we use its response
+                # to detect that we have seen all results.
+                self._control_ping(context)
 
         # Block until we get a reply.
         rl = []
         while (True):
-            msg = self.transport.read()
-            if not msg:
+            r = self.read_blocking(no_type_conversion, timeout)
+            if r is None:
                 raise VPPIOError(2, 'VPP API client: read failed')
-            r = self.decode_incoming_msg(msg, no_type_conversion)
             msgname = type(r).__name__
             if context not in r or r.context == 0 or context != r.context:
                 # Message being queued
                 self.message_queue.put_nowait(r)
                 continue
-
-            if not multipart:
+            if msgname != msgreply and (stream and (msgname != stream_message)):
+                print('REPLY MISMATCH', msgreply, msgname, stream_message, stream)
+            if not stream:
                 rl = r
                 break
-            if msgname == 'control_ping_reply':
+            if msgname == msgreply:
+                if modern: # Return both reply and list
+                    rl = r, rl
                 break
 
             rl.append(r)
@@ -669,6 +726,8 @@ class VPPApiClient(object):
         if len(s) > 80:
             s = s[:80] + "..."
         self.logger.debug(s)
+        te = time.time()
+        self._add_stat(msgdef.name, (te - ts) * 1000)
         return rl
 
     def _call_vpp_async(self, i, msg, **kwargs):
@@ -699,6 +758,34 @@ class VPPApiClient(object):
 
         self.transport.write(b)
         return context
+
+    def read_blocking(self, no_type_conversion=False, timeout=None):
+        """Get next received message from transport within timeout, decoded.
+
+        Note that notifications have context zero
+        and are not put into receive queue (at least for socket transport),
+        use async_thread with registered callback for processing them.
+
+        If no message appears in the queue within timeout, return None.
+
+        Optionally, type conversion can be skipped,
+        as some of conversions are into less precise types.
+
+        When r is the return value of this, the caller can get message name as:
+            msgname = type(r).__name__
+        and context number (type long) as:
+            context = r.context
+
+        :param no_type_conversion: If false, type conversions are applied.
+        :type no_type_conversion: bool
+        :returns: Decoded message, or None if no message (within timeout).
+        :rtype: Whatever VPPType.unpack returns, depends on no_type_conversion.
+        :raises VppTransportShmemIOError if timed out.
+        """
+        msg = self.transport.read(timeout=timeout)
+        if not msg:
+            return None
+        return self.decode_incoming_msg(msg, no_type_conversion)
 
     def register_event_callback(self, callback):
         """Register a callback for async messages.
@@ -733,6 +820,34 @@ class VPPApiClient(object):
             if self.event_callback:
                 self.event_callback(msgname, r)
 
+    def validate_message_table(self, namecrctable):
+        """Take a dictionary of name_crc message names
+        and returns an array of missing messages"""
+
+        missing_table = []
+        for name_crc in namecrctable:
+            i = self.transport.get_msg_index(name_crc)
+            if i <= 0:
+                missing_table.append(name_crc)
+        return missing_table
+
+    def dump_message_table(self):
+        """Return VPPs API message table as name_crc dictionary"""
+        return self.transport.message_table
+
+    def dump_message_table_filtered(self, msglist):
+        """Return VPPs API message table as name_crc dictionary,
+        filtered by message name list."""
+
+        replies = [self.services[n]['reply'] for n in msglist]
+        message_table_filtered = {}
+        for name in msglist + replies:
+            for k,v in self.transport.message_table.items():
+                if k.startswith(name):
+                    message_table_filtered[k] = v
+                    break
+        return message_table_filtered
+
     def __repr__(self):
         return "<VPPApiClient apifiles=%s, testmode=%s, async_thread=%s, " \
                "logger=%s, read_timeout=%s, use_socket=%s, " \
@@ -741,6 +856,19 @@ class VPPApiClient(object):
                    self.logger, self.read_timeout, self.use_socket,
                    self.server_address)
 
+    def details_iter(self, f, **kwargs):
+        cursor = 0
+        while True:
+            kwargs['cursor'] = cursor
+            rv, details = f(**kwargs)
+            #
+            # Convert to yield from details when we only support python 3
+            #
+            for d in details:
+                yield d
+            if rv.retval == 0 or rv.retval != -165:
+                break
+            cursor = rv.cursor
 
 # Provide the old name for backward compatibility.
 VPP = VPPApiClient

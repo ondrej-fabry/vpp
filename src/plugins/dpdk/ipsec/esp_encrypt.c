@@ -24,6 +24,7 @@
 #include <vnet/udp/udp.h>
 #include <dpdk/buffer.h>
 #include <dpdk/ipsec/ipsec.h>
+#include <vnet/ipsec/ipsec_tun.h>
 #include <dpdk/device/dpdk.h>
 #include <dpdk/device/dpdk_priv.h>
 
@@ -44,8 +45,8 @@ typedef enum
 #define foreach_esp_encrypt_error                   \
  _(RX_PKTS, "ESP pkts received")                    \
  _(SEQ_CYCLED, "Sequence number cycled")            \
- _(ENQ_FAIL, "Enqueue failed to crypto device")     \
- _(DISCARD, "Not enough crypto operations, discarding frame")  \
+ _(ENQ_FAIL, "Enqueue encrypt failed (queue full)")     \
+ _(DISCARD, "Not enough crypto operations")         \
  _(SESSION, "Failed to get crypto session")         \
  _(NOSUP, "Cipher/Auth not supported")
 
@@ -66,6 +67,8 @@ static char *esp_encrypt_error_strings[] = {
 
 extern vlib_node_registration_t dpdk_esp4_encrypt_node;
 extern vlib_node_registration_t dpdk_esp6_encrypt_node;
+extern vlib_node_registration_t dpdk_esp4_encrypt_tun_node;
+extern vlib_node_registration_t dpdk_esp6_encrypt_tun_node;
 
 typedef struct
 {
@@ -138,11 +141,12 @@ dpdk_esp_encrypt_inline (vlib_main_t * vm,
     {
       if (is_ip6)
 	vlib_node_increment_counter (vm, dpdk_esp6_encrypt_node.index,
-				     ESP_ENCRYPT_ERROR_DISCARD, 1);
+				     ESP_ENCRYPT_ERROR_DISCARD, n_left_from);
       else
 	vlib_node_increment_counter (vm, dpdk_esp4_encrypt_node.index,
-				     ESP_ENCRYPT_ERROR_DISCARD, 1);
+				     ESP_ENCRYPT_ERROR_DISCARD, n_left_from);
       /* Discard whole frame */
+      vlib_buffer_free (vm, from, n_left_from);
       return n_left_from;
     }
 
@@ -215,11 +219,10 @@ dpdk_esp_encrypt_inline (vlib_main_t * vm,
 
 	  if (is_tun)
 	    {
-	      u32 tmp;
 	      /* we are on a ipsec tunnel's feature arc */
-	      sa_index0 = *(u32 *) vnet_feature_next_with_data (&tmp, b0,
-								sizeof
-								(sa_index0));
+	      vnet_buffer (b0)->ipsec.sad_index =
+		sa_index0 = ipsec_tun_protect_get_sa_out
+		(vnet_buffer (b0)->ip.adj_index[VLIB_TX]);
 	    }
 	  else
 	    sa_index0 = vnet_buffer (b0)->ipsec.sad_index;
@@ -241,8 +244,6 @@ dpdk_esp_encrypt_inline (vlib_main_t * vm,
 
 	      if (PREDICT_FALSE (res_idx == (u16) ~ 0))
 		{
-		  clib_warning ("unsupported SA by thread index %u",
-				thread_idx);
 		  if (is_ip6)
 		    vlib_node_increment_counter (vm,
 						 dpdk_esp6_encrypt_node.index,
@@ -261,7 +262,6 @@ dpdk_esp_encrypt_inline (vlib_main_t * vm,
 	      error = crypto_get_session (&session, sa_index0, res, cwm, 1);
 	      if (PREDICT_FALSE (error || !session))
 		{
-		  clib_warning ("failed to get crypto session");
 		  if (is_ip6)
 		    vlib_node_increment_counter (vm,
 						 dpdk_esp6_encrypt_node.index,
@@ -283,9 +283,6 @@ dpdk_esp_encrypt_inline (vlib_main_t * vm,
 
 	  if (PREDICT_FALSE (esp_seq_advance (sa0)))
 	    {
-	      clib_warning
-		("sequence number counter has cycled SPI %u (0x%08x)",
-		 sa0->spi, sa0->spi);
 	      if (is_ip6)
 		vlib_node_increment_counter (vm,
 					     dpdk_esp6_encrypt_node.index,
@@ -411,13 +408,22 @@ dpdk_esp_encrypt_inline (vlib_main_t * vm,
 	    }
 	  else			/* transport mode */
 	    {
-	      priv->next = DPDK_CRYPTO_INPUT_NEXT_INTERFACE_OUTPUT;
-	      rewrite_len = vnet_buffer (b0)->ip.save_rewrite_length;
+	      if (is_tun)
+		{
+		  rewrite_len = 0;
+		  priv->next = DPDK_CRYPTO_INPUT_NEXT_MIDCHAIN;
+		}
+	      else
+		{
+		  priv->next = DPDK_CRYPTO_INPUT_NEXT_INTERFACE_OUTPUT;
+		  rewrite_len = vnet_buffer (b0)->ip.save_rewrite_length;
+		}
 	      u16 adv = sizeof (esp_header_t) + iv_size + udp_encap_adv;
 	      vlib_buffer_advance (b0, -adv - rewrite_len);
 	      u8 *src = ((u8 *) ih0) - rewrite_len;
 	      u8 *dst = vlib_buffer_get_current (b0);
 	      oh0 = vlib_buffer_get_current (b0) + rewrite_len;
+	      ouh0 = vlib_buffer_get_current (b0) + rewrite_len;
 
 	      if (is_ip6)
 		{
@@ -511,7 +517,8 @@ dpdk_esp_encrypt_inline (vlib_main_t * vm,
 	  u64 digest_paddr =
 	    mb0->buf_physaddr + digest - ((u8 *) mb0->buf_addr);
 
-	  if (!is_aead && cipher_alg->alg == RTE_CRYPTO_CIPHER_AES_CBC)
+	  if (!is_aead && (cipher_alg->alg == RTE_CRYPTO_CIPHER_AES_CBC ||
+			   cipher_alg->alg == RTE_CRYPTO_CIPHER_NULL))
 	    {
 	      cipher_off = sizeof (esp_header_t);
 	      cipher_len = iv_size + pad_payload_len;
@@ -529,14 +536,19 @@ dpdk_esp_encrypt_inline (vlib_main_t * vm,
 	  if (is_aead)
 	    {
 	      aad = (u32 *) priv->aad;
-	      aad[0] = clib_host_to_net_u32 (sa0->spi);
-	      aad[1] = clib_host_to_net_u32 (sa0->seq);
+	      aad[0] = esp0->spi;
 
 	      /* aad[3] should always be 0 */
 	      if (PREDICT_FALSE (ipsec_sa_is_set_USE_ESN (sa0)))
-		aad[2] = clib_host_to_net_u32 (sa0->seq_hi);
+		{
+		  aad[1] = clib_host_to_net_u32 (sa0->seq_hi);
+		  aad[2] = esp0->seq;
+		}
 	      else
-		aad[2] = 0;
+		{
+		  aad[1] = esp0->seq;
+		  aad[2] = 0;
+		}
 	    }
 	  else
 	    {
@@ -561,7 +573,7 @@ dpdk_esp_encrypt_inline (vlib_main_t * vm,
 	      tr->crypto_alg = sa0->crypto_alg;
 	      tr->integ_alg = sa0->integ_alg;
 	      u8 *p = vlib_buffer_get_current (b0);
-	      if (!ipsec_sa_is_set_IS_TUNNEL (sa0))
+	      if (!ipsec_sa_is_set_IS_TUNNEL (sa0) && !is_tun)
 		p += vnet_buffer (b0)->ip.save_rewrite_length;
 	      clib_memcpy_fast (tr->packet_data, p, sizeof (tr->packet_data));
 	    }
@@ -570,7 +582,10 @@ dpdk_esp_encrypt_inline (vlib_main_t * vm,
     }
   if (is_ip6)
     {
-      vlib_node_increment_counter (vm, dpdk_esp6_encrypt_node.index,
+      vlib_node_increment_counter (vm,
+				   (is_tun ?
+				    dpdk_esp6_encrypt_tun_node.index :
+				    dpdk_esp6_encrypt_node.index),
 				   ESP_ENCRYPT_ERROR_RX_PKTS,
 				   from_frame->n_vectors);
 
@@ -579,7 +594,10 @@ dpdk_esp_encrypt_inline (vlib_main_t * vm,
     }
   else
     {
-      vlib_node_increment_counter (vm, dpdk_esp4_encrypt_node.index,
+      vlib_node_increment_counter (vm,
+				   (is_tun ?
+				    dpdk_esp4_encrypt_tun_node.index :
+				    dpdk_esp4_encrypt_node.index),
 				   ESP_ENCRYPT_ERROR_RX_PKTS,
 				   from_frame->n_vectors);
 
@@ -659,13 +677,6 @@ VLIB_REGISTER_NODE (dpdk_esp4_encrypt_tun_node) = {
       [ESP_ENCRYPT_NEXT_DROP] = "error-drop",
     }
 };
-
-VNET_FEATURE_INIT (dpdk_esp4_encrypt_tun_feat_node, static) =
-{
-  .arc_name = "ip4-output",
-  .node_name = "dpdk-esp4-encrypt-tun",
-  .runs_before = VNET_FEATURES ("adj-midchain-tx"),
-};
 /* *INDENT-ON* */
 
 VLIB_NODE_FN (dpdk_esp6_encrypt_tun_node) (vlib_main_t * vm,
@@ -688,13 +699,6 @@ VLIB_REGISTER_NODE (dpdk_esp6_encrypt_tun_node) = {
     {
       [ESP_ENCRYPT_NEXT_DROP] = "error-drop",
     }
-};
-
-VNET_FEATURE_INIT (dpdk_esp6_encrypt_tun_feat_node, static) =
-{
-  .arc_name = "ip6-output",
-  .node_name = "dpdk-esp6-encrypt-tun",
-  .runs_before = VNET_FEATURES ("adj-midchain-tx"),
 };
 /* *INDENT-ON* */
 

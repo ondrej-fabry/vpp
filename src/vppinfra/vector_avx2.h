@@ -110,11 +110,11 @@ u8x32_msb_mask (u8x32 v)
   return _mm256_movemask_epi8 ((__m256i) v);
 }
 
-/* _extend_to_ */
+/* _from_ */
 /* *INDENT-OFF* */
 #define _(f,t,i) \
 static_always_inline t							\
-f##_extend_to_##t (f x)							\
+t##_from_##f (f x)							\
 { return (t) _mm256_cvt##i ((__m128i) x); }
 
 _(u16x8, u32x8, epu16_epi32)
@@ -131,6 +131,16 @@ _(i8x16, i32x8, epi8_epi32)
 _(i8x16, i64x4, epi8_epi64)
 #undef _
 /* *INDENT-ON* */
+
+static_always_inline u64x4
+u64x4_byte_swap (u64x4 v)
+{
+  u8x32 swap = {
+    7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8,
+    7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8,
+  };
+  return (u64x4) _mm256_shuffle_epi8 ((__m256i) v, (__m256i) swap);
+}
 
 static_always_inline u32x8
 u32x8_byte_swap (u32x8 v)
@@ -150,6 +160,23 @@ u16x16_byte_swap (u16x16 v)
     1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14
   };
   return (u16x16) _mm256_shuffle_epi8 ((__m256i) v, (__m256i) swap);
+}
+
+static_always_inline u8x32
+u8x32_shuffle (u8x32 v, u8x32 m)
+{
+  return (u8x32) _mm256_shuffle_epi8 ((__m256i) v, (__m256i) m);
+}
+
+#define u8x32_align_right(a, b, imm) \
+  (u8x32) _mm256_alignr_epi8 ((__m256i) a, (__m256i) b, imm)
+
+static_always_inline u32
+u32x8_sum_elts (u32x8 sum8)
+{
+  sum8 += (u32x8) u8x32_align_right (sum8, sum8, 8);
+  sum8 += (u32x8) u8x32_align_right (sum8, sum8, 4);
+  return sum8[0] + sum8[4];
 }
 
 static_always_inline u32x8
@@ -185,6 +212,14 @@ u16x16_mask_last (u16x16 v, u8 n_last)
 
   return v & masks[16 - n_last];
 }
+
+#ifdef __AVX512F__
+static_always_inline u8x32
+u8x32_mask_load (u8x32 a, void *p, u32 mask)
+{
+  return (u8x32) _mm256_mask_loadu_epi8 ((__m256i) a, mask, p);
+}
+#endif
 
 static_always_inline f32x8
 f32x8_from_u32x8 (u32x8 v)

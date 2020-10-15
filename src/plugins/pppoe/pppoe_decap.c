@@ -16,7 +16,6 @@
  */
 
 #include <vlib/vlib.h>
-#include <vnet/pg/pg.h>
 #include <vnet/ppp/packet.h>
 #include <pppoe/pppoe.h>
 
@@ -390,12 +389,14 @@ VLIB_NODE_FN (pppoe_input_node) (vlib_main_t * vm,
   return from_frame->n_vectors;
 }
 
-static char * pppoe_error_strings[] = {
+#ifndef CLIB_MARCH_VARIANT
+char * pppoe_error_strings[] = {
 #define pppoe_error(n,s) s,
 #include <pppoe/pppoe_error.def>
 #undef pppoe_error
 #undef _
 };
+#endif /* CLIB_MARCH_VARIANT */
 
 VLIB_REGISTER_NODE (pppoe_input_node) = {
   .name = "pppoe-input",

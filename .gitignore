@@ -84,6 +84,10 @@ GTAGS
 /sphinx_venv
 !/docs/Makefile
 
+# language servers
+compile_commands.json
+.clangd
+
 # indent backup files
 *.BAK
 
@@ -97,12 +101,14 @@ GTAGS
 /src/vpp_api/.tox
 /src/vpp_api/.stestr
 
-# Build files in the test directory
-/test/*.ok
-
 # vppctl command list
 /src/scripts/vppctl-cmd-list
 
 # No core files
 **/core
 
+# extra scripts config
+/extras/scripts/.config/
+
+# extras gomemif build files
+/extras/gomemif/bazel*

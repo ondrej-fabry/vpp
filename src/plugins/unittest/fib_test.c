@@ -93,7 +93,7 @@ static u8 * format_test_interface_name (u8 * s, va_list * args)
   return format (s, "test-eth%d", dev_instance);
 }
 
-static uword dummy_interface_tx (vlib_main_t * vm,
+static uword placeholder_interface_tx (vlib_main_t * vm,
                                  vlib_node_runtime_t * node,
                                  vlib_frame_t * frame)
 {
@@ -115,7 +115,7 @@ test_interface_admin_up_down (vnet_main_t * vnm,
 VNET_DEVICE_CLASS (test_interface_device_class,static) = {
     .name = "Test interface",
     .format_device_name = format_test_interface_name,
-    .tx_function = dummy_interface_tx,
+    .tx_function = placeholder_interface_tx,
     .admin_up_down_function = test_interface_admin_up_down,
 };
 
@@ -455,7 +455,7 @@ fib_test_validate_lb_v (const load_balance_t *lb,
 			   "bucket %d stacks on %U",
 			   bucket,
 			   format_dpo_type, dpo->dpoi_type);
-	    
+
 		mld = mpls_label_dpo_get(dpo->dpoi_index);
                 hdr = clib_net_to_host_u32(mld->mld_hdr[0].label_exp_s_ttl);
 
@@ -845,11 +845,11 @@ fib_test_v4 (void)
      * at this stage there are 5 entries in the test FIB (plus 5 in the default),
      * all of which are special sourced and so none of which share path-lists.
      * There are also 2 entries, and 2 non-shared path-lists, in the v6 default
-     * table, and 4 path-lists in the v6 MFIB table
+     * table, and 4 path-lists in the v6 MFIB table and 2 in v4.
      */
 #define ENBR (5+5+2)
 
-    u32 PNBR = 5+5+2+4;
+    u32 PNBR = 5+5+2+4+2;
 
     /*
      * if the IGMP plugin is loaded this adds two more entries to the v4 MFIB
@@ -4441,11 +4441,11 @@ fib_test_v6 (void)
 
     /*
      * At this stage there is one v4 FIB with 5 routes and two v6 FIBs
-     * each with 2 entries and a v6 mfib with 4 path-lists.
+     * each with 2 entries and a v6 mfib with 4 path-lists and v4 mfib with 2.
      * All entries are special so no path-list sharing.
      */
 #define ENPS (5+4)
-    u32 PNPS = (5+4+4);
+    u32 PNPS = (5+4+4+2);
     /*
      * if the IGMP plugin is loaded this adds two more entries to the v4 MFIB
      */
@@ -6688,7 +6688,7 @@ fib_test_label (void)
                                           l1600,
                                           FIB_ROUTE_PATH_FLAG_NONE);
 
-    FIB_TEST(!fib_test_validate_entry(fei, 
+    FIB_TEST(!fib_test_validate_entry(fei,
                                       FIB_FORW_CHAIN_TYPE_UNICAST_IP4,
                                       1,
                                       &l1600_eos_o_1_1_1_1),
@@ -9310,13 +9310,16 @@ fib_test_inherit (void)
              "%U via 10.10.10.2",
              format_fib_prefix, &pfx_10_10_10_0_s_24);
 
+    fib_source_t hi_src = fib_source_allocate("test", 0x50,
+                                              FIB_SOURCE_BH_SIMPLE);
+
     /*
      * add the source that replaces inherited state.
      * inheriting source is not the best, so it doesn't push state.
      */
     fib_table_entry_update_one_path(0,
                                     &pfx_10_10_10_0_s_24,
-                                    FIB_SOURCE_PLUGIN_HI,
+                                    hi_src,
                                     FIB_ENTRY_FLAG_NONE,
                                     DPO_PROTO_IP4,
                                     &nh_10_10_10_1,
@@ -9354,7 +9357,7 @@ fib_test_inherit (void)
      * withdraw the higher priority source and expect the inherited to return
      * throughout the sub-tree
      */
-    fib_table_entry_delete(0, &pfx_10_10_10_0_s_24, FIB_SOURCE_PLUGIN_HI);
+    fib_table_entry_delete(0, &pfx_10_10_10_0_s_24, hi_src);
 
     fei = fib_table_lookup_exact_match(0, &pfx_10_10_10_21_s_32);
     FIB_TEST(!fib_test_validate_entry(fei,

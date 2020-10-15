@@ -3,23 +3,37 @@
    You can adapt this file completely to your liking, but it should at least
    contain the root `toctree` directive.
 
-#########
-FD.io VPP
-#########
+#########################################
+What is the Vector Packet Processor (VPP)
+#########################################
 
-FD.io Vector Packet Processing (VPP) is a fast, scalable and multi-platform network stack. 
+FD.io's Vector Packet Processor (VPP) is a fast, scalable layer 2-4
+multi-platform network stack. It runs in `Linux Userspace <https://en.wikipedia.org/wiki/User_space>`_
+on multiple architectures including x86, ARM, and Power architectures.
 
-FD.io VPP is, at it's core, a scalable layer 2-4 network stack. 
-It supports integration into both Open Stack and Kubernetes environments. 
-It supports network management features including configuration, counters and sampling. 
-It supports extending with plugins, tracing and debugging. 
-It supports use cases such as vSwitch, vRouter, Gateways, Firewalls and Load Balancers, to name but a few. 
-Finally it is useful both a software development kit or an appliance out of the box. 
+VPP's high performance network stack is quickly becoming the network stack of
+choice for applications around the world.
+
+VPP is continually being enhanced through the extensive use of plugins. The
+`Data Plane Development Kit (DPDK) <https://en.wikipedia.org/wiki/Data_Plane_Development_Kit>`_ 
+is a great example of this. It provides some important features and drivers
+for VPP.
+
+VPP supports integration with OpenStack and Kubernetes. Network
+management features include configuration, counters, sampling and
+more. For developers, VPP includes high-performance event-logging,
+and multiple kinds of packet tracing. Development debug images
+include complete symbol tables, and extensive consistency checking.
+
+Some VPP Use-cases include vSwitches, vRouters, Gateways, Firewalls
+and Load Balancers, to name a few.
+
+For more details click on the links below or press next.
 
 .. toctree::
    :maxdepth: 2
 
-   overview/index
+   whatisvpp/index.rst
    gettingstarted/index
    links/index
    usecases/index

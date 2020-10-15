@@ -182,7 +182,7 @@ rdma_flag_change (vnet_main_t * vnm, vnet_hw_interface_t * hw, u32 flags)
 
   switch (flags)
     {
-    case 0:
+    case ETHERNET_INTERFACE_FLAG_DEFAULT_L3:
       return rdma_dev_set_ucast (rd);
     case ETHERNET_INTERFACE_FLAG_ACCEPT_ALL:
       return rdma_dev_set_promisc (rd);
@@ -324,7 +324,7 @@ rdma_async_event_init (rdma_device_t * rd)
   t.file_descriptor = rd->ctx->async_fd;
   t.error_function = rdma_async_event_error_ready;
   t.private_data = rd->dev_instance;
-  t.description = format (0, "%s async event", rd->name);
+  t.description = format (0, "%v async event", rd->name);
 
   rd->async_event_clib_file_index = clib_file_add (&file_main, &t);
   return 0;
@@ -339,9 +339,18 @@ rdma_async_event_cleanup (rdma_device_t * rd)
 static clib_error_t *
 rdma_register_interface (vnet_main_t * vnm, rdma_device_t * rd)
 {
-  return ethernet_register_interface (vnm, rdma_device_class.index,
-				      rd->dev_instance, rd->hwaddr.bytes,
-				      &rd->hw_if_index, rdma_flag_change);
+  clib_error_t *err =
+    ethernet_register_interface (vnm, rdma_device_class.index,
+				 rd->dev_instance, rd->hwaddr.bytes,
+				 &rd->hw_if_index, rdma_flag_change);
+
+  /* Indicate ability to support L3 DMAC filtering and
+   * initialize interface to L3 non-promisc mode */
+  vnet_hw_interface_t *hi = vnet_get_hw_interface (vnm, rd->hw_if_index);
+  hi->flags |= VNET_HW_INTERFACE_FLAG_SUPPORTS_MAC_FILTER;
+  ethernet_set_flags (vnm, rd->hw_if_index,
+		      ETHERNET_INTERFACE_FLAG_DEFAULT_L3);
+  return err;
 }
 
 static void
@@ -399,15 +408,32 @@ rdma_rxq_init (vlib_main_t * vm, rdma_device_t * rd, u16 qid, u32 n_desc)
 {
   rdma_rxq_t *rxq;
   struct ibv_wq_init_attr wqia;
+  struct ibv_cq_init_attr_ex cqa = { };
   struct ibv_wq_attr wqa;
+  struct ibv_cq_ex *cqex;
 
   vec_validate_aligned (rd->rxqs, qid, CLIB_CACHE_LINE_BYTES);
   rxq = vec_elt_at_index (rd->rxqs, qid);
   rxq->size = n_desc;
   vec_validate_aligned (rxq->bufs, n_desc - 1, CLIB_CACHE_LINE_BYTES);
 
-  if ((rxq->cq = ibv_create_cq (rd->ctx, n_desc, NULL, NULL, 0)) == 0)
-    return clib_error_return_unix (0, "Create CQ Failed");
+  cqa.cqe = n_desc;
+  if (rd->flags & RDMA_DEVICE_F_MLX5DV)
+    {
+      struct mlx5dv_cq_init_attr dvcq = { };
+      dvcq.comp_mask = MLX5DV_CQ_INIT_ATTR_MASK_COMPRESSED_CQE;
+      dvcq.cqe_comp_res_format = MLX5DV_CQE_RES_FORMAT_HASH;
+
+      if ((cqex = mlx5dv_create_cq (rd->ctx, &cqa, &dvcq)) == 0)
+	return clib_error_return_unix (0, "Create mlx5dv rx CQ Failed");
+    }
+  else
+    {
+      if ((cqex = ibv_create_cq_ex (rd->ctx, &cqa)) == 0)
+	return clib_error_return_unix (0, "Create CQ Failed");
+    }
+
+  rxq->cq = ibv_cq_ex_to_cq (cqex);
 
   memset (&wqia, 0, sizeof (wqia));
   wqia.wq_type = IBV_WQT_RQ;
@@ -423,6 +449,44 @@ rdma_rxq_init (vlib_main_t * vm, rdma_device_t * rd, u16 qid, u32 n_desc)
   wqa.wq_state = IBV_WQS_RDY;
   if (ibv_modify_wq (rxq->wq, &wqa) != 0)
     return clib_error_return_unix (0, "Modify WQ (RDY) Failed");
+
+  if (rd->flags & RDMA_DEVICE_F_MLX5DV)
+    {
+      struct mlx5dv_obj obj = { };
+      struct mlx5dv_cq dv_cq;
+      struct mlx5dv_rwq dv_rwq;
+      u64 qw0;
+
+      obj.cq.in = rxq->cq;
+      obj.cq.out = &dv_cq;
+      obj.rwq.in = rxq->wq;
+      obj.rwq.out = &dv_rwq;
+
+      if ((mlx5dv_init_obj (&obj, MLX5DV_OBJ_CQ | MLX5DV_OBJ_RWQ)))
+	return clib_error_return_unix (0, "mlx5dv: failed to init rx obj");
+
+      if (dv_cq.cqe_size != sizeof (mlx5dv_cqe_t))
+	return clib_error_return_unix (0, "mlx5dv: incompatible rx CQE size");
+
+      rxq->log2_cq_size = max_log2 (dv_cq.cqe_cnt);
+      rxq->cqes = (mlx5dv_cqe_t *) dv_cq.buf;
+      rxq->cq_db = (volatile u32 *) dv_cq.dbrec;
+      rxq->cqn = dv_cq.cqn;
+
+      rxq->wqes = (mlx5dv_rwq_t *) dv_rwq.buf;
+      rxq->wq_db = (volatile u32 *) dv_rwq.dbrec;
+      rxq->wq_stride = dv_rwq.stride;
+      rxq->wqe_cnt = dv_rwq.wqe_cnt;
+
+      qw0 = clib_host_to_net_u32 (vlib_buffer_get_default_data_size (vm));
+      qw0 |= (u64) clib_host_to_net_u32 (rd->lkey) << 32;
+
+      for (int i = 0; i < rxq->size; i++)
+	rxq->wqes[i].dsz_and_lkey = qw0;
+
+      for (int i = 0; i < (1 << rxq->log2_cq_size); i++)
+	rxq->cqes[i].opcode_cqefmt_se_owner = 0xff;
+    }
 
   return 0;
 }
@@ -480,7 +544,8 @@ rdma_txq_init (vlib_main_t * vm, rdma_device_t * rd, u16 qid, u32 n_desc)
 
   vec_validate_aligned (rd->txqs, qid, CLIB_CACHE_LINE_BYTES);
   txq = vec_elt_at_index (rd->txqs, qid);
-  txq->size = n_desc;
+  ASSERT (is_pow2 (n_desc));
+  txq->bufs_log2sz = min_log2 (n_desc);
   vec_validate_aligned (txq->bufs, n_desc - 1, CLIB_CACHE_LINE_BYTES);
 
   if ((txq->cq = ibv_create_cq (rd->ctx, n_desc, NULL, NULL, 0)) == 0)
@@ -514,6 +579,57 @@ rdma_txq_init (vlib_main_t * vm, rdma_device_t * rd, u16 qid, u32 n_desc)
   qpa.qp_state = IBV_QPS_RTS;
   if (ibv_modify_qp (txq->qp, &qpa, qp_flags) != 0)
     return clib_error_return_unix (0, "Modify QP (send) Failed");
+
+  txq->ibv_cq = txq->cq;
+  txq->ibv_qp = txq->qp;
+
+  if (rd->flags & RDMA_DEVICE_F_MLX5DV)
+    {
+      rdma_mlx5_wqe_t *tmpl = (void *) txq->dv_wqe_tmpl;
+      struct mlx5dv_cq dv_cq;
+      struct mlx5dv_qp dv_qp;
+      struct mlx5dv_obj obj = { };
+
+      obj.cq.in = txq->cq;
+      obj.cq.out = &dv_cq;
+      obj.qp.in = txq->qp;
+      obj.qp.out = &dv_qp;
+
+      if (mlx5dv_init_obj (&obj, MLX5DV_OBJ_CQ | MLX5DV_OBJ_QP))
+	return clib_error_return_unix (0, "DV init obj failed");
+
+      if (RDMA_TXQ_BUF_SZ (txq) > dv_qp.sq.wqe_cnt
+	  || !is_pow2 (dv_qp.sq.wqe_cnt)
+	  || sizeof (rdma_mlx5_wqe_t) != dv_qp.sq.stride
+	  || (uword) dv_qp.sq.buf % sizeof (rdma_mlx5_wqe_t))
+	return clib_error_return (0, "Unsupported DV SQ parameters");
+
+      if (RDMA_TXQ_BUF_SZ (txq) > dv_cq.cqe_cnt
+	  || !is_pow2 (dv_cq.cqe_cnt)
+	  || sizeof (struct mlx5_cqe64) != dv_cq.cqe_size
+	  || (uword) dv_cq.buf % sizeof (struct mlx5_cqe64))
+	return clib_error_return (0, "Unsupported DV CQ parameters");
+
+      /* get SQ and doorbell addresses */
+      txq->dv_sq_wqes = dv_qp.sq.buf;
+      txq->dv_sq_dbrec = dv_qp.dbrec;
+      txq->dv_sq_db = dv_qp.bf.reg;
+      txq->dv_sq_log2sz = min_log2 (dv_qp.sq.wqe_cnt);
+
+      /* get CQ and doorbell addresses */
+      txq->dv_cq_cqes = dv_cq.buf;
+      txq->dv_cq_dbrec = dv_cq.dbrec;
+      txq->dv_cq_log2sz = min_log2 (dv_cq.cqe_cnt);
+
+      /* init tx desc template */
+      STATIC_ASSERT_SIZEOF (txq->dv_wqe_tmpl, sizeof (*tmpl));
+      mlx5dv_set_ctrl_seg (&tmpl->ctrl, 0, MLX5_OPCODE_SEND, 0,
+			   txq->qp->qp_num, 0, RDMA_MLX5_WQE_DS, 0,
+			   RDMA_TXQ_DV_INVALID_ID);
+      tmpl->eseg.inline_hdr_sz = htobe16 (MLX5_ETH_L2_INLINE_HEADER_SIZE);
+      mlx5dv_set_data_seg (&tmpl->dseg, 0, rd->lkey, 0);
+    }
+
   return 0;
 }
 
@@ -532,23 +648,35 @@ rdma_dev_init (vlib_main_t * vm, rdma_device_t * rd, u32 rxq_size,
   if ((rd->pd = ibv_alloc_pd (rd->ctx)) == 0)
     return clib_error_return_unix (0, "PD Alloc Failed");
 
+  if ((rd->mr = ibv_reg_mr (rd->pd, (void *) bm->buffer_mem_start,
+			    bm->buffer_mem_size,
+			    IBV_ACCESS_LOCAL_WRITE)) == 0)
+    return clib_error_return_unix (0, "Register MR Failed");
+
+  rd->lkey = rd->mr->lkey;	/* avoid indirection in datapath */
+
   ethernet_mac_address_generate (rd->hwaddr.bytes);
-
-  for (i = 0; i < rxq_num; i++)
-    if ((err = rdma_rxq_init (vm, rd, i, rxq_size)))
-      return err;
-  if ((err = rdma_rxq_finalize (vm, rd)))
-    return err;
-
-  for (i = 0; i < tm->n_vlib_mains; i++)
-    if ((err = rdma_txq_init (vm, rd, i, txq_size)))
-      return err;
 
   if ((rd->mr = ibv_reg_mr (rd->pd, (void *) bm->buffer_mem_start,
 			    bm->buffer_mem_size,
 			    IBV_ACCESS_LOCAL_WRITE)) == 0)
     return clib_error_return_unix (0, "Register MR Failed");
   rd->lkey = rd->mr->lkey;	/* avoid indirection in datapath */
+
+  /*
+   * /!\ WARNING /!\ creation order is important
+   * We *must* create TX queues *before* RX queues, otherwise we will receive
+   * the broacast packets we sent
+   */
+  for (i = 0; i < tm->n_vlib_mains; i++)
+    if ((err = rdma_txq_init (vm, rd, i, txq_size)))
+      return err;
+
+  for (i = 0; i < rxq_num; i++)
+    if ((err = rdma_rxq_init (vm, rd, i, rxq_size)))
+      return err;
+  if ((err = rdma_rxq_finalize (vm, rd)))
+    return err;
 
   return 0;
 }
@@ -561,6 +689,9 @@ sysfs_path_to_pci_addr (char *path, vlib_pci_addr_t * addr)
   u8 *s;
 
   s = clib_sysfs_link_to_name (path);
+  if (!s)
+    return 0;
+
   unformat_init_string (&in, (char *) s, strlen ((char *) s));
   rv = unformat (&in, "%U", unformat_vlib_pci_addr, addr);
   unformat_free (&in);
@@ -581,8 +712,8 @@ rdma_create_if (vlib_main_t * vm, rdma_create_if_args_t * args)
   u16 qid;
   int i;
 
-  args->rxq_size = args->rxq_size ? args->rxq_size : 2 * VLIB_FRAME_SIZE;
-  args->txq_size = args->txq_size ? args->txq_size : 2 * VLIB_FRAME_SIZE;
+  args->rxq_size = args->rxq_size ? args->rxq_size : 1024;
+  args->txq_size = args->txq_size ? args->txq_size : 1024;
   args->rxq_num = args->rxq_num ? args->rxq_num : 1;
 
   if (!is_pow2 (args->rxq_num))
@@ -594,12 +725,13 @@ rdma_create_if (vlib_main_t * vm, rdma_create_if_args_t * args)
     }
 
   if (args->rxq_size < VLIB_FRAME_SIZE || args->txq_size < VLIB_FRAME_SIZE ||
+      args->rxq_size > 65535 || args->txq_size > 65535 ||
       !is_pow2 (args->rxq_size) || !is_pow2 (args->txq_size))
     {
       args->rv = VNET_API_ERROR_INVALID_VALUE;
-      args->error =
-	clib_error_return (0, "queue size must be a power of two >= %i",
-			   VLIB_FRAME_SIZE);
+      args->error = clib_error_return (0, "queue size must be a power of two "
+				       "between %i and 65535",
+				       VLIB_FRAME_SIZE);
       goto err0;
     }
 
@@ -624,12 +756,21 @@ rdma_create_if (vlib_main_t * vm, rdma_create_if_args_t * args)
   pool_get_zero (rm->devices, rd);
   rd->dev_instance = rd - rm->devices;
   rd->per_interface_next_index = VNET_DEVICE_INPUT_NEXT_ETHERNET_INPUT;
-  rd->name = format (0, "%s", args->name);
   rd->linux_ifname = format (0, "%s", args->ifname);
+
+  if (!args->name || 0 == args->name[0])
+    rd->name = format (0, "%s/%d", args->ifname, rd->dev_instance);
+  else
+    rd->name = format (0, "%s", args->name);
 
   rd->pci = vlib_pci_get_device_info (vm, &pci_addr, &args->error);
   if (!rd->pci)
     goto err2;
+
+  /* if we failed to parse NUMA node, default to 0 */
+  if (-1 == rd->pci->numa_node)
+    rd->pci->numa_node = 0;
+
   rd->pool = vlib_buffer_pool_get_default_for_numa (vm, rd->pci->numa_node);
 
   if (strncmp ((char *) rd->pci->driver_name, "mlx5_core", 9))
@@ -657,8 +798,28 @@ rdma_create_if (vlib_main_t * vm, rdma_create_if_args_t * args)
 	break;
     }
 
-  if ((args->error =
-       rdma_dev_init (vm, rd, args->rxq_size, args->txq_size, args->rxq_num)))
+  if (args->mode != RDMA_MODE_IBV)
+    {
+      struct mlx5dv_context mlx5dv_attrs = { };
+
+      if (mlx5dv_query_device (rd->ctx, &mlx5dv_attrs) == 0)
+	{
+	  if ((mlx5dv_attrs.flags & MLX5DV_CONTEXT_FLAGS_CQE_V1))
+	    rd->flags |= RDMA_DEVICE_F_MLX5DV;
+	}
+      else
+	{
+	  if (args->mode == RDMA_MODE_DV)
+	    {
+	      args->error = clib_error_return (0, "Direct Verbs mode not "
+					       "supported on this interface");
+	      goto err2;
+	    }
+	}
+    }
+
+  if ((args->error = rdma_dev_init (vm, rd, args->rxq_size, args->txq_size,
+				    args->rxq_num)))
     goto err2;
 
   if ((args->error = rdma_register_interface (vnm, rd)))
@@ -736,15 +897,9 @@ rdma_set_interface_next_node (vnet_main_t * vnm, u32 hw_if_index,
   rdma_main_t *rm = &rdma_main;
   vnet_hw_interface_t *hw = vnet_get_hw_interface (vnm, hw_if_index);
   rdma_device_t *rd = pool_elt_at_index (rm->devices, hw->dev_instance);
-
-  /* Shut off redirection */
-  if (node_index == ~0)
-    {
-      rd->per_interface_next_index = node_index;
-      return;
-    }
-
   rd->per_interface_next_index =
+    ~0 ==
+    node_index ? VNET_DEVICE_INPUT_NEXT_ETHERNET_INPUT :
     vlib_node_add_next (vlib_get_main (), rdma_input_node.index, node_index);
 }
 
@@ -772,13 +927,32 @@ clib_error_t *
 rdma_init (vlib_main_t * vm)
 {
   rdma_main_t *rm = &rdma_main;
+  vlib_thread_main_t *tm = vlib_get_thread_main ();
 
   rm->log_class = vlib_log_register_class ("rdma", 0);
+
+  /* vlib_buffer_t template */
+  vec_validate_aligned (rm->per_thread_data, tm->n_vlib_mains - 1,
+			CLIB_CACHE_LINE_BYTES);
+
+  for (int i = 0; i < tm->n_vlib_mains; i++)
+    {
+      rdma_per_thread_data_t *ptd = vec_elt_at_index (rm->per_thread_data, i);
+      clib_memset (&ptd->buffer_template, 0, sizeof (vlib_buffer_t));
+      ptd->buffer_template.flags = VLIB_BUFFER_TOTAL_LENGTH_VALID;
+      ptd->buffer_template.ref_count = 1;
+      vnet_buffer (&ptd->buffer_template)->sw_if_index[VLIB_TX] = (u32) ~ 0;
+    }
 
   return 0;
 }
 
-VLIB_INIT_FUNCTION (rdma_init);
+/* *INDENT-OFF* */
+VLIB_INIT_FUNCTION (rdma_init) =
+{
+  .runs_after = VLIB_INITS ("pci_bus_init"),
+};
+/* *INDENT-OFF* */
 
 /*
  * fd.io coding-style-patch-verification: ON

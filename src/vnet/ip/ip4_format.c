@@ -150,10 +150,15 @@ format_ip4_header (u8 * s, va_list * args)
 
   /* Check and report invalid checksums. */
   {
-    u16 c = ip4_header_checksum (ip);
-    if (c != ip->checksum)
-      s = format (s, " (should be 0x%04x)", clib_net_to_host_u16 (c));
+    if (!ip4_header_checksum_is_valid (ip))
+      s =
+	format (s, " (should be 0x%04x)",
+		clib_net_to_host_u16 (ip4_header_checksum (ip)));
   }
+
+  s = format (s, " dscp %U ecn %U",
+	      format_ip_dscp, ip4_header_get_dscp (ip),
+	      format_ip_ecn, ip4_header_get_ecn (ip));
 
   {
     u32 f = clib_net_to_host_u16 (ip->flags_and_fragment_offset);
@@ -165,7 +170,7 @@ format_ip4_header (u8 * s, va_list * args)
 
     /* Fragment offset. */
     o = 8 * (f & 0x1fff);
-    f ^= o;
+    f ^= f & 0x1fff;
     if (o != 0)
       s = format (s, " offset %d", o);
 

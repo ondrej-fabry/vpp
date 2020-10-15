@@ -274,7 +274,7 @@ load_balance_map_db_remove (load_balance_map_t *lbm)
     {
         p = hash_get(lb_maps_by_path_index, lbmp->lbmp_index);
 
-        ASSERT(NULL != p);
+        ALWAYS_ASSERT(NULL != p);
 
         fib_node_list_remove(p[0], lbmp->lbmp_sibling);
     }
@@ -312,7 +312,7 @@ load_balance_map_fill (load_balance_map_t *lbm)
                 tmp_buckets[jj++] = bucket++;
             }
         }
-        else 
+        else
         {
             bucket += lbmp->lbmp_weight;
         }
@@ -387,8 +387,13 @@ load_balance_map_alloc (const load_balance_path_t *paths)
 {
     load_balance_map_t *lbm;
     u32 ii;
+    vlib_main_t *vm;
+    u8 did_barrier_sync;
 
+    dpo_pool_barrier_sync (vm, load_balance_map_pool, did_barrier_sync);
     pool_get_aligned(load_balance_map_pool, lbm, CLIB_CACHE_LINE_BYTES);
+    dpo_pool_barrier_release (vm, did_barrier_sync);
+
     clib_memset(lbm, 0, sizeof(*lbm));
 
     vec_validate(lbm->lbm_paths, vec_len(paths)-1);

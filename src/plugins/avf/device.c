@@ -27,7 +27,7 @@
 #define AVF_MBOX_BUF_SZ 512
 #define AVF_RXQ_SZ 512
 #define AVF_TXQ_SZ 512
-#define AVF_ITR_INT 32
+#define AVF_ITR_INT 250
 
 #define PCI_VENDOR_ID_INTEL			0x8086
 #define PCI_DEVICE_ID_INTEL_AVF			0x1889
@@ -35,6 +35,7 @@
 #define PCI_DEVICE_ID_INTEL_X722_VF		0x37cd
 
 avf_main_t avf_main;
+void avf_delete_if (vlib_main_t * vm, avf_device_t * ad, int with_barrier);
 
 static pci_device_id_t avf_pci_device_ids[] = {
   {.vendor_id = PCI_VENDOR_ID_INTEL,.device_id = PCI_DEVICE_ID_INTEL_AVF},
@@ -49,14 +50,15 @@ const static char *virtchnl_event_names[] = {
 #undef _
 };
 
-const static char *virtchnl_link_speed_str[] = {
-#define _(v, n, s) [v] = s,
-  foreach_virtchnl_link_speed
-#undef _
-};
+typedef enum
+{
+  AVF_IRQ_STATE_DISABLED,
+  AVF_IRQ_STATE_ENABLED,
+  AVF_IRQ_STATE_WB_ON_ITR,
+} avf_irq_state_t;
 
 static inline void
-avf_irq_0_disable (avf_device_t * ad)
+avf_irq_0_set_state (avf_device_t * ad, avf_irq_state_t state)
 {
   u32 dyn_ctl0 = 0, icr0_ena = 0;
 
@@ -65,45 +67,52 @@ avf_irq_0_disable (avf_device_t * ad)
   avf_reg_write (ad, AVFINT_ICR0_ENA1, icr0_ena);
   avf_reg_write (ad, AVFINT_DYN_CTL0, dyn_ctl0);
   avf_reg_flush (ad);
-}
 
-static inline void
-avf_irq_0_enable (avf_device_t * ad)
-{
-  u32 dyn_ctl0 = 0, icr0_ena = 0;
+  if (state == AVF_IRQ_STATE_DISABLED)
+    return;
+
+  dyn_ctl0 = 0;
+  icr0_ena = 0;
 
   icr0_ena |= (1 << 30);	/* [30] Admin Queue Enable */
 
   dyn_ctl0 |= (1 << 0);		/* [0] Interrupt Enable */
   dyn_ctl0 |= (1 << 1);		/* [1] Clear PBA */
-  //dyn_ctl0 |= (3 << 3);               /* [4:3] ITR Index, 11b = No ITR update */
+  dyn_ctl0 |= (2 << 3);		/* [4:3] ITR Index, 11b = No ITR update */
   dyn_ctl0 |= ((AVF_ITR_INT / 2) << 5);	/* [16:5] ITR Interval in 2us steps */
 
-  avf_irq_0_disable (ad);
   avf_reg_write (ad, AVFINT_ICR0_ENA1, icr0_ena);
   avf_reg_write (ad, AVFINT_DYN_CTL0, dyn_ctl0);
   avf_reg_flush (ad);
 }
 
 static inline void
-avf_irq_n_disable (avf_device_t * ad, u8 line)
+avf_irq_n_set_state (avf_device_t * ad, u8 line, avf_irq_state_t state)
 {
   u32 dyn_ctln = 0;
 
+  /* disable */
   avf_reg_write (ad, AVFINT_DYN_CTLN (line), dyn_ctln);
   avf_reg_flush (ad);
-}
 
-static inline void
-avf_irq_n_enable (avf_device_t * ad, u8 line)
-{
-  u32 dyn_ctln = 0;
+  if (state == AVF_IRQ_STATE_DISABLED)
+    return;
 
-  dyn_ctln |= (1 << 0);		/* [0] Interrupt Enable */
   dyn_ctln |= (1 << 1);		/* [1] Clear PBA */
-  dyn_ctln |= ((AVF_ITR_INT / 2) << 5);	/* [16:5] ITR Interval in 2us steps */
+  if (state == AVF_IRQ_STATE_WB_ON_ITR)
+    {
+      /* minimal ITR interval, use ITR1 */
+      dyn_ctln |= (1 << 3);	/* [4:3] ITR Index */
+      dyn_ctln |= ((32 / 2) << 5);	/* [16:5] ITR Interval in 2us steps */
+      dyn_ctln |= (1 << 30);	/* [30] Writeback on ITR */
+    }
+  else
+    {
+      /* configured ITR interval, use ITR0 */
+      dyn_ctln |= (1 << 0);	/* [0] Interrupt Enable */
+      dyn_ctln |= ((AVF_ITR_INT / 2) << 5);	/* [16:5] ITR Interval in 2us steps */
+    }
 
-  avf_irq_n_disable (ad, line);
   avf_reg_write (ad, AVFINT_DYN_CTLN (line), dyn_ctln);
   avf_reg_flush (ad);
 }
@@ -115,7 +124,7 @@ avf_aq_desc_enq (vlib_main_t * vm, avf_device_t * ad, avf_aq_desc_t * dt,
 {
   clib_error_t *err = 0;
   avf_aq_desc_t *d, dc;
-  f64 t0, wait_time, suspend_time = AVF_AQ_ENQ_SUSPEND_TIME;
+  f64 t0, suspend_time = AVF_AQ_ENQ_SUSPEND_TIME;
 
   d = &ad->atq[ad->atq_next_slot];
   clib_memcpy_fast (d, dt, sizeof (avf_aq_desc_t));
@@ -144,12 +153,13 @@ avf_aq_desc_enq (vlib_main_t * vm, avf_device_t * ad, avf_aq_desc_t * dt,
   t0 = vlib_time_now (vm);
 retry:
   vlib_process_suspend (vm, suspend_time);
-  wait_time = vlib_time_now (vm) - t0;
 
   if (((d->flags & AVF_AQ_F_DD) == 0) || ((d->flags & AVF_AQ_F_CMP) == 0))
     {
-      if (wait_time > AVF_AQ_ENQ_MAX_WAIT_TIME)
+      f64 t = vlib_time_now (vm) - t0;
+      if (t > AVF_AQ_ENQ_MAX_WAIT_TIME)
 	{
+	  avf_log_err (ad, "aq_desc_enq failed (timeout %.3fs)", t);
 	  err = clib_error_return (0, "adminq enqueue timeout [opcode 0x%x]",
 				   d->opcode);
 	  goto done;
@@ -387,8 +397,12 @@ avf_send_to_pf (vlib_main_t * vm, avf_device_t * ad, virtchnl_ops_t op,
   clib_error_t *err;
   avf_aq_desc_t *d, dt = {.opcode = 0x801,.v_opcode = op };
   u32 head;
-  int n_retry = 5;
+  f64 t0, suspend_time = AVF_SEND_TO_PF_SUSPEND_TIME;
 
+  /* adminq operations should be only done from process node after device
+   * is initialized */
+  ASSERT ((ad->flags & AVF_DEVICE_F_INITIALIZED) == 0 ||
+	  vlib_get_current_process_node_index (vm) == avf_process_node.index);
 
   /* suppress interrupt in the next adminq receive slot
      as we are going to wait for response
@@ -399,14 +413,20 @@ avf_send_to_pf (vlib_main_t * vm, avf_device_t * ad, virtchnl_ops_t op,
   if ((err = avf_aq_desc_enq (vm, ad, &dt, in, in_len)))
     return err;
 
+  t0 = vlib_time_now (vm);
 retry:
   head = avf_get_u32 (ad->bar0, AVF_ARQH);
 
   if (ad->arq_next_slot == head)
     {
-      if (--n_retry == 0)
-	return clib_error_return (0, "timeout");
-      vlib_process_suspend (vm, 10e-3);
+      f64 t = vlib_time_now (vm) - t0;
+      if (t > AVF_SEND_TO_PF_MAX_WAIT_TIME)
+	{
+	  avf_log_err (ad, "send_to_pf failed (timeout %.3fs)", t);
+	  return clib_error_return (0, "timeout");
+	}
+      vlib_process_suspend (vm, suspend_time);
+      suspend_time *= 2;
       goto retry;
     }
 
@@ -425,7 +445,9 @@ retry:
       clib_memcpy_fast (e, buf, sizeof (virtchnl_pf_event_t));
       avf_arq_slot_init (ad, ad->arq_next_slot);
       ad->arq_next_slot++;
-      n_retry = 5;
+      /* reset timer */
+      t0 = vlib_time_now (vm);
+      suspend_time = AVF_SEND_TO_PF_SUSPEND_TIME;
       goto retry;
     }
 
@@ -519,7 +541,8 @@ avf_op_get_vf_resources (vlib_main_t * vm, avf_device_t * ad,
   clib_error_t *err = 0;
   u32 bitmap = (VIRTCHNL_VF_OFFLOAD_L2 | VIRTCHNL_VF_OFFLOAD_RSS_PF |
 		VIRTCHNL_VF_OFFLOAD_WB_ON_ITR | VIRTCHNL_VF_OFFLOAD_VLAN |
-		VIRTCHNL_VF_OFFLOAD_RX_POLLING);
+		VIRTCHNL_VF_OFFLOAD_RX_POLLING |
+		VIRTCHNL_VF_CAP_ADV_LINK_SPEED);
 
   avf_log_debug (ad, "get_vf_reqources: bitmap 0x%x", bitmap);
   err = avf_send_to_pf (vm, ad, VIRTCHNL_OP_GET_VF_RESOURCES, &bitmap,
@@ -606,12 +629,15 @@ avf_op_disable_vlan_stripping (vlib_main_t * vm, avf_device_t * ad)
 }
 
 clib_error_t *
-avf_config_promisc_mode (vlib_main_t * vm, avf_device_t * ad)
+avf_op_config_promisc_mode (vlib_main_t * vm, avf_device_t * ad,
+			    int is_enable)
 {
   virtchnl_promisc_info_t pi = { 0 };
 
   pi.vsi_id = ad->vsi_id;
-  pi.flags = FLAG_VF_UNICAST_PROMISC | FLAG_VF_MULTICAST_PROMISC;
+
+  if (is_enable)
+    pi.flags = FLAG_VF_UNICAST_PROMISC | FLAG_VF_MULTICAST_PROMISC;
 
   avf_log_debug (ad, "config_promisc_mode: unicast %s multicast %s",
 		 pi.flags & FLAG_VF_UNICAST_PROMISC ? "on" : "off",
@@ -681,31 +707,37 @@ avf_op_config_vsi_queues (vlib_main_t * vm, avf_device_t * ad)
 clib_error_t *
 avf_op_config_irq_map (vlib_main_t * vm, avf_device_t * ad)
 {
-  int count = 1;
   int msg_len = sizeof (virtchnl_irq_map_info_t) +
-    count * sizeof (virtchnl_vector_map_t);
+    (ad->n_rx_irqs) * sizeof (virtchnl_vector_map_t);
   u8 msg[msg_len];
   virtchnl_irq_map_info_t *imi;
 
   clib_memset (msg, 0, msg_len);
   imi = (virtchnl_irq_map_info_t *) msg;
-  imi->num_vectors = count;
+  imi->num_vectors = ad->n_rx_irqs;
 
-  imi->vecmap[0].vector_id = 1;
-  imi->vecmap[0].vsi_id = ad->vsi_id;
-  imi->vecmap[0].rxq_map = (1 << ad->n_rx_queues) - 1;
-  imi->vecmap[0].txq_map = (1 << ad->n_tx_queues) - 1;
+  for (int i = 0; i < ad->n_rx_irqs; i++)
+    {
+      imi->vecmap[i].vector_id = i + 1;
+      imi->vecmap[i].vsi_id = ad->vsi_id;
+      if (ad->n_rx_irqs == ad->n_rx_queues)
+	imi->vecmap[i].rxq_map = 1 << i;
+      else
+	imi->vecmap[i].rxq_map = pow2_mask (ad->n_rx_queues);;
 
-  avf_log_debug (ad, "config_irq_map: vsi_id %u vector_id %u rxq_map %u",
-		 ad->vsi_id, imi->vecmap[0].vector_id,
-		 imi->vecmap[0].rxq_map);
+      avf_log_debug (ad, "config_irq_map[%u/%u]: vsi_id %u vector_id %u "
+		     "rxq_map %u", i, ad->n_rx_irqs - 1, ad->vsi_id,
+		     imi->vecmap[i].vector_id, imi->vecmap[i].rxq_map);
+    }
+
 
   return avf_send_to_pf (vm, ad, VIRTCHNL_OP_CONFIG_IRQ_MAP, msg, msg_len, 0,
 			 0);
 }
 
 clib_error_t *
-avf_op_add_eth_addr (vlib_main_t * vm, avf_device_t * ad, u8 count, u8 * macs)
+avf_op_add_del_eth_addr (vlib_main_t * vm, avf_device_t * ad, u8 count,
+			 u8 * macs, int is_add)
 {
   int msg_len =
     sizeof (virtchnl_ether_addr_list_t) +
@@ -719,17 +751,17 @@ avf_op_add_eth_addr (vlib_main_t * vm, avf_device_t * ad, u8 count, u8 * macs)
   al->vsi_id = ad->vsi_id;
   al->num_elements = count;
 
-  avf_log_debug (ad, "add_eth_addr: vsi_id %u num_elements %u",
-		 ad->vsi_id, al->num_elements);
+  avf_log_debug (ad, "add_del_eth_addr: vsi_id %u num_elements %u is_add %u",
+		 ad->vsi_id, al->num_elements, is_add);
 
   for (i = 0; i < count; i++)
     {
       clib_memcpy_fast (&al->list[i].addr, macs + i * 6, 6);
-      avf_log_debug (ad, "add_eth_addr[%u]: %U", i,
+      avf_log_debug (ad, "add_del_eth_addr[%u]: %U", i,
 		     format_ethernet_address, &al->list[i].addr);
     }
-  return avf_send_to_pf (vm, ad, VIRTCHNL_OP_ADD_ETH_ADDR, msg, msg_len, 0,
-			 0);
+  return avf_send_to_pf (vm, ad, is_add ? VIRTCHNL_OP_ADD_ETH_ADDR :
+			 VIRTCHNL_OP_ADD_ETH_ADDR, msg, msg_len, 0, 0);
 }
 
 clib_error_t *
@@ -778,7 +810,7 @@ avf_device_reset (vlib_main_t * vm, avf_device_t * ad)
   avf_aq_desc_t d = { 0 };
   clib_error_t *error;
   u32 rstat;
-  int n_retry = 20;
+  f64 t0, t = 0, suspend_time = AVF_RESET_SUSPEND_TIME;
 
   avf_log_debug (ad, "reset");
 
@@ -787,19 +819,26 @@ avf_device_reset (vlib_main_t * vm, avf_device_t * ad)
   if ((error = avf_aq_desc_enq (vm, ad, &d, 0, 0)))
     return error;
 
+  t0 = vlib_time_now (vm);
 retry:
-  vlib_process_suspend (vm, 10e-3);
+  vlib_process_suspend (vm, suspend_time);
+
   rstat = avf_get_u32 (ad->bar0, AVFGEN_RSTAT);
 
   if (rstat == 2 || rstat == 3)
-    return 0;
-
-  if (--n_retry == 0)
     {
-      avf_log_err (ad, "reset failed");
+      avf_log_debug (ad, "reset completed in %.3fs", t);
+      return 0;
+    }
+
+  t = vlib_time_now (vm) - t0;
+  if (t > AVF_RESET_MAX_WAIT_TIME)
+    {
+      avf_log_err (ad, "reset failed (timeout %.3fs)", t);
       return clib_error_return (0, "reset failed (timeout)");
     }
 
+  suspend_time *= 2;
   goto retry;
 }
 
@@ -809,7 +848,7 @@ avf_request_queues (vlib_main_t * vm, avf_device_t * ad, u16 num_queue_pairs)
   virtchnl_vf_res_request_t res_req = { 0 };
   clib_error_t *error;
   u32 rstat;
-  int n_retry = 20;
+  f64 t0, t, suspend_time = AVF_RESET_SUSPEND_TIME;
 
   res_req.num_queue_pairs = num_queue_pairs;
 
@@ -829,16 +868,23 @@ avf_request_queues (vlib_main_t * vm, avf_device_t * ad, u16 num_queue_pairs)
 				res_req.num_queue_pairs);
     }
 
+  t0 = vlib_time_now (vm);
 retry:
-  vlib_process_suspend (vm, 10e-3);
+  vlib_process_suspend (vm, suspend_time);
+  t = vlib_time_now (vm) - t0;
+
   rstat = avf_get_u32 (ad->bar0, AVFGEN_RSTAT);
 
   if ((rstat == VIRTCHNL_VFR_COMPLETED) || (rstat == VIRTCHNL_VFR_VFACTIVE))
     goto done;
 
-  if (--n_retry == 0)
-    return clib_error_return (0, "reset failed (timeout)");
+  if (t > AVF_RESET_MAX_WAIT_TIME)
+    {
+      avf_log_err (ad, "request queues failed (timeout %.3f seconds)", t);
+      return clib_error_return (0, "request queues failed (timeout)");
+    }
 
+  suspend_time *= 2;
   goto retry;
 
 done:
@@ -853,7 +899,7 @@ avf_device_init (vlib_main_t * vm, avf_main_t * am, avf_device_t * ad,
   virtchnl_vf_resource_t res = { 0 };
   clib_error_t *error;
   vlib_thread_main_t *tm = vlib_get_thread_main ();
-  int i;
+  int i, wb_on_itr;
 
   avf_adminq_init (vm, ad);
 
@@ -896,6 +942,7 @@ avf_device_init (vlib_main_t * vm, avf_main_t * am, avf_device_t * ad,
   ad->max_mtu = res.max_mtu;
   ad->rss_key_size = res.rss_key_size;
   ad->rss_lut_size = res.rss_lut_size;
+  wb_on_itr = (ad->feature_bitmap & VIRTCHNL_VF_OFFLOAD_WB_ON_ITR) != 0;
 
   clib_memcpy_fast (ad->hwaddr, res.vsi_res[0].default_mac_addr, 6);
 
@@ -903,9 +950,6 @@ avf_device_init (vlib_main_t * vm, avf_main_t * am, avf_device_t * ad,
    * Disable VLAN stripping
    */
   if ((error = avf_op_disable_vlan_stripping (vm, ad)))
-    return error;
-
-  if ((error = avf_config_promisc_mode (vm, ad)))
     return error;
 
   /*
@@ -930,6 +974,15 @@ avf_device_init (vlib_main_t * vm, avf_main_t * am, avf_device_t * ad,
     if ((error = avf_txq_init (vm, ad, i, args->txq_size)))
       return error;
 
+  if (ad->max_vectors > ad->n_rx_queues)
+    {
+      ad->flags |= AVF_DEVICE_F_RX_INT;
+      ad->n_rx_irqs = args->rxq_num;
+    }
+  else
+    ad->n_rx_irqs = 1;
+
+
   if ((ad->feature_bitmap & VIRTCHNL_VF_OFFLOAD_RSS_PF) &&
       (error = avf_op_config_rss_lut (vm, ad)))
     return error;
@@ -944,11 +997,13 @@ avf_device_init (vlib_main_t * vm, avf_main_t * am, avf_device_t * ad,
   if ((error = avf_op_config_irq_map (vm, ad)))
     return error;
 
-  avf_irq_0_enable (ad);
-  for (i = 0; i < ad->n_rx_queues; i++)
-    avf_irq_n_enable (ad, i);
+  avf_irq_0_set_state (ad, AVF_IRQ_STATE_ENABLED);
 
-  if ((error = avf_op_add_eth_addr (vm, ad, 1, ad->hwaddr)))
+  for (i = 0; i < ad->n_rx_irqs; i++)
+    avf_irq_n_set_state (ad, i, wb_on_itr ? AVF_IRQ_STATE_WB_ON_ITR :
+			 AVF_IRQ_STATE_ENABLED);
+
+  if ((error = avf_op_add_del_eth_addr (vm, ad, 1, ad->hwaddr, 1 /* add */ )))
     return error;
 
   if ((error = avf_op_enable_queues (vm, ad, pow2_mask (ad->n_rx_queues),
@@ -1006,38 +1061,45 @@ avf_process_one_device (vlib_main_t * vm, avf_device_t * ad, int is_irq)
 		     virtchnl_event_names[e->event], e->event, e->severity);
       if (e->event == VIRTCHNL_EVENT_LINK_CHANGE)
 	{
-	  int link_up = e->event_data.link_event.link_status;
+	  int link_up;
 	  virtchnl_link_speed_t speed = e->event_data.link_event.link_speed;
 	  u32 flags = 0;
-	  u32 kbps = 0;
+	  u32 mbps = 0;
 
-	  avf_log_debug (ad, "event_link_change: status %d speed '%s' (%d)",
-			 link_up,
-			 speed < ARRAY_LEN (virtchnl_link_speed_str) ?
-			 virtchnl_link_speed_str[speed] : "unknown", speed);
+	  if (ad->feature_bitmap & VIRTCHNL_VF_CAP_ADV_LINK_SPEED)
+	    link_up = e->event_data.link_event_adv.link_status;
+	  else
+	    link_up = e->event_data.link_event.link_status;
+
+	  if (ad->feature_bitmap & VIRTCHNL_VF_CAP_ADV_LINK_SPEED)
+	    mbps = e->event_data.link_event_adv.link_speed;
+	  if (speed == VIRTCHNL_LINK_SPEED_40GB)
+	    mbps = 40000;
+	  else if (speed == VIRTCHNL_LINK_SPEED_25GB)
+	    mbps = 25000;
+	  else if (speed == VIRTCHNL_LINK_SPEED_10GB)
+	    mbps = 10000;
+	  else if (speed == VIRTCHNL_LINK_SPEED_5GB)
+	    mbps = 5000;
+	  else if (speed == VIRTCHNL_LINK_SPEED_2_5GB)
+	    mbps = 2500;
+	  else if (speed == VIRTCHNL_LINK_SPEED_1GB)
+	    mbps = 1000;
+	  else if (speed == VIRTCHNL_LINK_SPEED_100MB)
+	    mbps = 100;
+
+	  avf_log_debug (ad, "event_link_change: status %d speed %u mbps",
+			 link_up, mbps);
 
 	  if (link_up && (ad->flags & AVF_DEVICE_F_LINK_UP) == 0)
 	    {
 	      ad->flags |= AVF_DEVICE_F_LINK_UP;
 	      flags |= (VNET_HW_INTERFACE_FLAG_FULL_DUPLEX |
 			VNET_HW_INTERFACE_FLAG_LINK_UP);
-	      if (speed == VIRTCHNL_LINK_SPEED_40GB)
-		kbps = 40000000;
-	      else if (speed == VIRTCHNL_LINK_SPEED_25GB)
-		kbps = 25000000;
-	      else if (speed == VIRTCHNL_LINK_SPEED_10GB)
-		kbps = 10000000;
-	      else if (speed == VIRTCHNL_LINK_SPEED_5GB)
-		kbps = 5000000;
-	      else if (speed == VIRTCHNL_LINK_SPEED_2_5GB)
-		kbps = 2500000;
-	      else if (speed == VIRTCHNL_LINK_SPEED_1GB)
-		kbps = 1000000;
-	      else if (speed == VIRTCHNL_LINK_SPEED_100MB)
-		kbps = 100000;
 	      vnet_hw_interface_set_flags (vnm, ad->hw_if_index, flags);
-	      vnet_hw_interface_set_link_speed (vnm, ad->hw_if_index, kbps);
-	      ad->link_speed = speed;
+	      vnet_hw_interface_set_link_speed (vnm, ad->hw_if_index,
+						mbps * 1000);
+	      ad->link_speed = mbps;
 	    }
 	  else if (!link_up && (ad->flags & AVF_DEVICE_F_LINK_UP) != 0)
 	    {
@@ -1050,19 +1112,19 @@ avf_process_one_device (vlib_main_t * vm, avf_device_t * ad, int is_irq)
 	      ELOG_TYPE_DECLARE (el) =
 		{
 		  .format = "avf[%d] link change: link_status %d "
-		    "link_speed %d",
-		  .format_args = "i4i1i1",
+		    "link_speed %d mbps",
+		  .format_args = "i4i1i4",
 		};
 	      struct
 		{
 		  u32 dev_instance;
 		  u8 link_status;
-		  u8 link_speed;
+		  u32 link_speed;
 		} *ed;
 	      ed = ELOG_DATA (&vm->elog_main, el);
               ed->dev_instance = ad->dev_instance;
 	      ed->link_status = link_up;
-	      ed->link_speed = speed;
+	      ed->link_speed = mbps;
 	    }
 	}
       else
@@ -1098,11 +1160,69 @@ error:
   vlib_log_err (am->log_class, "%U", format_clib_error, ad->error);
 }
 
+static clib_error_t *
+avf_process_request (vlib_main_t * vm, avf_process_req_t * req)
+{
+  uword *event_data = 0;
+  req->calling_process_index = vlib_get_current_process_node_index (vm);
+  vlib_process_signal_event_pointer (vm, avf_process_node.index,
+				     AVF_PROCESS_EVENT_REQ, req);
+
+  vlib_process_wait_for_event_or_clock (vm, 5.0);
+
+  if (vlib_process_get_events (vm, &event_data) != 0)
+    clib_panic ("avf process node failed to reply in 5 seconds");
+  vec_free (event_data);
+
+  return req->error;
+}
+
+static void
+avf_process_handle_request (vlib_main_t * vm, avf_process_req_t * req)
+{
+  avf_device_t *ad = avf_get_device (req->dev_instance);
+
+  if (req->type == AVF_PROCESS_REQ_ADD_DEL_ETH_ADDR)
+    req->error = avf_op_add_del_eth_addr (vm, ad, 1, req->eth_addr,
+					  req->is_add);
+  else if (req->type == AVF_PROCESS_REQ_CONFIG_PROMISC_MDDE)
+    req->error = avf_op_config_promisc_mode (vm, ad, req->is_enable);
+  else
+    clib_panic ("BUG: unknown avf proceess request type");
+
+  vlib_process_signal_event (vm, req->calling_process_index, 0, 0);
+}
+
 static u32
 avf_flag_change (vnet_main_t * vnm, vnet_hw_interface_t * hw, u32 flags)
 {
-  avf_main_t *am = &avf_main;
-  vlib_log_warn (am->log_class, "TODO");
+  avf_process_req_t req;
+  vlib_main_t *vm = vlib_get_main ();
+  avf_device_t *ad = avf_get_device (hw->dev_instance);
+  clib_error_t *err;
+
+  switch (flags)
+    {
+    case ETHERNET_INTERFACE_FLAG_DEFAULT_L3:
+      ad->flags &= ~AVF_DEVICE_F_PROMISC;
+      break;
+    case ETHERNET_INTERFACE_FLAG_ACCEPT_ALL:
+      ad->flags |= AVF_DEVICE_F_PROMISC;
+      break;
+    default:
+      return ~0;
+    }
+
+  req.is_enable = ((ad->flags & AVF_DEVICE_F_PROMISC) != 0);
+  req.type = AVF_PROCESS_REQ_CONFIG_PROMISC_MDDE;
+  req.dev_instance = hw->dev_instance;
+
+  if ((err = avf_process_request (vm, &req)))
+    {
+      avf_log_err (ad, "error: %U", format_clib_error, err);
+      clib_error_free (err);
+      return ~0;
+    }
   return 0;
 }
 
@@ -1110,11 +1230,12 @@ static uword
 avf_process (vlib_main_t * vm, vlib_node_runtime_t * rt, vlib_frame_t * f)
 {
   avf_main_t *am = &avf_main;
-  avf_device_t *ad;
   uword *event_data = 0, event_type;
   int enabled = 0, irq;
   f64 last_run_duration = 0;
   f64 last_periodic_time = 0;
+  avf_device_t **dev_pointers = 0;
+  u32 i;
 
   while (1)
     {
@@ -1124,7 +1245,6 @@ avf_process (vlib_main_t * vm, vlib_node_runtime_t * rt, vlib_frame_t * f)
 	vlib_process_wait_for_event (vm);
 
       event_type = vlib_process_get_events (vm, &event_data);
-      vec_reset_length (event_data);
       irq = 0;
 
       switch (event_type)
@@ -1135,21 +1255,45 @@ avf_process (vlib_main_t * vm, vlib_node_runtime_t * rt, vlib_frame_t * f)
 	case AVF_PROCESS_EVENT_START:
 	  enabled = 1;
 	  break;
-	case AVF_PROCESS_EVENT_STOP:
-	  enabled = 0;
-	  continue;
+	case AVF_PROCESS_EVENT_DELETE_IF:
+	  for (int i = 0; i < vec_len (event_data); i++)
+	    {
+	      avf_device_t *ad = avf_get_device (event_data[i]);
+	      avf_delete_if (vm, ad, /* with_barrier */ 1);
+	    }
+	  if (pool_elts (am->devices) < 1)
+	    enabled = 0;
+	  break;
 	case AVF_PROCESS_EVENT_AQ_INT:
 	  irq = 1;
 	  break;
+	case AVF_PROCESS_EVENT_REQ:
+	  for (int i = 0; i < vec_len (event_data); i++)
+	    avf_process_handle_request (vm, (void *) event_data[i]);
+	  break;
+
 	default:
 	  ASSERT (0);
 	}
 
+      vec_reset_length (event_data);
+
+      if (enabled == 0)
+	continue;
+
+      /* create local list of device pointers as device pool may grow
+       * during suspend */
+      vec_reset_length (dev_pointers);
       /* *INDENT-OFF* */
-      pool_foreach (ad, am->devices,
+      pool_foreach_index (i, am->devices,
         {
-	  avf_process_one_device (vm, ad, irq);
-        });
+	  vec_add1 (dev_pointers, avf_get_device (i));
+	});
+
+      vec_foreach_index (i, dev_pointers)
+        {
+	  avf_process_one_device (vm, dev_pointers[i], irq);
+        };
       /* *INDENT-ON* */
       last_run_duration = vlib_time_now (vm) - last_periodic_time;
     }
@@ -1157,7 +1301,7 @@ avf_process (vlib_main_t * vm, vlib_node_runtime_t * rt, vlib_frame_t * f)
 }
 
 /* *INDENT-OFF* */
-VLIB_REGISTER_NODE (avf_process_node, static)  = {
+VLIB_REGISTER_NODE (avf_process_node)  = {
   .function = avf_process,
   .type = VLIB_NODE_TYPE_PROCESS,
   .name = "avf-process",
@@ -1167,9 +1311,8 @@ VLIB_REGISTER_NODE (avf_process_node, static)  = {
 static void
 avf_irq_0_handler (vlib_main_t * vm, vlib_pci_dev_handle_t h, u16 line)
 {
-  avf_main_t *am = &avf_main;
   uword pd = vlib_pci_get_private_data (vm, h);
-  avf_device_t *ad = pool_elt_at_index (am->devices, pd);
+  avf_device_t *ad = avf_get_device (pd);
   u32 icr0;
 
   icr0 = avf_reg_read (ad, AVFINT_ICR0);
@@ -1194,7 +1337,7 @@ avf_irq_0_handler (vlib_main_t * vm, vlib_pci_dev_handle_t h, u16 line)
       ed->icr0 = icr0;
     }
 
-  avf_irq_0_enable (ad);
+  avf_irq_0_set_state (ad, AVF_IRQ_STATE_ENABLED);
 
   /* bit 30 - Send/Receive Admin queue interrupt indication */
   if (icr0 & (1 << 30))
@@ -1206,11 +1349,8 @@ static void
 avf_irq_n_handler (vlib_main_t * vm, vlib_pci_dev_handle_t h, u16 line)
 {
   vnet_main_t *vnm = vnet_get_main ();
-  avf_main_t *am = &avf_main;
   uword pd = vlib_pci_get_private_data (vm, h);
-  avf_device_t *ad = pool_elt_at_index (am->devices, pd);
-  u16 qid;
-  int i;
+  avf_device_t *ad = avf_get_device (pd);
 
   if (ad->flags & AVF_DEVICE_F_ELOG)
     {
@@ -1232,25 +1372,31 @@ avf_irq_n_handler (vlib_main_t * vm, vlib_pci_dev_handle_t h, u16 line)
       ed->line = line;
     }
 
-  qid = line - 1;
-  if (vec_len (ad->rxqs) > qid && ad->rxqs[qid].int_mode != 0)
-    vnet_device_input_set_interrupt_pending (vnm, ad->hw_if_index, qid);
-  for (i = 0; i < vec_len (ad->rxqs); i++)
-    avf_irq_n_enable (ad, i);
+  line--;
+
+  if (ad->flags & AVF_DEVICE_F_RX_INT && ad->rxqs[line].int_mode)
+    vnet_device_input_set_interrupt_pending (vnm, ad->hw_if_index, line);
+  avf_irq_n_set_state (ad, line, AVF_IRQ_STATE_ENABLED);
 }
 
 void
-avf_delete_if (vlib_main_t * vm, avf_device_t * ad)
+avf_delete_if (vlib_main_t * vm, avf_device_t * ad, int with_barrier)
 {
   vnet_main_t *vnm = vnet_get_main ();
   avf_main_t *am = &avf_main;
   int i;
 
+  ad->flags &= ~AVF_DEVICE_F_ADMIN_UP;
+
   if (ad->hw_if_index)
     {
+      if (with_barrier)
+	vlib_worker_thread_barrier_sync (vm);
       vnet_hw_interface_set_flags (vnm, ad->hw_if_index, 0);
       vnet_hw_interface_unassign_rx_thread (vnm, ad->hw_if_index, 0);
       ethernet_delete_interface (vnm, ad->hw_if_index);
+      if (with_barrier)
+	vlib_worker_thread_barrier_release (vm);
     }
 
   vlib_pci_device_close (vm, ad->pci_dev_handle);
@@ -1293,7 +1439,45 @@ avf_delete_if (vlib_main_t * vm, avf_device_t * ad)
 
   clib_error_free (ad->error);
   clib_memset (ad, 0, sizeof (*ad));
-  pool_put (am->devices, ad);
+  pool_put_index (am->devices, ad->dev_instance);
+  clib_mem_free (ad);
+}
+
+static u8
+avf_validate_queue_size (avf_create_if_args_t * args)
+{
+  clib_error_t *error = 0;
+
+  args->rxq_size = (args->rxq_size == 0) ? AVF_RXQ_SZ : args->rxq_size;
+  args->txq_size = (args->txq_size == 0) ? AVF_TXQ_SZ : args->txq_size;
+
+  if ((args->rxq_size > AVF_QUEUE_SZ_MAX)
+      || (args->txq_size > AVF_QUEUE_SZ_MAX))
+    {
+      args->rv = VNET_API_ERROR_INVALID_VALUE;
+      args->error =
+	clib_error_return (error, "queue size must not be greater than %u",
+			   AVF_QUEUE_SZ_MAX);
+      return 1;
+    }
+  if ((args->rxq_size < AVF_QUEUE_SZ_MIN)
+      || (args->txq_size < AVF_QUEUE_SZ_MIN))
+    {
+      args->rv = VNET_API_ERROR_INVALID_VALUE;
+      args->error =
+	clib_error_return (error, "queue size must not be smaller than %u",
+			   AVF_QUEUE_SZ_MIN);
+      return 1;
+    }
+  if ((args->rxq_size & (args->rxq_size - 1)) ||
+      (args->txq_size & (args->txq_size - 1)))
+    {
+      args->rv = VNET_API_ERROR_INVALID_VALUE;
+      args->error =
+	clib_error_return (error, "queue size must be a power of two");
+      return 1;
+    }
+  return 0;
 }
 
 void
@@ -1301,26 +1485,33 @@ avf_create_if (vlib_main_t * vm, avf_create_if_args_t * args)
 {
   vnet_main_t *vnm = vnet_get_main ();
   avf_main_t *am = &avf_main;
-  avf_device_t *ad;
+  avf_device_t *ad, **adp;
   vlib_pci_dev_handle_t h;
   clib_error_t *error = 0;
   int i;
 
   /* check input args */
-  args->rxq_size = (args->rxq_size == 0) ? AVF_RXQ_SZ : args->rxq_size;
-  args->txq_size = (args->txq_size == 0) ? AVF_TXQ_SZ : args->txq_size;
+  if (avf_validate_queue_size (args) != 0)
+    return;
 
-  if ((args->rxq_size & (args->rxq_size - 1))
-      || (args->txq_size & (args->txq_size - 1)))
-    {
-      args->rv = VNET_API_ERROR_INVALID_VALUE;
-      args->error =
-	clib_error_return (error, "queue size must be a power of two");
-      return;
-    }
+  /* *INDENT-OFF* */
+  pool_foreach (adp, am->devices, ({
+	if ((*adp)->pci_addr.as_u32 == args->addr.as_u32)
+      {
+	args->rv = VNET_API_ERROR_ADDRESS_IN_USE;
+	args->error =
+	  clib_error_return (error, "%U: %s", format_vlib_pci_addr,
+			     &args->addr, "pci address in use");
+	return;
+      }
+  }));
+  /* *INDENT-ON* */
 
-  pool_get (am->devices, ad);
-  ad->dev_instance = ad - am->devices;
+  pool_get (am->devices, adp);
+  adp[0] = ad = clib_mem_alloc_aligned (sizeof (avf_device_t),
+					CLIB_CACHE_LINE_BYTES);
+  clib_memset (ad, 0, sizeof (avf_device_t));
+  ad->dev_instance = adp - am->devices;
   ad->per_interface_next_index = ~0;
   ad->name = vec_dup (args->name);
 
@@ -1330,7 +1521,8 @@ avf_create_if (vlib_main_t * vm, avf_create_if_args_t * args)
   if ((error = vlib_pci_device_open (vm, &args->addr, avf_pci_device_ids,
 				     &h)))
     {
-      pool_put (am->devices, ad);
+      pool_put (am->devices, adp);
+      clib_mem_free (ad);
       args->rv = VNET_API_ERROR_INVALID_INTERFACE;
       args->error =
 	clib_error_return (error, "pci-addr %U", format_vlib_pci_addr,
@@ -1347,17 +1539,6 @@ avf_create_if (vlib_main_t * vm, avf_create_if_args_t * args)
     goto error;
 
   if ((error = vlib_pci_map_region (vm, h, 0, &ad->bar0)))
-    goto error;
-
-  if ((error = vlib_pci_register_msix_handler (vm, h, 0, 1,
-					       &avf_irq_0_handler)))
-    goto error;
-
-  if ((error = vlib_pci_register_msix_handler (vm, h, 1, 1,
-					       &avf_irq_n_handler)))
-    goto error;
-
-  if ((error = vlib_pci_enable_msix_irq (vm, h, 0, 2)))
     goto error;
 
   ad->atq = vlib_physmem_alloc_aligned_on_numa (vm, sizeof (avf_aq_desc_t) *
@@ -1412,13 +1593,24 @@ avf_create_if (vlib_main_t * vm, avf_create_if_args_t * args)
   if ((error = vlib_pci_map_dma (vm, h, ad->arq_bufs)))
     goto error;
 
-  if ((error = vlib_pci_intr_enable (vm, h)))
-    goto error;
-
   if (vlib_pci_supports_virtual_addr_dma (vm, h))
     ad->flags |= AVF_DEVICE_F_VA_DMA;
 
   if ((error = avf_device_init (vm, am, ad, args)))
+    goto error;
+
+  if ((error = vlib_pci_register_msix_handler (vm, h, 0, 1,
+					       &avf_irq_0_handler)))
+    goto error;
+
+  if ((error = vlib_pci_register_msix_handler (vm, h, 1, ad->n_rx_irqs,
+					       &avf_irq_n_handler)))
+    goto error;
+
+  if ((error = vlib_pci_enable_msix_irq (vm, h, 0, ad->n_rx_irqs + 1)))
+    goto error;
+
+  if ((error = vlib_pci_intr_enable (vm, h)))
     goto error;
 
   /* create interface */
@@ -1428,6 +1620,13 @@ avf_create_if (vlib_main_t * vm, avf_create_if_args_t * args)
 
   if (error)
     goto error;
+
+  /* Indicate ability to support L3 DMAC filtering and
+   * initialize interface to L3 non-promisc mode */
+  vnet_hw_interface_t *hi = vnet_get_hw_interface (vnm, ad->hw_if_index);
+  hi->flags |= VNET_HW_INTERFACE_FLAG_SUPPORTS_MAC_FILTER;
+  ethernet_set_flags (vnm, ad->hw_if_index,
+		      ETHERNET_INTERFACE_FLAG_DEFAULT_L3);
 
   vnet_sw_interface_t *sw = vnet_get_hw_sw_interface (vnm, ad->hw_if_index);
   args->sw_if_index = ad->sw_if_index = sw->sw_if_index;
@@ -1447,7 +1646,7 @@ avf_create_if (vlib_main_t * vm, avf_create_if_args_t * args)
   return;
 
 error:
-  avf_delete_if (vm, ad);
+  avf_delete_if (vm, ad, /* with_barrier */ 0);
   args->rv = VNET_API_ERROR_INVALID_INTERFACE;
   args->error = clib_error_return (error, "pci-addr %U",
 				   format_vlib_pci_addr, &args->addr);
@@ -1458,8 +1657,7 @@ static clib_error_t *
 avf_interface_admin_up_down (vnet_main_t * vnm, u32 hw_if_index, u32 flags)
 {
   vnet_hw_interface_t *hi = vnet_get_hw_interface (vnm, hw_if_index);
-  avf_main_t *am = &avf_main;
-  avf_device_t *ad = vec_elt_at_index (am->devices, hi->dev_instance);
+  avf_device_t *ad = avf_get_device (hi->dev_instance);
   uword is_up = (flags & VNET_SW_INTERFACE_FLAG_ADMIN_UP) != 0;
 
   if (ad->flags & AVF_DEVICE_F_ERROR)
@@ -1481,17 +1679,31 @@ avf_interface_admin_up_down (vnet_main_t * vnm, u32 hw_if_index, u32 flags)
 
 static clib_error_t *
 avf_interface_rx_mode_change (vnet_main_t * vnm, u32 hw_if_index, u32 qid,
-			      vnet_hw_interface_rx_mode mode)
+			      vnet_hw_if_rx_mode mode)
 {
-  avf_main_t *am = &avf_main;
   vnet_hw_interface_t *hw = vnet_get_hw_interface (vnm, hw_if_index);
-  avf_device_t *ad = pool_elt_at_index (am->devices, hw->dev_instance);
+  avf_device_t *ad = avf_get_device (hw->dev_instance);
   avf_rxq_t *rxq = vec_elt_at_index (ad->rxqs, qid);
 
-  if (mode == VNET_HW_INTERFACE_RX_MODE_POLLING)
-    rxq->int_mode = 0;
+  if (mode == VNET_HW_IF_RX_MODE_POLLING)
+    {
+      if (rxq->int_mode == 0)
+	return 0;
+      if (ad->feature_bitmap & VIRTCHNL_VF_OFFLOAD_WB_ON_ITR)
+	avf_irq_n_set_state (ad, qid, AVF_IRQ_STATE_WB_ON_ITR);
+      else
+	avf_irq_n_set_state (ad, qid, AVF_IRQ_STATE_ENABLED);
+      rxq->int_mode = 0;
+    }
   else
-    rxq->int_mode = 1;
+    {
+      if (rxq->int_mode == 1)
+	return 0;
+      if (ad->n_rx_irqs != ad->n_rx_queues)
+	return clib_error_return (0, "not enough interrupt lines");
+      rxq->int_mode = 1;
+      avf_irq_n_set_state (ad, qid, AVF_IRQ_STATE_ENABLED);
+    }
 
   return 0;
 }
@@ -1500,9 +1712,8 @@ static void
 avf_set_interface_next_node (vnet_main_t * vnm, u32 hw_if_index,
 			     u32 node_index)
 {
-  avf_main_t *am = &avf_main;
   vnet_hw_interface_t *hw = vnet_get_hw_interface (vnm, hw_if_index);
-  avf_device_t *ad = pool_elt_at_index (am->devices, hw->dev_instance);
+  avf_device_t *ad = avf_get_device (hw->dev_instance);
 
   /* Shut off redirection */
   if (node_index == ~0)
@@ -1515,6 +1726,21 @@ avf_set_interface_next_node (vnet_main_t * vnm, u32 hw_if_index,
     vlib_node_add_next (vlib_get_main (), avf_input_node.index, node_index);
 }
 
+static clib_error_t *
+avf_add_del_mac_address (vnet_hw_interface_t * hw,
+			 const u8 * address, u8 is_add)
+{
+  vlib_main_t *vm = vlib_get_main ();
+  avf_process_req_t req;
+
+  req.dev_instance = hw->dev_instance;
+  req.type = AVF_PROCESS_REQ_ADD_DEL_ETH_ADDR;
+  req.is_add = is_add;
+  clib_memcpy (req.eth_addr, address, 6);
+
+  return avf_process_request (vm, &req);
+}
+
 static char *avf_tx_func_error_strings[] = {
 #define _(n,s) s,
   foreach_avf_tx_func_error
@@ -1524,8 +1750,7 @@ static char *avf_tx_func_error_strings[] = {
 static void
 avf_clear_hw_interface_counters (u32 instance)
 {
-  avf_main_t *am = &avf_main;
-  avf_device_t *ad = vec_elt_at_index (am->devices, instance);
+  avf_device_t *ad = avf_get_device (instance);
   clib_memcpy_fast (&ad->last_cleared_eth_stats,
 		    &ad->eth_stats, sizeof (ad->eth_stats));
 }
@@ -1540,6 +1765,7 @@ VNET_DEVICE_CLASS (avf_device_class,) =
   .admin_up_down_function = avf_interface_admin_up_down,
   .rx_mode_change_function = avf_interface_rx_mode_change,
   .rx_redirect_to_node = avf_set_interface_next_node,
+  .mac_addr_add_del_function = avf_add_del_mac_address,
   .tx_function_n_errors = AVF_TX_N_ERROR,
   .tx_function_error_strings = avf_tx_func_error_strings,
 };

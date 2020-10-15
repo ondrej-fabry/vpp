@@ -292,18 +292,27 @@ format_ipsec_sa (u8 * s, va_list * args)
 
   s = format (s, "\n   locks %d", sa->node.fn_locks);
   s = format (s, "\n   salt 0x%x", clib_net_to_host_u32 (sa->salt));
+  s = format (s, "\n   thread-indices [encrypt:%d decrypt:%d]",
+	      sa->encrypt_thread_index, sa->decrypt_thread_index);
   s = format (s, "\n   seq %u seq-hi %u", sa->seq, sa->seq_hi);
   s = format (s, "\n   last-seq %u last-seq-hi %u window %U",
 	      sa->last_seq, sa->last_seq_hi,
 	      format_ipsec_replay_window, sa->replay_window);
   s = format (s, "\n   crypto alg %U",
 	      format_ipsec_crypto_alg, sa->crypto_alg);
-  if (sa->crypto_alg)
+  if (sa->crypto_alg && (flags & IPSEC_FORMAT_INSECURE))
     s = format (s, " key %U", format_ipsec_key, &sa->crypto_key);
+  else
+    s = format (s, " key [redacted]");
   s = format (s, "\n   integrity alg %U",
 	      format_ipsec_integ_alg, sa->integ_alg);
-  if (sa->integ_alg)
+  if (sa->integ_alg && (flags & IPSEC_FORMAT_INSECURE))
     s = format (s, " key %U", format_ipsec_key, &sa->integ_key);
+  else
+    s = format (s, " key [redacted]");
+  s = format (s, "\n   UDP:[src:%d dst:%d]",
+	      clib_host_to_net_u16 (sa->udp_hdr.src_port),
+	      clib_host_to_net_u16 (sa->udp_hdr.dst_port));
 
   vlib_get_combined_counter (&ipsec_sa_counters, sai, &counts);
   s = format (s, "\n   packets %u bytes %u", counts.packets, counts.bytes);
@@ -331,60 +340,49 @@ done:
 }
 
 u8 *
-format_ipsec_tunnel (u8 * s, va_list * args)
+format_ipsec_tun_protect_index (u8 * s, va_list * args)
 {
-  ipsec_main_t *im = &ipsec_main;
-  u32 ti = va_arg (*args, u32);
-  ipsec_tunnel_if_t *t;
+  u32 itpi = va_arg (*args, index_t);
+  ipsec_tun_protect_t *itp;
 
-  if (pool_is_free_index (im->tunnel_interfaces, ti))
-    {
-      s = format (s, "No such tunnel index: %d", ti);
-      goto done;
-    }
+  if (pool_is_free_index (ipsec_tun_protect_pool, itpi))
+    return (format (s, "No such tunnel index: %d", itpi));
 
-  t = pool_elt_at_index (im->tunnel_interfaces, ti);
+  itp = pool_elt_at_index (ipsec_tun_protect_pool, itpi);
 
-  if (t->hw_if_index == ~0)
-    goto done;
+  return (format (s, "%U", format_ipsec_tun_protect, itp));
+}
 
-  s =
-    format (s, "%U\n", format_vnet_hw_if_index_name, im->vnet_main,
-	    t->hw_if_index);
+u8 *
+format_ipsec_tun_protect_flags (u8 * s, va_list * args)
+{
+  ipsec_protect_flags_t flags = va_arg (*args, int);
 
-  s = format (s, "   out-bound sa: ");
-  s = format (s, "%U\n", format_ipsec_sa, t->output_sa_index,
-	      IPSEC_FORMAT_BRIEF);
+  if (IPSEC_PROTECT_NONE == flags)
+    s = format (s, "none");
+#define _(a,b,c)                                \
+  else if (flags & IPSEC_PROTECT_##a)           \
+    s = format (s, "%s", c);                    \
+  foreach_ipsec_protect_flags
+#undef _
 
-  s = format (s, "    in-bound sa: ");
-  s = format (s, "%U\n", format_ipsec_sa, t->input_sa_index,
-	      IPSEC_FORMAT_BRIEF);
-
-done:
   return (s);
 }
 
 u8 *
 format_ipsec_tun_protect (u8 * s, va_list * args)
 {
-  u32 itpi = va_arg (*args, u32);
-  ipsec_tun_protect_t *itp;
+  ipsec_tun_protect_t *itp = va_arg (*args, ipsec_tun_protect_t *);
   u32 sai;
 
-  if (pool_is_free_index (ipsec_protect_pool, itpi))
-    {
-      s = format (s, "No such tunnel index: %d", itpi);
-      goto done;
-    }
-
-  itp = pool_elt_at_index (ipsec_protect_pool, itpi);
-
-  s = format (s, "%U", format_vnet_sw_if_index_name,
-	      vnet_get_main (), itp->itp_sw_if_index);
+  s = format (s, "%U flags:[%U]", format_vnet_sw_if_index_name,
+	      vnet_get_main (), itp->itp_sw_if_index,
+	      format_ipsec_tun_protect_flags, itp->itp_flags);
+  if (!ip_address_is_zero (itp->itp_key))
+    s = format (s, ": %U", format_ip_address, itp->itp_key);
   s = format (s, "\n output-sa:");
-  s =
-    format (s, "\n  %U", format_ipsec_sa, itp->itp_out_sa,
-	    IPSEC_FORMAT_BRIEF);
+  s = format (s, "\n  %U", format_ipsec_sa, itp->itp_out_sa,
+	      IPSEC_FORMAT_BRIEF);
 
   s = format (s, "\n input-sa:");
   /* *INDENT-OFF* */
@@ -394,32 +392,37 @@ format_ipsec_tun_protect (u8 * s, va_list * args)
   }));
   /* *INDENT-ON* */
 
-done:
   return (s);
 }
 
 u8 *
-format_ipsec4_tunnel_key (u8 * s, va_list * args)
+format_ipsec4_tunnel_kv (u8 * s, va_list * args)
 {
-  ipsec4_tunnel_key_t *key = va_arg (*args, ipsec4_tunnel_key_t *);
+  ipsec4_tunnel_kv_t *kv = va_arg (*args, ipsec4_tunnel_kv_t *);
+  ip4_address_t ip;
+  u32 spi;
 
-  s = format (s, "remote:%U spi:%u (0x%08x)",
-	      format_ip4_address, &key->remote_ip,
-	      clib_net_to_host_u32 (key->spi),
-	      clib_net_to_host_u32 (key->spi));
+  ipsec4_tunnel_extract_key (kv, &ip, &spi);
+
+  s = format (s, "remote:%U spi:%u (0x%08x) sa:%d tun:%d",
+	      format_ip4_address, &ip,
+	      clib_net_to_host_u32 (spi),
+	      clib_net_to_host_u32 (spi),
+	      kv->value.sa_index, kv->value.tun_index);
 
   return (s);
 }
 
 u8 *
-format_ipsec6_tunnel_key (u8 * s, va_list * args)
+format_ipsec6_tunnel_kv (u8 * s, va_list * args)
 {
-  ipsec6_tunnel_key_t *key = va_arg (*args, ipsec6_tunnel_key_t *);
+  ipsec6_tunnel_kv_t *kv = va_arg (*args, ipsec6_tunnel_kv_t *);
 
-  s = format (s, "remote:%U spi:%u (0x%08x)",
-	      format_ip6_address, &key->remote_ip,
-	      clib_net_to_host_u32 (key->spi),
-	      clib_net_to_host_u32 (key->spi));
+  s = format (s, "remote:%U spi:%u (0x%08x) sa:%d tun:%d",
+	      format_ip6_address, &kv->key.remote_ip,
+	      clib_net_to_host_u32 (kv->key.spi),
+	      clib_net_to_host_u32 (kv->key.spi),
+	      kv->value.sa_index, kv->value.tun_index);
 
   return (s);
 }

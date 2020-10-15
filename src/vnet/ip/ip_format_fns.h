@@ -70,7 +70,7 @@ format_vl_api_address_t (u8 * s, va_list * args)
   case ADDRESS_IP6:
     return format(s, "%U", format_ip6_address, &a->un.ip6);
     }
-  return format (s, "");
+  return format (s, "unknown-af");
 }
 
 static inline u8 *

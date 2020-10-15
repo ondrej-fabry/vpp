@@ -202,12 +202,13 @@ vlib_pci_device_info_t *
 vlib_pci_get_device_info (vlib_main_t * vm, vlib_pci_addr_t * addr,
 			  clib_error_t ** error)
 {
-  linux_vfio_main_t *lvm = &vfio_main;
   clib_error_t *err;
   vlib_pci_device_info_t *di;
   u8 *f = 0;
   u32 tmp;
   int fd;
+  u8 *tmpstr;
+  clib_bitmap_t *bmp = 0;
 
   di = clib_mem_alloc (sizeof (vlib_pci_device_info_t));
   clib_memset (di, 0, sizeof (vlib_pci_device_info_t));
@@ -260,11 +261,21 @@ vlib_pci_get_device_info (vlib_main_t * vm, vlib_pci_addr_t * addr,
   di->numa_node = -1;
   vec_reset_length (f);
   f = format (f, "%v/numa_node%c", dev_dir_name, 0);
-  err = clib_sysfs_read ((char *) f, "%u", &di->numa_node);
+  err = clib_sysfs_read ((char *) f, "%d", &di->numa_node);
   if (err)
     {
       di->numa_node = -1;
       clib_error_free (err);
+    }
+  if (di->numa_node == -1)
+    {
+      /* if '/sys/bus/pci/devices/<device id>/numa_node' returns -1 and
+         it is a SMP system, set numa_node to 0. */
+      if ((err = clib_sysfs_read ("/sys/devices/system/node/online", "%U",
+				  unformat_bitmap_list, &bmp)))
+	clib_error_free (err);
+      if (clib_bitmap_count_set_bits (bmp) == 1)
+	di->numa_node = 0;
     }
 
   vec_reset_length (f);
@@ -291,31 +302,30 @@ vlib_pci_get_device_info (vlib_main_t * vm, vlib_pci_addr_t * addr,
   vec_reset_length (f);
   f = format (f, "%v/driver%c", dev_dir_name, 0);
   di->driver_name = clib_sysfs_link_to_name ((char *) f);
+  if (!di->driver_name)
+    di->driver_name = format (0, "<NONE>%c", 0);
 
   di->iommu_group = -1;
-  if (lvm->container_fd != -1)
+  vec_reset_length (f);
+  f = format (f, "%v/iommu_group%c", dev_dir_name, 0);
+  tmpstr = clib_sysfs_link_to_name ((char *) f);
+  if (tmpstr)
     {
-      u8 *tmpstr;
-      vec_reset_length (f);
-      f = format (f, "%v/iommu_group%c", dev_dir_name, 0);
-      tmpstr = clib_sysfs_link_to_name ((char *) f);
-      if (tmpstr)
-	{
-	  di->iommu_group = atoi ((char *) tmpstr);
-	  vec_free (tmpstr);
-	}
-      vec_reset_length (f);
-      f = format (f, "%v/iommu_group/name%c", dev_dir_name, 0);
-      err = clib_sysfs_read ((char *) f, "%s", &tmpstr);
-      if (err == 0)
-	{
-	  if (strncmp ((char *) tmpstr, "vfio-noiommu", 12) == 0)
-	    di->flags |= VLIB_PCI_DEVICE_INFO_F_NOIOMMU;
-	  vec_free (tmpstr);
-	}
-      else
-	clib_error_free (err);
+      di->iommu_group = atoi ((char *) tmpstr);
+      vec_free (tmpstr);
     }
+
+  vec_reset_length (f);
+  f = format (f, "%v/iommu_group/name%c", dev_dir_name, 0);
+  err = clib_sysfs_read ((char *) f, "%s", &tmpstr);
+  if (err == 0)
+    {
+      if (strncmp ((char *) tmpstr, "vfio-noiommu", 12) == 0)
+	di->flags |= VLIB_PCI_DEVICE_INFO_F_NOIOMMU;
+      vec_free (tmpstr);
+    }
+  else
+    clib_error_free (err);
 
   close (fd);
 
@@ -363,6 +373,7 @@ error:
   di = 0;
 
 done:
+  vec_free (bmp);
   vec_free (f);
   vec_free (dev_dir_name);
   if (error)
@@ -739,8 +750,8 @@ add_device_uio (vlib_main_t * vm, linux_pci_device_t * p,
       goto error;
     }
 
-  s = format (0, "%s/%U/uio", sysfs_pci_dev_path,
-	      format_vlib_pci_addr, &di->addr);
+  s = format (0, "%s/%U/uio%c", sysfs_pci_dev_path,
+	      format_vlib_pci_addr, &di->addr, 0);
   foreach_directory_file ((char *) s, scan_uio_dir, p,	/* scan_dirs */
 			  1);
   vec_reset_length (s);
@@ -901,6 +912,17 @@ vlib_pci_enable_msix_irq (vlib_main_t * vm, vlib_pci_dev_handle_t h,
 			VFIO_IRQ_SET_ACTION_TRIGGER, fds);
 }
 
+uword
+vlib_pci_get_msix_file_index (vlib_main_t * vm, vlib_pci_dev_handle_t h,
+			      u16 index)
+{
+  linux_pci_device_t *p = linux_pci_get_device (h);
+  linux_pci_irq_t *irq = vec_elt_at_index (p->msix_irqs, index);
+  if (irq->fd == -1)
+    return ~0;
+  return irq->clib_file_index;
+}
+
 clib_error_t *
 vlib_pci_disable_msix_irq (vlib_main_t * vm, vlib_pci_dev_handle_t h,
 			   u16 start, u16 count)
@@ -955,13 +977,7 @@ add_device_vfio (vlib_main_t * vm, linux_pci_device_t * p,
       goto error;
     }
 
-  pci_log_debug (vm, p, "%s region_info index:%u size:0x%lx offset:0x%lx "
-		 "flags: %s%s%s(0x%x)", __func__,
-		 reg.index, reg.size, reg.offset,
-		 reg.flags & VFIO_REGION_INFO_FLAG_READ ? "rd " : "",
-		 reg.flags & VFIO_REGION_INFO_FLAG_WRITE ? "wr " : "",
-		 reg.flags & VFIO_REGION_INFO_FLAG_MMAP ? "mmap " : "",
-		 reg.flags);
+  pci_log_debug (vm, p, "%s %U", __func__, format_vfio_region_info, &reg);
 
   p->config_offset = reg.offset;
   p->config_fd = p->fd;
@@ -1076,23 +1092,28 @@ vlib_pci_region (vlib_main_t * vm, vlib_pci_dev_handle_t h, u32 bar, int *fd,
     }
   else if (p->type == LINUX_PCI_DEVICE_TYPE_VFIO)
     {
-      struct vfio_region_info reg = { 0 };
-      reg.argsz = sizeof (struct vfio_region_info);
-      reg.index = bar;
-      if (ioctl (p->fd, VFIO_DEVICE_GET_REGION_INFO, &reg) < 0)
+      struct vfio_region_info *r;
+      u32 sz = sizeof (struct vfio_region_info);
+    again:
+      r = clib_mem_alloc (sz);
+      clib_memset (r, 0, sz);
+      r->argsz = sz;
+      r->index = bar;
+      if (ioctl (p->fd, VFIO_DEVICE_GET_REGION_INFO, r) < 0)
 	return clib_error_return_unix (0, "ioctl(VFIO_DEVICE_GET_INFO) "
 				       "'%U'", format_vlib_pci_addr,
 				       &p->addr);
+      if (sz != r->argsz)
+	{
+	  sz = r->argsz;
+	  clib_mem_free (r);
+	  goto again;
+	}
       _fd = p->fd;
-      _size = reg.size;
-      _offset = reg.offset;
-      pci_log_debug (vm, p, "%s region_info index:%u size:0x%lx offset:0x%lx "
-		     "flags: %s%s%s(0x%x)", __func__,
-		     reg.index, reg.size, reg.offset,
-		     reg.flags & VFIO_REGION_INFO_FLAG_READ ? "rd " : "",
-		     reg.flags & VFIO_REGION_INFO_FLAG_WRITE ? "wr " : "",
-		     reg.flags & VFIO_REGION_INFO_FLAG_MMAP ? "mmap " : "",
-		     reg.flags);
+      _size = r->size;
+      _offset = r->offset;
+      pci_log_debug (vm, p, "%s %U", __func__, format_vfio_region_info, r);
+      clib_mem_free (r);
     }
   else
     ASSERT (0);
@@ -1122,11 +1143,13 @@ vlib_pci_map_region_int (vlib_main_t * vm, vlib_pci_dev_handle_t h,
   if (p->type == LINUX_PCI_DEVICE_TYPE_UIO && addr != 0)
     flags |= MAP_FIXED;
 
-  *result = mmap (addr, size, PROT_READ | PROT_WRITE, flags, fd, offset);
-  if (*result == (void *) -1)
+  *result = clib_mem_vm_map_shared (addr, size, fd, offset,
+				    "PCIe %U region %u", format_vlib_pci_addr,
+				    vlib_pci_get_addr (vm, h), bar);
+  if (*result == CLIB_MEM_VM_MAP_FAILED)
     {
       error = clib_error_return_unix (0, "mmap `BAR%u'", bar);
-      if (p->type == LINUX_PCI_DEVICE_TYPE_UIO)
+      if (p->type == LINUX_PCI_DEVICE_TYPE_UIO && (fd != -1))
 	close (fd);
       return error;
     }
@@ -1327,7 +1350,7 @@ vlib_pci_device_close (vlib_main_t * vm, vlib_pci_dev_handle_t h)
     {
       if (res->size == 0)
 	continue;
-      munmap (res->addr, res->size);
+      clib_mem_vm_unmap (res->addr);
       if (res->fd != -1)
         close (res->fd);
     }

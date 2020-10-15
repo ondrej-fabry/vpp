@@ -63,8 +63,12 @@ static lookup_dpo_t *
 lookup_dpo_alloc (void)
 {
     lookup_dpo_t *lkd;
+    vlib_main_t *vm;
+    u8 did_barrier_sync;
 
+    dpo_pool_barrier_sync (vm, lookup_dpo_pool, did_barrier_sync);
     pool_get_aligned(lookup_dpo_pool, lkd, CLIB_CACHE_LINE_BYTES);
+    dpo_pool_barrier_release (vm, did_barrier_sync);
 
     return (lkd);
 }
@@ -1076,7 +1080,7 @@ lookup_dpo_mpls_inline (vlib_main_t * vm,
              */
             if (table_from_interface)
             {
-                fib_index0 = 
+                fib_index0 =
                     mpls_fib_table_get_index_for_sw_if_index(
                         vnet_buffer(b0)->sw_if_index[VLIB_RX]);
             }
@@ -1142,9 +1146,9 @@ lookup_dpo_mpls_inline (vlib_main_t * vm,
             if (PREDICT_FALSE(vnet_buffer2(b0)->loop_counter > MAX_LUKPS_PER_PACKET))
                 next0 = MPLS_LOOKUP_NEXT_DROP;
 
-	    if (PREDICT_FALSE(b0->flags & VLIB_BUFFER_IS_TRACED)) 
+	    if (PREDICT_FALSE(b0->flags & VLIB_BUFFER_IS_TRACED))
             {
-                lookup_trace_t *tr = vlib_add_trace (vm, node, 
+                lookup_trace_t *tr = vlib_add_trace (vm, node,
                                                      b0, sizeof (*tr));
                 tr->fib_index = fib_index0;
                 tr->lbi = lbi0;
@@ -1467,7 +1471,10 @@ lookup_dpo_show (vlib_main_t * vm,
 
     if (INDEX_INVALID != lkdi)
     {
-        vlib_cli_output (vm, "%U", format_lookup_dpo, lkdi);
+	if (pool_is_free_index(lookup_dpo_pool, lkdi))
+		vlib_cli_output (vm, "no such index %d", lkdi);
+	else
+		vlib_cli_output (vm, "%U", format_lookup_dpo, lkdi);
     }
     else
     {

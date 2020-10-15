@@ -39,7 +39,6 @@
 #include <vppinfra/bitmap.h>
 #include <vppinfra/fifo.h>
 #include <vppinfra/time.h>
-#include <vppinfra/mheap.h>
 #include <vppinfra/heap.h>
 #include <vppinfra/pool.h>
 #include <vppinfra/format.h>
@@ -143,22 +142,19 @@ shmem_cli_output (uword arg, u8 * buffer, uword buffer_bytes)
   u8 **shmem_vecp = (u8 **) arg;
   u8 *shmem_vec;
   void *oldheap;
-  api_main_t *am = &api_main;
   u32 offset;
 
   shmem_vec = *shmem_vecp;
 
   offset = vec_len (shmem_vec);
 
-  pthread_mutex_lock (&am->vlib_rp->mutex);
-  oldheap = svm_push_data_heap (am->vlib_rp);
+  oldheap = vl_msg_push_heap ();
 
   vec_validate (shmem_vec, offset + buffer_bytes - 1);
 
   clib_memcpy (shmem_vec + offset, buffer, buffer_bytes);
 
-  svm_pop_heap (oldheap);
-  pthread_mutex_unlock (&am->vlib_rp->mutex);
+  vl_msg_pop_heap (oldheap);
 
   *shmem_vecp = shmem_vec;
 }
@@ -170,7 +166,6 @@ vl_api_cli_t_handler (vl_api_cli_t * mp)
   vl_api_cli_reply_t *rp;
   vl_api_registration_t *reg;
   vlib_main_t *vm = vlib_get_main ();
-  api_main_t *am = &api_main;
   unformat_input_t input;
   u8 *shmem_vec = 0;
   void *oldheap;
@@ -187,13 +182,9 @@ vl_api_cli_t_handler (vl_api_cli_t * mp)
 
   vlib_cli_input (vm, &input, shmem_cli_output, (uword) & shmem_vec);
 
-  pthread_mutex_lock (&am->vlib_rp->mutex);
-  oldheap = svm_push_data_heap (am->vlib_rp);
-
+  oldheap = vl_msg_push_heap ();
   vec_add1 (shmem_vec, 0);
-
-  svm_pop_heap (oldheap);
-  pthread_mutex_unlock (&am->vlib_rp->mutex);
+  vl_msg_pop_heap (oldheap);
 
   rp->reply_in_shmem = (uword) shmem_vec;
 
@@ -220,7 +211,7 @@ vl_api_cli_inband_t_handler (vl_api_cli_inband_t * mp)
   vlib_main_t *vm = vlib_get_main ();
   unformat_input_t input;
   u8 *out_vec = 0;
-  u32 len = 0;
+  u8 *cmd_vec = 0;
 
   if (vl_msg_api_get_msg_length (mp) <
       vl_api_string_len (&mp->cmd) + sizeof (*mp))
@@ -229,20 +220,21 @@ vl_api_cli_inband_t_handler (vl_api_cli_inband_t * mp)
       goto error;
     }
 
-  unformat_init_string (&input, (char *) vl_api_from_api_string (&mp->cmd),
+  cmd_vec = vl_api_from_api_to_new_vec (mp, &mp->cmd);
+
+  unformat_init_string (&input, (char *) cmd_vec,
 			vl_api_string_len (&mp->cmd));
   rv = vlib_cli_input (vm, &input, inband_cli_output, (uword) & out_vec);
 
-  len = vec_len (out_vec);
-
 error:
   /* *INDENT-OFF* */
-  REPLY_MACRO3(VL_API_CLI_INBAND_REPLY, len,
+  REPLY_MACRO3(VL_API_CLI_INBAND_REPLY, vec_len (out_vec),
   ({
-    vl_api_to_api_string(len, (const char *)out_vec, &rmp->reply);
+    vl_api_vec_to_api_string(out_vec, &rmp->reply);
   }));
   /* *INDENT-ON* */
   vec_free (out_vec);
+  vec_free (cmd_vec);
 }
 
 static void
@@ -281,7 +273,7 @@ get_thread_data (vl_api_thread_data_t * td, int index)
   td->pid = htonl (w->lwp);
   td->cpu_id = htonl (w->cpu_id);
   td->core = htonl (w->core_id);
-  td->cpu_socket = htonl (w->socket_id);
+  td->cpu_socket = htonl (w->numa_id);
 }
 
 static void
@@ -349,7 +341,7 @@ vl_api_get_node_index_t_handler (vl_api_get_node_index_t * mp)
   /* *INDENT-OFF* */
   REPLY_MACRO2(VL_API_GET_NODE_INDEX_REPLY,
   ({
-    rmp->node_index = ntohl(node_index);
+    rmp->node_index = htonl(node_index);
   }));
   /* *INDENT-ON* */
 }
@@ -396,7 +388,7 @@ out:
   /* *INDENT-OFF* */
   REPLY_MACRO2(VL_API_GET_NEXT_INDEX_REPLY,
   ({
-    rmp->next_index = ntohl(next_index);
+    rmp->next_index = htonl(next_index);
   }));
   /* *INDENT-ON* */
 }
@@ -427,9 +419,9 @@ vl_api_add_node_next_t_handler (vl_api_add_node_next_t * mp)
 
 out:
   /* *INDENT-OFF* */
-  REPLY_MACRO2(VL_API_GET_NODE_INDEX_REPLY,
+  REPLY_MACRO2(VL_API_ADD_NODE_NEXT_REPLY,
   ({
-    rmp->next_index = ntohl(next_index);
+    rmp->next_index = htonl(next_index);
   }));
   /* *INDENT-ON* */
 }
@@ -439,15 +431,13 @@ vl_api_get_node_graph_t_handler (vl_api_get_node_graph_t * mp)
 {
   int rv = 0;
   u8 *vector = 0;
-  api_main_t *am = &api_main;
   vlib_main_t *vm = vlib_get_main ();
   void *oldheap;
   vl_api_get_node_graph_reply_t *rmp;
   static vlib_node_t ***node_dups;
   static vlib_main_t **stat_vms;
 
-  pthread_mutex_lock (&am->vlib_rp->mutex);
-  oldheap = svm_push_data_heap (am->vlib_rp);
+  oldheap = vl_msg_push_heap ();
 
   /*
    * Keep the number of memcpy ops to a minimum (e.g. 1).
@@ -462,8 +452,7 @@ vl_api_get_node_graph_t_handler (vl_api_get_node_graph_t * mp)
   vector = vlib_node_serialize (vm, node_dups, vector, 1 /* include nexts */ ,
 				1 /* include stats */ );
 
-  svm_pop_heap (oldheap);
-  pthread_mutex_unlock (&am->vlib_rp->mutex);
+  vl_msg_pop_heap (oldheap);
 
   /* *INDENT-OFF* */
   REPLY_MACRO2(VL_API_GET_NODE_GRAPH_REPLY,
@@ -481,7 +470,11 @@ show_log_details (vl_api_registration_t * reg, u32 context,
   u32 msg_size;
 
   vl_api_log_details_t *rmp;
-  msg_size = sizeof (*rmp) + vec_len (msg_class) + vec_len (message);
+  int class_len =
+    clib_min (vec_len (msg_class) + 1, ARRAY_LEN (rmp->msg_class));
+  int message_len =
+    clib_min (vec_len (message) + 1, ARRAY_LEN (rmp->message));
+  msg_size = sizeof (*rmp) + class_len + message_len;
 
   rmp = vl_msg_api_alloc (msg_size);
   clib_memset (rmp, 0, msg_size);
@@ -491,10 +484,11 @@ show_log_details (vl_api_registration_t * reg, u32 context,
   rmp->timestamp = clib_host_to_net_f64 (timestamp);
   rmp->level = htonl (*level);
 
-  strncpy ((char *) rmp->msg_class, (char *) msg_class,
-	   ARRAY_LEN (rmp->msg_class) - 1);
-  strncpy ((char *) rmp->message, (char *) message,
-	   ARRAY_LEN (rmp->message) - 1);
+  memcpy (rmp->msg_class, msg_class, class_len - 1);
+  memcpy (rmp->message, message, message_len - 1);
+  /* enforced by memset() above */
+  ASSERT (0 == rmp->msg_class[class_len - 1]);
+  ASSERT (0 == rmp->message[message_len - 1]);
 
   vl_api_send_msg (reg, (u8 *) rmp);
 }
@@ -620,7 +614,7 @@ static void setup_message_id_table (api_main_t * am);
 static clib_error_t *
 vpe_api_hookup (vlib_main_t * vm)
 {
-  api_main_t *am = &api_main;
+  api_main_t *am = vlibapi_get_main ();
 
 #define _(N,n)                                                  \
     vl_msg_api_set_handlers(VL_API_##N, #n,                     \
@@ -799,78 +793,6 @@ get_unformat_vnet_sw_interface (void)
 {
   return (void *) &unformat_vnet_sw_interface;
 }
-
-static u8 *
-format_arp_event (u8 * s, va_list * args)
-{
-  vl_api_ip4_arp_event_t *event = va_arg (*args, vl_api_ip4_arp_event_t *);
-
-  s = format (s, "pid %d: ", ntohl (event->pid));
-  s = format (s, "resolution for %U", format_vl_api_ip4_address, event->ip);
-  return s;
-}
-
-static u8 *
-format_nd_event (u8 * s, va_list * args)
-{
-  vl_api_ip6_nd_event_t *event = va_arg (*args, vl_api_ip6_nd_event_t *);
-
-  s = format (s, "pid %d: ", ntohl (event->pid));
-  s = format (s, "resolution for %U", format_vl_api_ip6_address, event->ip);
-  return s;
-}
-
-static clib_error_t *
-show_ip_arp_nd_events_fn (vlib_main_t * vm,
-			  unformat_input_t * input, vlib_cli_command_t * cmd)
-{
-  vpe_api_main_t *am = &vpe_api_main;
-  vl_api_ip4_arp_event_t *arp_event;
-  vl_api_ip6_nd_event_t *nd_event;
-
-  if (pool_elts (am->arp_events) == 0 && pool_elts (am->nd_events) == 0 &&
-      pool_elts (am->wc_ip4_arp_events_registrations) == 0 &&
-      pool_elts (am->wc_ip6_nd_events_registrations) == 0)
-    {
-      vlib_cli_output (vm, "No active arp or nd event registrations");
-      return 0;
-    }
-
-  /* *INDENT-OFF* */
-  pool_foreach (arp_event, am->arp_events,
-  ({
-    vlib_cli_output (vm, "%U", format_arp_event, arp_event);
-  }));
-
-  vpe_client_registration_t *reg;
-  pool_foreach(reg, am->wc_ip4_arp_events_registrations,
-  ({
-    vlib_cli_output (vm, "pid %d: bd mac/ip4 binding events",
-                     ntohl (reg->client_pid));
-  }));
-
-  pool_foreach (nd_event, am->nd_events,
-  ({
-    vlib_cli_output (vm, "%U", format_nd_event, nd_event);
-  }));
-
-  pool_foreach(reg, am->wc_ip6_nd_events_registrations,
-  ({
-    vlib_cli_output (vm, "pid %d: bd mac/ip6 binding events",
-                     ntohl (reg->client_pid));
-  }));
-  /* *INDENT-ON* */
-
-  return 0;
-}
-
-/* *INDENT-OFF* */
-VLIB_CLI_COMMAND (show_ip_arp_nd_events, static) = {
-  .path = "show arp-nd-event registrations",
-  .function = show_ip_arp_nd_events_fn,
-  .short_help = "Show ip4 arp and ip6 nd event registrations",
-};
-/* *INDENT-ON* */
 
 #define vl_msg_name_crc_list
 #include <vpp/api/vpe_all_api_h.h>

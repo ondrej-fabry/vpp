@@ -40,6 +40,8 @@
 #ifndef included_vnet_vnet_h
 #define included_vnet_vnet_h
 
+#include <stddef.h>
+
 #include <vppinfra/types.h>
 
 #include <vppinfra/pcap.h>
@@ -47,6 +49,7 @@
 #include <vnet/config.h>
 #include <vnet/interface.h>
 #include <vnet/api_errno.h>
+#include <vnet/ip/ip_table.h>
 
 typedef struct vnet_main_t
 {
@@ -71,14 +74,14 @@ typedef struct vnet_main_t
 
   uword *interface_tag_by_sw_if_index;
 
+    _vnet_ip_table_function_list_elt_t
+    * ip_table_add_del_functions[VNET_ITF_FUNC_N_PRIO];
+
   /*
    * Last "api" error, preserved so we can issue reasonable diagnostics
    * at or near the top of the food chain
    */
   vnet_api_error_t api_errno;
-
-  /* pcap rx/tx, packet tracer filter tables */
-  u32 *classify_filter_table_indices;
 
   vlib_main_t *vlib_main;
 } vnet_main_t;

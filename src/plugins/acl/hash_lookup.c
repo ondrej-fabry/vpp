@@ -23,7 +23,6 @@
 
 #include <vlib/vlib.h>
 #include <vnet/vnet.h>
-#include <vnet/pg/pg.h>
 #include <vppinfra/error.h>
 #include <vnet/plugin/plugin.h>
 #include <acl/acl.h>
@@ -447,7 +446,7 @@ remake_hash_applied_mask_info_vec (acl_main_t * am,
           if (minfo->mask_type_index == pae->mask_type_index)
             break;
         }
-       
+
       vec_validate ((new_hash_applied_mask_info_vec), search);
       minfo = vec_elt_at_index ((new_hash_applied_mask_info_vec), search);
       if (search == new_pointer)
@@ -586,66 +585,6 @@ activate_applied_ace_hash_entry(acl_main_t *am,
 }
 
 
-static void *
-hash_acl_set_heap(acl_main_t *am)
-{
-  if (0 == am->hash_lookup_mheap) {
-    am->hash_lookup_mheap = mheap_alloc_with_lock (0 /* use VM */ , 
-                                                   am->hash_lookup_mheap_size,
-                                                   1 /* locked */);
-    if (0 == am->hash_lookup_mheap) {
-        clib_error("ACL plugin failed to allocate lookup heap of %U bytes", 
-                   format_memory_size, am->hash_lookup_mheap_size);
-    }
-#if USE_DLMALLOC != 0
-    /*
-     * DLMALLOC is being "helpful" in that it ignores the heap size parameter
-     * by default and tries to allocate the larger amount of memory.
-     *
-     * Pin the heap so this does not happen and if we run out of memory
-     * in this heap, we will bail out with "out of memory", rather than
-     * an obscure error sometime later.
-     */
-    mspace_disable_expand(am->hash_lookup_mheap);
-#endif
-  }
-  void *oldheap = clib_mem_set_heap(am->hash_lookup_mheap);
-  return oldheap;
-}
-
-void
-acl_plugin_hash_acl_set_validate_heap(int on)
-{
-  acl_main_t *am = &acl_main;
-  clib_mem_set_heap(hash_acl_set_heap(am));
-#if USE_DLMALLOC == 0
-  mheap_t *h = mheap_header (am->hash_lookup_mheap);
-  if (on) {
-    h->flags |= MHEAP_FLAG_VALIDATE;
-    h->flags &= ~MHEAP_FLAG_SMALL_OBJECT_CACHE;
-    mheap_validate(h);
-  } else {
-    h->flags &= ~MHEAP_FLAG_VALIDATE;
-    h->flags |= MHEAP_FLAG_SMALL_OBJECT_CACHE;
-  }
-#endif
-}
-
-void
-acl_plugin_hash_acl_set_trace_heap(int on)
-{
-  acl_main_t *am = &acl_main;
-  clib_mem_set_heap(hash_acl_set_heap(am));
-#if USE_DLMALLOC == 0
-  mheap_t *h = mheap_header (am->hash_lookup_mheap);
-  if (on) {
-    h->flags |= MHEAP_FLAG_TRACE;
-  } else {
-    h->flags &= ~MHEAP_FLAG_TRACE;
-  }
-#endif
-}
-
 static void
 assign_mask_type_index_to_pae(acl_main_t *am, u32 lc_index, int is_ip6, applied_hash_ace_entry_t *pae)
 {
@@ -693,7 +632,6 @@ hash_acl_apply(acl_main_t *am, u32 lc_index, int acl_index, u32 acl_position)
     am->acl_lookup_hash_initialized = 1;
   }
 
-  void *oldheap = hash_acl_set_heap(am);
   vec_validate(am->hash_entry_vec_by_lc_index, lc_index);
   vec_validate(am->hash_acl_infos, acl_index);
   applied_hash_ace_entry_t **applied_hash_aces = get_applied_hash_aces(am, lc_index);
@@ -714,14 +652,16 @@ hash_acl_apply(acl_main_t *am, u32 lc_index, int acl_index, u32 acl_position)
   if (index != ~0) {
     clib_warning("BUG: trying to apply twice acl_index %d on lc_index %d, according to lc",
                  acl_index, lc_index);
-    goto done;
+    ASSERT(0);
+    return;
   }
   vec_add1(pal->applied_acls, acl_index);
   u32 index2 = vec_search((*hash_acl_applied_lc_index), lc_index);
   if (index2 != ~0) {
     clib_warning("BUG: trying to apply twice acl_index %d on lc_index %d, according to hash h-acl info",
                  acl_index, lc_index);
-    goto done;
+    ASSERT(0);
+    return;
   }
   vec_add1((*hash_acl_applied_lc_index), lc_index);
 
@@ -772,8 +712,6 @@ hash_acl_apply(acl_main_t *am, u32 lc_index, int acl_index, u32 acl_position)
       check_collision_count_and_maybe_split(am, lc_index, is_ip6, first_index);
   }
   remake_hash_applied_mask_info_vec(am, applied_hash_aces, lc_index);
-done:
-  clib_mem_set_heap (oldheap);
 }
 
 static u32
@@ -949,7 +887,6 @@ hash_acl_unapply(acl_main_t *am, u32 lc_index, int acl_index)
     return;
   }
 
-  void *oldheap = hash_acl_set_heap(am);
   int base_offset = i;
   int tail_offset = base_offset + vec_len(ha->rules);
   int tail_len = vec_len((*applied_hash_aces)) - tail_offset;
@@ -973,8 +910,6 @@ hash_acl_unapply(acl_main_t *am, u32 lc_index, int acl_index)
   if (vec_len((*applied_hash_aces)) == 0) {
     vec_free((*applied_hash_aces));
   }
-
-  clib_mem_set_heap (oldheap);
 }
 
 /*
@@ -1126,7 +1061,6 @@ int hash_acl_exists(acl_main_t *am, int acl_index)
 
 void hash_acl_add(acl_main_t *am, int acl_index)
 {
-  void *oldheap = hash_acl_set_heap(am);
   DBG("HASH ACL add : %d", acl_index);
   int i;
   acl_rule_t *acl_rules = am->acls[acl_index].rules;
@@ -1169,12 +1103,10 @@ void hash_acl_add(acl_main_t *am, int acl_index)
       hash_acl_reapply(am, *lc_index, acl_index);
     }
   }
-  clib_mem_set_heap (oldheap);
 }
 
 void hash_acl_delete(acl_main_t *am, int acl_index)
 {
-  void *oldheap = hash_acl_set_heap(am);
   DBG0("HASH ACL delete : %d", acl_index);
   /*
    * If the ACL is applied somewhere, remove the references of it (call hash_acl_unapply)
@@ -1209,7 +1141,6 @@ void hash_acl_delete(acl_main_t *am, int acl_index)
   }
   ha->hash_acl_exists = 0;
   vec_free(ha->rules);
-  clib_mem_set_heap (oldheap);
 }
 
 
@@ -1678,4 +1609,3 @@ split_partition(acl_main_t *am, u32 first_index,
 	DBG( "TM-split_partition - END");
 
 }
-

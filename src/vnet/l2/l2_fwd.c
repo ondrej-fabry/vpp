@@ -61,8 +61,7 @@ typedef struct
 typedef struct
 {
   /* per-pkt trace data */
-  u8 src[6];
-  u8 dst[6];
+  u8 dst_and_src[12];
   u32 sw_if_index;
   u16 bd_index;
   l2fib_entry_result_t result;
@@ -79,8 +78,9 @@ format_l2fwd_trace (u8 * s, va_list * args)
   s =
     format (s,
 	    "l2-fwd:   sw_if_index %d dst %U src %U bd_index %d result [0x%llx, %d] %U",
-	    t->sw_if_index, format_ethernet_address, t->dst,
-	    format_ethernet_address, t->src, t->bd_index, t->result.raw,
+	    t->sw_if_index, format_ethernet_address, t->dst_and_src,
+	    format_ethernet_address, t->dst_and_src + 6,
+	    t->bd_index, t->result.raw,
 	    t->result.fields.sw_if_index, format_l2fib_entry_result_flags,
 	    t->result.fields.flags);
   return s;
@@ -156,13 +156,12 @@ l2fwd_process (vlib_main_t * vm,
       /* check l2fib seq num for stale entries */
       if (!l2fib_entry_result_is_set_AGE_NOT (result0))
 	{
-	  l2fib_seq_num_t in_sn = {.as_u16 = vnet_buffer (b0)->l2.l2fib_sn };
-	  l2fib_seq_num_t expected_sn = {
-	    .bd = in_sn.bd,
-	    .swif = *l2fib_swif_seq_num (result0->fields.sw_if_index),
-	  };
-	  l2fib_seq_num_valid =
-	    expected_sn.as_u16 == result0->fields.sn.as_u16;
+	  l2fib_seq_num_t in_sn = vnet_buffer (b0)->l2.l2fib_sn;
+	  l2fib_seq_num_t expected_sn = l2_fib_update_seq_num (in_sn,
+							       l2_input_seq_num
+							       (result0->fields.sw_if_index));
+
+	  l2fib_seq_num_valid = expected_sn == result0->fields.sn;
 	}
 
       if (PREDICT_FALSE (!l2fib_seq_num_valid))
@@ -324,8 +323,9 @@ l2fwd_node_inline (vlib_main_t * vm, vlib_node_runtime_t * node,
 	      l2fwd_trace_t *t = vlib_add_trace (vm, node, b[0], sizeof (*t));
 	      t->sw_if_index = sw_if_index0;
 	      t->bd_index = vnet_buffer (b[0])->l2.bd_index;
-	      clib_memcpy_fast (t->src, h0->src_address, 6);
-	      clib_memcpy_fast (t->dst, h0->dst_address, 6);
+	      clib_memcpy_fast (t->dst_and_src, h0->dst_address,
+				sizeof (h0->dst_address) +
+				sizeof (h0->src_address));
 	      t->result = result0;
 	    }
 	  if (b[1]->flags & VLIB_BUFFER_IS_TRACED)
@@ -333,8 +333,9 @@ l2fwd_node_inline (vlib_main_t * vm, vlib_node_runtime_t * node,
 	      l2fwd_trace_t *t = vlib_add_trace (vm, node, b[1], sizeof (*t));
 	      t->sw_if_index = sw_if_index1;
 	      t->bd_index = vnet_buffer (b[1])->l2.bd_index;
-	      clib_memcpy_fast (t->src, h1->src_address, 6);
-	      clib_memcpy_fast (t->dst, h1->dst_address, 6);
+	      clib_memcpy_fast (t->dst_and_src, h1->dst_address,
+				sizeof (h1->dst_address) +
+				sizeof (h1->src_address));
 	      t->result = result1;
 	    }
 	  if (b[2]->flags & VLIB_BUFFER_IS_TRACED)
@@ -342,8 +343,9 @@ l2fwd_node_inline (vlib_main_t * vm, vlib_node_runtime_t * node,
 	      l2fwd_trace_t *t = vlib_add_trace (vm, node, b[2], sizeof (*t));
 	      t->sw_if_index = sw_if_index2;
 	      t->bd_index = vnet_buffer (b[2])->l2.bd_index;
-	      clib_memcpy_fast (t->src, h2->src_address, 6);
-	      clib_memcpy_fast (t->dst, h2->dst_address, 6);
+	      clib_memcpy_fast (t->dst_and_src, h2->dst_address,
+				sizeof (h2->dst_address) +
+				sizeof (h2->src_address));
 	      t->result = result2;
 	    }
 	  if (b[3]->flags & VLIB_BUFFER_IS_TRACED)
@@ -351,8 +353,9 @@ l2fwd_node_inline (vlib_main_t * vm, vlib_node_runtime_t * node,
 	      l2fwd_trace_t *t = vlib_add_trace (vm, node, b[3], sizeof (*t));
 	      t->sw_if_index = sw_if_index3;
 	      t->bd_index = vnet_buffer (b[3])->l2.bd_index;
-	      clib_memcpy_fast (t->src, h3->src_address, 6);
-	      clib_memcpy_fast (t->dst, h3->dst_address, 6);
+	      clib_memcpy_fast (t->dst_and_src, h3->dst_address,
+				sizeof (h3->dst_address) +
+				sizeof (h3->src_address));
 	      t->result = result3;
 	    }
 	}
@@ -387,8 +390,9 @@ l2fwd_node_inline (vlib_main_t * vm, vlib_node_runtime_t * node,
 	  l2fwd_trace_t *t = vlib_add_trace (vm, node, b[0], sizeof (*t));
 	  t->sw_if_index = sw_if_index0;
 	  t->bd_index = vnet_buffer (b[0])->l2.bd_index;
-	  clib_memcpy_fast (t->src, h0->src_address, 6);
-	  clib_memcpy_fast (t->dst, h0->dst_address, 6);
+	  clib_memcpy_fast (t->dst_and_src, h0->dst_address,
+			    sizeof (h0->dst_address) +
+			    sizeof (h0->src_address));
 	  t->result = result0;
 	}
 
@@ -500,7 +504,7 @@ int_fwd (vlib_main_t * vm, unformat_input_t * input, vlib_cli_command_t * cmd)
     }
 
   /* set the interface flag */
-  if (l2input_intf_config (sw_if_index)->xconnect)
+  if (l2input_intf_config (sw_if_index))
     {
       l2input_intf_bitmap_enable (sw_if_index, L2INPUT_FEAT_XCONNECT, enable);
     }

@@ -114,6 +114,268 @@ key\_pointer. It is usually a bad mistake to pass the address of a
 vector element as the second argument to hash\_set\_mem. It is perfectly
 fine to memorize constant string addresses in the text segment.
 
+Timekeeping
+-----------
+
+Vppinfra includes high-precision, low-cost timing services. The
+datatype clib_time_t and associated functions reside in
+./src/vppinfra/time.\[ch\]. Call clib_time_init (clib_time_t \*cp) to
+initialize the clib_time_t object.
+
+Clib_time_init(...) can use a variety of different ways to establish
+the hardware clock frequency. At the end of the day, vppinfra
+timekeeping takes the attitude that the operating system's clock is
+the closest thing to a gold standard it has handy.
+
+When properly configured, NTP maintains kernel clock synchronization
+with a highly accurate off-premises reference clock.  Notwithstanding
+network propagation delays, a synchronized NTP client will keep the
+kernel clock accurate to within 50ms or so.
+
+Why should one care? Simply put, oscillators used to generate CPU
+ticks aren't super accurate. They work pretty well, but a 0.1% error
+wouldn't be out of the question. That's a minute and a half's worth of
+error in 1 day. The error changes constantly, due to temperature
+variation, and a host of other physical factors.
+
+It's far too expensive to use system calls for timing, so we're left
+with the problem of continously adjusting our view of the CPU tick
+register's clocks_per_second parameter.
+
+The clock rate adjustment algorithm measures the number of cpu ticks
+and the "gold standard" reference time across an interval of
+approximately 16 seconds. We calculate clocks_per_second for the
+interval: use rdtsc (on x86_64) and a system call to get the latest
+cpu tick count and the kernel's latest nanosecond timestamp. We
+subtract the previous interval end values, and use exponential
+smoothing to merge the new clock rate sample into the clocks_per_second
+parameter.
+
+As of this writing, we maintain the clock rate by way of the following
+first-order differential equation:
+
+
+```
+   clocks_per_second(t) = clocks_per_second(t-1) * K + sample_cps(t)*(1-K)
+   where K = e**(-1.0/3.75);
+```
+
+This yields a per observation "half-life" of 1 minute. Empirically,
+the clock rate converges within 5 minutes, and appears to maintain
+near-perfect agreement with the kernel clock in the face of ongoing
+NTP time adjustments.
+
+See ./src/vppinfra/time.c:clib_time_verify_frequency(...) to look at
+the rate adjustment algorithm. The code rejects frequency samples
+corresponding to the sort of adjustment which might occur if someone
+changes the gold standard kernel clock by several seconds.
+
+### Monotonic timebase support
+
+Particularly during system initialization, the "gold standard" system
+reference clock can change by a large amount, in an instant. It's not
+a best practice to yank the reference clock - in either direction - by
+hours or days. In fact, some poorly-constructed use-cases do so.
+
+To deal with this reality, clib_time_now(...) returns the number of
+seconds since vpp started, *guaranteed to be monotonically
+increasing, no matter what happens to the system reference clock*.
+
+This is first-order important, to avoid breaking every active timer in
+the system. The vpp host stack alone may account for tens of millions
+of active timers. It's utterly impractical to track down and fix
+timers, so we must deal with the issue at the timebase level.
+
+Here's how it works. Prior to adjusting the clock rate, we collect the
+kernel reference clock and the cpu clock:
+
+```
+  /* Ask the kernel and the CPU what time it is... */
+  now_reference = unix_time_now ();
+  now_clock = clib_cpu_time_now ();
+```
+
+Compute changes for both clocks since the last rate adjustment,
+roughly 15 seconds ago:
+
+```
+  /* Compute change in the reference clock */
+  delta_reference = now_reference - c->last_verify_reference_time;
+
+  /* And change in the CPU clock */
+  delta_clock_in_seconds = (f64) (now_clock - c->last_verify_cpu_time) *
+    c->seconds_per_clock;
+```
+
+Delta_reference is key. Almost 100% of the time, delta_reference and
+delta_clock_in_seconds are identical modulo one system-call
+time. However, NTP or a privileged user can yank the system reference
+time - in either direction - by an hour, a day, or a decade.
+
+As described above, clib_time_now(...) must return monotonically
+increasing answers to the question "how long has it been since vpp
+started, in seconds." To do that, the clock rate adjustment algorithm
+begins by recomputing the initial reference time:
+
+```
+  c->init_reference_time += (delta_reference - delta_clock_in_seconds);
+```
+
+It's easy to convince yourself that if the reference clock changes by
+15.000000 seconds and the cpu clock tick time changes by 15.000000
+seconds, the initial reference time won't change.
+
+If, on the other hand, delta_reference is -86400.0 and delta clock is
+15.0 - reference time jumped backwards by exactly one day in a
+15-second rate update interval - we add -86415.0 to the initial
+reference time.
+
+Given the corrected initial reference time, we recompute the total
+number of cpu ticks which have occurred since the corrected initial
+reference time, at the current clock tick rate:
+
+```
+  c->total_cpu_time = (now_reference - c->init_reference_time)
+    * c->clocks_per_second;
+```
+
+### Timebase precision
+
+Cognoscenti may notice that vlib/clib\_time\_now(...) return a 64-bit
+floating-point value; the number of seconds since vpp started.
+
+Please see [this Wikipedia
+article](https://en.wikipedia.org/wiki/Double-precision_floating-point_format)
+for more information. C double-precision floating point numbers
+(called f64 in the vpp code base) have a 53-bit effective mantissa,
+and can accurately represent 15 decimal digits' worth of precision.
+
+There are 315,360,000.000001 seconds in ten years plus one
+microsecond. That string has exactly 15 decimal digits. The vpp time
+base retains 1us precision for roughly 30 years.
+
+vlib/clib\_time\_now do *not* provide precision in excess of 1e-6
+seconds. If necessary, please use clib_cpu_time_now(...) for direct
+access to the CPU clock-cycle counter. Note that the number of CPU
+clock cycles per second varies significantly across CPU architectures.
+
+Timer Wheels
+------------
+
+Vppinfra includes configurable timer wheel support. See the source
+code in .../src/vppinfra/tw_timer_template.[ch], as well as a
+considerable number of template instances defined in
+.../src/vppinfra/tw_timer_<wheel-geometry-spec>.[ch].
+
+Instantiation of tw_timer_template.h generates named structures to
+implement specific timer wheel geometries. Choices include: number of
+timer wheels (currently, 1 or 2), number of slots per ring (a power of
+two), and the number of timers per "object handle".
+
+Internally, user object/timer handles are 32-bit integers, so if one
+selects 16 timers/object (4 bits), the resulting timer wheel handle is
+limited to 2**28 objects.
+
+Here are the specific settings required to generate a single 2048 slot
+wheel which supports 2 timers per object:
+
+```
+    #define TW_TIMER_WHEELS 1
+    #define TW_SLOTS_PER_RING 2048
+    #define TW_RING_SHIFT 11
+    #define TW_RING_MASK (TW_SLOTS_PER_RING -1)
+    #define TW_TIMERS_PER_OBJECT 2
+    #define LOG2_TW_TIMERS_PER_OBJECT 1
+    #define TW_SUFFIX _2t_1w_2048sl
+    #define TW_FAST_WHEEL_BITMAP 0
+    #define TW_TIMER_ALLOW_DUPLICATE_STOP 0
+```
+
+See tw_timer_2t_1w_2048sl.h for a complete
+example.
+
+tw_timer_template.h is not intended to be #included directly. Client
+codes can include multiple timer geometry header files, although
+extreme caution would required to use the TW and TWT macros in such a
+case.
+
+### API usage examples
+
+The unit test code in .../src/vppinfra/test_tw_timer.c provides a
+concrete API usage example. It uses a synthetic clock to rapidly
+exercise the underlying tw_timer_expire_timers(...) template.
+
+There are not many API routines to call.
+
+#### Initialize a two-timer, single 2048-slot wheel w/ a 1-second timer granularity
+
+```
+    tw_timer_wheel_init_2t_1w_2048sl (&tm->single_wheel,
+                                     expired_timer_single_callback,
+				      1.0 / * timer interval * / );
+```
+
+#### Start a timer
+
+```
+    handle = tw_timer_start_2t_1w_2048sl (&tm->single_wheel, elt_index,
+                                          [0 | 1] / * timer id * / ,
+                                          expiration_time_in_u32_ticks);
+```
+
+#### Stop a timer
+
+```
+    tw_timer_stop_2t_1w_2048sl (&tm->single_wheel, handle);
+```
+
+#### An expired timer callback
+
+```
+    static void
+    expired_timer_single_callback (u32 * expired_timers)
+    {
+    	int i;
+        u32 pool_index, timer_id;
+        tw_timer_test_elt_t *e;
+        tw_timer_test_main_t *tm = &tw_timer_test_main;
+
+        for (i = 0; i < vec_len (expired_timers);
+            {
+            pool_index = expired_timers[i] & 0x7FFFFFFF;
+            timer_id = expired_timers[i] >> 31;
+
+            ASSERT (timer_id == 1);
+
+            e = pool_elt_at_index (tm->test_elts, pool_index);
+
+            if (e->expected_to_expire != tm->single_wheel.current_tick)
+              {
+              	fformat (stdout, "[%d] expired at %d not %d\n",
+                         e - tm->test_elts, tm->single_wheel.current_tick,
+                         e->expected_to_expire);
+              }
+         pool_put (tm->test_elts, e);
+         }
+     }
+```
+
+We use wheel timers extensively in the vpp host stack. Each TCP
+session needs 5 timers, so supporting 10 million flows requires up to
+50 million concurrent timers.
+
+Timers rarely expire, so it's of utmost important that stopping and
+restarting a timer costs as few clock cycles as possible.
+
+Stopping a timer costs a doubly-linked list dequeue. Starting a timer
+involves modular arithmetic to determine the correct timer wheel and
+slot, and a list head enqueue.
+
+Expired timer processing generally involves bulk link-list retirement
+with user callback presentation. Some additional complexity at wheel
+wrap time, to relocate timers from slower-turning timer wheels into
+faster-turning wheels.
+
 Format
 ------
 
@@ -161,7 +423,7 @@ format specification. For example:
 
 format\_junk() can invoke other user-format functions if desired. The
 programmer shoulders responsibility for argument type-checking. It is
-typical for user format functions to blow up spectaculary if the
+typical for user format functions to blow up spectacularly if the
 va\_arg(va, type) macros don't match the caller's idea of reality.
 
 Unformat
@@ -220,6 +482,20 @@ argument parsing codes using "%=".
 The phrase "bitzero %|" means "set the specified bit in the supplied
 bitmask" if unformat parses "bitzero". Although it looks like it could
 be fairly handy, it's very lightly used in the code base.
+
+`%_` toggles whether or not to skip input white space.
+
+For transition from skip to no-skip in middle of format string, skip input white space.  For example, the following:
+
+```c
+fmt = "%_%d.%d%_->%_%d.%d%_"
+unformat (input, fmt, &one, &two, &three, &four);
+```
+matches input "1.2 -> 3.4".
+Without this, the space after -> does not get skipped.
+
+
+```
 
 ### How to parse a single input line
 

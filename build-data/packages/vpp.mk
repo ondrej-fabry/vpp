@@ -25,8 +25,7 @@ vpp_cmake_prefix_path := $(subst $() $(),;,$(vpp_cmake_prefix_path))
 
 vpp_cmake_args ?=
 vpp_cmake_args += -DCMAKE_INSTALL_PREFIX:PATH=$(PACKAGE_INSTALL_DIR)
-vpp_cmake_args += -DCMAKE_C_FLAGS="$($(TAG)_TAG_CFLAGS)"
-vpp_cmake_args += -DCMAKE_LINKER_FLAGS="$($(TAG)_TAG_LDFLAGS)"
+vpp_cmake_args += -DCMAKE_BUILD_TYPE="$($(TAG)_TAG_BUILD_TYPE)"
 vpp_cmake_args += -DCMAKE_PREFIX_PATH:PATH="$(vpp_cmake_prefix_path)"
 ifeq ("$(V)","1")
 vpp_cmake_args += -DCMAKE_VERBOSE_MAKEFILE:BOOL=ON
@@ -38,8 +37,12 @@ endif
 endif
 
 # Use devtoolset on centos 7
-ifneq ($(wildcard /opt/rh/devtoolset-7/enable),)
-vpp_cmake_args += -DCMAKE_PROGRAM_PATH:PATH="/opt/rh/devtoolset-7/root/bin"
+ifneq ($(wildcard /opt/rh/devtoolset-9/enable),)
+vpp_cmake_args += -DCMAKE_PROGRAM_PATH:PATH="/opt/rh/devtoolset-9/root/bin"
+endif
+
+ifneq ($(VPP_EXTRA_CMAKE_ARGS),)
+vpp_cmake_args += $(VPP_EXTRA_CMAKE_ARGS)
 endif
 
 vpp_configure_depend += external-install

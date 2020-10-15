@@ -39,6 +39,7 @@
 #define included_time_h
 
 #include <vppinfra/clib.h>
+#include <vppinfra/format.h>
 
 typedef struct
 {
@@ -56,10 +57,9 @@ typedef struct
      from clock cycles into seconds. */
   f64 seconds_per_clock;
 
-  f64 round_to_units;
-
   /* Time stamp of call to clib_time_init call. */
   u64 init_cpu_time;
+  f64 init_reference_time;
 
   u64 last_verify_cpu_time;
 
@@ -67,7 +67,13 @@ typedef struct
   f64 last_verify_reference_time;
 
   u32 log2_clocks_per_second, log2_clocks_per_frequency_verify;
+
+  /* Damping constant */
+  f64 damping_constant;
+
 } clib_time_t;
+
+format_function_t format_clib_time;
 
 /* Return CPU time stamp as 64bit number. */
 #if defined(__x86_64__) || defined(i386)
@@ -193,19 +199,28 @@ clib_cpu_time_now (void)
 
 void clib_time_verify_frequency (clib_time_t * c);
 
+/* Define it as the type returned by clib_time_now */
+typedef f64 clib_time_type_t;
+typedef u64 clib_us_time_t;
+
+#define CLIB_US_TIME_PERIOD (1e-6)
+#define CLIB_US_TIME_FREQ (1.0/CLIB_US_TIME_PERIOD)
+
 always_inline f64
 clib_time_now_internal (clib_time_t * c, u64 n)
 {
   u64 l = c->last_cpu_time;
   u64 t = c->total_cpu_time;
+  f64 rv;
   t += n - l;
   c->total_cpu_time = t;
   c->last_cpu_time = n;
+  rv = t * c->seconds_per_clock;
   if (PREDICT_FALSE
       ((c->last_cpu_time -
 	c->last_verify_cpu_time) >> c->log2_clocks_per_frequency_verify))
     clib_time_verify_frequency (c);
-  return t * c->seconds_per_clock;
+  return rv;
 }
 
 /* Maximum f64 value as max clib_time */

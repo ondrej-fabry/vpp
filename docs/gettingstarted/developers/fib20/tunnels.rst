@@ -10,7 +10,7 @@ beforehand, so the recursive switch can be avoided if the packet can follow the
 already constructed data-plane graph for the tunnel's destination. This process
 of joining to DP graphs together is termed *stacking*.
   
-.. figure:: /_images/fib20fig2.png
+.. figure:: /_images/fib20fig11.png
 
 Figure 11: Tunnel control plane object diagram
 
@@ -18,12 +18,12 @@ Figure 11 shows the control plane object graph for a route via a tunnel. The two
 sub-graphs for the route via the tunnel and the route for the tunnel's
 destination are shown to the right and left respectively. The red line shows the
 relationship form by stacking the two sub-graphs. The adjacency on the tunnel
-interface is termed a ԭid-chainՠthis it is now present in the middle of the
+interface is termed a 'mid-chain' this it is now present in the middle of the
 graph/chain rather than its usual terminal location.
 
 The mid-chain adjacency is contributed by the gre_tunnel_t , which also becomes
 part of the FIB control-plane graph. Consequently it will be visited by a
-back-walk when the forwarding information for the tunnelճ destination changes.
+back-walk when the forwarding information for the tunnel's destination changes.
 This will trigger it to restack the mid-chain adjacency on the new
 *load_balance_t* contributed by the parent *fib_entry_t*.
 

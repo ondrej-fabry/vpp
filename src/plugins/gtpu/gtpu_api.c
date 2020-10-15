@@ -24,60 +24,75 @@
 
 #include <vppinfra/byte_order.h>
 #include <vlibmemory/api.h>
-
+#include <vnet/ip/ip_types_api.h>
 #include <gtpu/gtpu.h>
 
-
-#define vl_msg_id(n,h) n,
-typedef enum
-{
-#include <gtpu/gtpu.api.h>
-  /* We'll want to know how many messages IDs we need... */
-  VL_MSG_FIRST_AVAILABLE,
-} vl_msg_id_t;
-#undef vl_msg_id
-
-/* define message structures */
-#define vl_typedefs
-#include <gtpu/gtpu.api.h>
-#undef vl_typedefs
-
-/* define generated endian-swappers */
-#define vl_endianfun
-#include <gtpu/gtpu.api.h>
-#undef vl_endianfun
-
-/* instantiate all the print functions we know about */
-#define vl_print(handle, ...) vlib_cli_output (handle, __VA_ARGS__)
-#define vl_printfun
-#include <gtpu/gtpu.api.h>
-#undef vl_printfun
-
-/* Get the API version number */
-#define vl_api_version(n,v) static u32 api_version=(v);
-#include <gtpu/gtpu.api.h>
-#undef vl_api_version
-
-#define vl_msg_name_crc_list
-#include <gtpu/gtpu.api.h>
-#undef vl_msg_name_crc_list
+#include <vnet/format_fns.h>
+#include <gtpu/gtpu.api_enum.h>
+#include <gtpu/gtpu.api_types.h>
 
 #define REPLY_MSG_ID_BASE gtm->msg_id_base
 #include <vlibapi/api_helper_macros.h>
 
 static void
-setup_message_id_table (gtpu_main_t * gtm, api_main_t * am)
+vl_api_gtpu_offload_rx_t_handler (vl_api_gtpu_offload_rx_t * mp)
 {
-#define _(id,n,crc) \
-  vl_msg_api_add_msg_name_crc (am, #n "_" #crc, id + gtm->msg_id_base);
-  foreach_vl_msg_name_crc_gtpu;
-#undef _
-}
+  vl_api_gtpu_offload_rx_reply_t *rmp;
+  int rv = 0;
+  vl_api_interface_index_t hw_if_index = ntohl (mp->hw_if_index);
+  vl_api_interface_index_t sw_if_index = ntohl (mp->sw_if_index);
 
-#define foreach_gtpu_plugin_api_msg                             \
-_(SW_INTERFACE_SET_GTPU_BYPASS, sw_interface_set_gtpu_bypass)         \
-_(GTPU_ADD_DEL_TUNNEL, gtpu_add_del_tunnel)                           \
-_(GTPU_TUNNEL_DUMP, gtpu_tunnel_dump)
+  if (!vnet_hw_interface_is_valid (vnet_get_main (), hw_if_index))
+    {
+      rv = VNET_API_ERROR_NO_SUCH_ENTRY;
+      goto err;
+    }
+  VALIDATE_SW_IF_INDEX (mp);
+
+  u32 t_index = vnet_gtpu_get_tunnel_index (sw_if_index);
+  if (t_index == ~0)
+    {
+      rv = VNET_API_ERROR_INVALID_SW_IF_INDEX_2;
+      goto err;
+    }
+
+  gtpu_main_t *gtm = &gtpu_main;
+  gtpu_tunnel_t *t = pool_elt_at_index (gtm->tunnels, t_index);
+  if (!ip46_address_is_ip4 (&t->dst))
+    {
+      rv = VNET_API_ERROR_INVALID_ADDRESS_FAMILY;
+      goto err;
+    }
+
+  if ((t->decap_next_index != GTPU_INPUT_NEXT_IP4_INPUT) &&
+      (t->decap_next_index != GTPU_INPUT_NEXT_IP6_INPUT))
+    {
+      rv = VNET_API_ERROR_INVALID_ADDRESS_FAMILY;
+      goto err;
+    }
+
+  vnet_main_t *vnm = vnet_get_main ();
+  vnet_hw_interface_t *hw_if = vnet_get_hw_interface (vnm, hw_if_index);
+  ip4_main_t *im = &ip4_main;
+  u32 rx_fib_index =
+    vec_elt (im->fib_index_by_sw_if_index, hw_if->sw_if_index);
+
+  if (t->encap_fib_index != rx_fib_index)
+    {
+      rv = VNET_API_ERROR_NO_SUCH_FIB;
+      goto err;
+    }
+
+  if (vnet_gtpu_add_del_rx_flow (hw_if_index, t_index, mp->enable))
+    {
+      rv = VNET_API_ERROR_UNSPECIFIED;
+      goto err;
+    }
+  BAD_SW_IF_INDEX_LABEL;
+err:
+
+  REPLY_MACRO (VL_API_GTPU_OFFLOAD_RX_REPLY);
+}
 
 static void
   vl_api_sw_interface_set_gtpu_bypass_t_handler
@@ -101,26 +116,26 @@ static void vl_api_gtpu_add_del_tunnel_t_handler
 {
   vl_api_gtpu_add_del_tunnel_reply_t *rmp;
   int rv = 0;
-  ip4_main_t *im = &ip4_main;
   gtpu_main_t *gtm = &gtpu_main;
 
-  uword *p = hash_get (im->fib_index_by_table_id, ntohl (mp->encap_vrf_id));
-  if (!p)
+  vnet_gtpu_add_mod_del_tunnel_args_t a = {
+    .opn = mp->is_add ? GTPU_ADD_TUNNEL : GTPU_DEL_TUNNEL,
+    .mcast_sw_if_index = ntohl (mp->mcast_sw_if_index),
+    .decap_next_index = ntohl (mp->decap_next_index),
+    .teid = ntohl (mp->teid),
+    .tteid = ntohl (mp->tteid),
+  };
+  ip_address_decode (&mp->dst_address, &a.dst);
+  ip_address_decode (&mp->src_address, &a.src);
+
+  u8 is_ipv6 = !ip46_address_is_ip4 (&a.dst);
+  a.encap_fib_index = fib_table_find (fib_ip_proto (is_ipv6),
+				      ntohl (mp->encap_vrf_id));
+  if (a.encap_fib_index == ~0)
     {
       rv = VNET_API_ERROR_NO_SUCH_FIB;
       goto out;
     }
-
-  vnet_gtpu_add_del_tunnel_args_t a = {
-    .is_add = mp->is_add,
-    .is_ip6 = mp->is_ipv6,
-    .mcast_sw_if_index = ntohl (mp->mcast_sw_if_index),
-    .encap_fib_index = p[0],
-    .decap_next_index = ntohl (mp->decap_next_index),
-    .teid = ntohl (mp->teid),
-    .dst = to_ip46 (mp->is_ipv6, mp->dst_address),
-    .src = to_ip46 (mp->is_ipv6, mp->src_address),
-  };
 
   /* Check src & dst are different */
   if (ip46_address_cmp (&a.dst, &a.src) == 0)
@@ -136,7 +151,7 @@ static void vl_api_gtpu_add_del_tunnel_t_handler
     }
 
   u32 sw_if_index = ~0;
-  rv = vnet_gtpu_add_del_tunnel (&a, &sw_if_index);
+  rv = vnet_gtpu_add_mod_del_tunnel (&a, &sw_if_index);
 
 out:
   /* *INDENT-OFF* */
@@ -147,34 +162,61 @@ out:
   /* *INDENT-ON* */
 }
 
+static void vl_api_gtpu_tunnel_update_tteid_t_handler
+  (vl_api_gtpu_tunnel_update_tteid_t * mp)
+{
+  vl_api_gtpu_tunnel_update_tteid_reply_t *rmp;
+  int rv = 0;
+  gtpu_main_t *gtm = &gtpu_main;
+
+  vnet_gtpu_add_mod_del_tunnel_args_t a = {
+    .opn = GTPU_UPD_TTEID,
+    .teid = ntohl (mp->teid),
+    .tteid = ntohl (mp->tteid),
+  };
+  ip_address_decode (&mp->dst_address, &a.dst);
+
+  u8 is_ipv6 = !ip46_address_is_ip4 (&a.dst);
+  a.encap_fib_index = fib_table_find (fib_ip_proto (is_ipv6),
+				      ntohl (mp->encap_vrf_id));
+  if (a.encap_fib_index == ~0)
+    {
+      rv = VNET_API_ERROR_NO_SUCH_FIB;
+      goto out;
+    }
+
+  rv = vnet_gtpu_add_mod_del_tunnel (&a, 0);
+
+out:
+  REPLY_MACRO (VL_API_GTPU_TUNNEL_UPDATE_TTEID_REPLY);
+}
+
 static void send_gtpu_tunnel_details
   (gtpu_tunnel_t * t, vl_api_registration_t * reg, u32 context)
 {
   vl_api_gtpu_tunnel_details_t *rmp;
+  gtpu_main_t *gtm = &gtpu_main;
   ip4_main_t *im4 = &ip4_main;
   ip6_main_t *im6 = &ip6_main;
   u8 is_ipv6 = !ip46_address_is_ip4 (&t->dst);
 
   rmp = vl_msg_api_alloc (sizeof (*rmp));
   clib_memset (rmp, 0, sizeof (*rmp));
-  rmp->_vl_msg_id = ntohs (VL_API_GTPU_TUNNEL_DETAILS);
-  if (is_ipv6)
-    {
-      memcpy (rmp->src_address, t->src.ip6.as_u8, 16);
-      memcpy (rmp->dst_address, t->dst.ip6.as_u8, 16);
-      rmp->encap_vrf_id = htonl (im6->fibs[t->encap_fib_index].ft_table_id);
-    }
-  else
-    {
-      memcpy (rmp->src_address, t->src.ip4.as_u8, 4);
-      memcpy (rmp->dst_address, t->dst.ip4.as_u8, 4);
-      rmp->encap_vrf_id = htonl (im4->fibs[t->encap_fib_index].ft_table_id);
-    }
+  rmp->_vl_msg_id = ntohs (VL_API_GTPU_TUNNEL_DETAILS + gtm->msg_id_base);
+
+  ip_address_encode (&t->src, is_ipv6 ? IP46_TYPE_IP6 : IP46_TYPE_IP4,
+		     &rmp->src_address);
+  ip_address_encode (&t->dst, is_ipv6 ? IP46_TYPE_IP6 : IP46_TYPE_IP4,
+		     &rmp->dst_address);
+
+  rmp->encap_vrf_id =
+    is_ipv6 ? htonl (im6->fibs[t->encap_fib_index].ft_table_id) :
+    htonl (im4->fibs[t->encap_fib_index].ft_table_id);
   rmp->mcast_sw_if_index = htonl (t->mcast_sw_if_index);
   rmp->teid = htonl (t->teid);
+  rmp->tteid = htonl (t->tteid);
   rmp->decap_next_index = htonl (t->decap_next_index);
   rmp->sw_if_index = htonl (t->sw_if_index);
-  rmp->is_ipv6 = is_ipv6;
   rmp->context = context;
 
   vl_api_send_msg (reg, (u8 *) rmp);
@@ -215,30 +257,13 @@ vl_api_gtpu_tunnel_dump_t_handler (vl_api_gtpu_tunnel_dump_t * mp)
     }
 }
 
-
+#include <gtpu/gtpu.api.c>
 static clib_error_t *
 gtpu_api_hookup (vlib_main_t * vm)
 {
   gtpu_main_t *gtm = &gtpu_main;
 
-  u8 *name = format (0, "gtpu_%08x%c", api_version, 0);
-  gtm->msg_id_base = vl_msg_api_get_msg_ids
-    ((char *) name, VL_MSG_FIRST_AVAILABLE);
-
-#define _(N,n)                                                  \
-    vl_msg_api_set_handlers((VL_API_##N + gtm->msg_id_base),     \
-                           #n,                  \
-                           vl_api_##n##_t_handler,              \
-                           vl_noop_handler,                     \
-                           vl_api_##n##_t_endian,               \
-                           vl_api_##n##_t_print,                \
-                           sizeof(vl_api_##n##_t), 1);
-  foreach_gtpu_plugin_api_msg;
-#undef _
-
-  /* Add our API messages to the global name_crc hash table */
-  setup_message_id_table (gtm, &api_main);
-
+  gtm->msg_id_base = setup_message_id_table ();
   return 0;
 }
 
